@@ -314,6 +314,99 @@ export function registerTaskBoardTools(server: McpServer): void {
     }
   );
 
+  // ── Delete Task ────────────────────────────────────
+  server.tool(
+    "tb_delete_task",
+    "Delete a task from the board. Only tasks in 'backlog' or 'done' status can be deleted.",
+    {
+      task_id: z.string().describe("Task ID to delete"),
+    },
+    async ({ task_id }) => {
+      const db = getDb();
+      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
+
+      if (!task) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
+      }
+
+      if (task.status !== "backlog" && task.status !== "done") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Cannot delete task in '${task.status}' status. Only 'backlog' or 'done' tasks can be deleted.`,
+              }),
+            },
+          ],
+        };
+      }
+
+      // Remove this task from other tasks' dependencies
+      const siblings = db
+        .prepare(`SELECT id, dependencies FROM tasks WHERE board_id = ? AND id != ?`)
+        .all(task.board_id as string, task_id) as Record<string, unknown>[];
+
+      for (const sibling of siblings) {
+        const deps = JSON.parse(sibling.dependencies as string) as string[];
+        if (deps.includes(task_id)) {
+          const updated = deps.filter((d) => d !== task_id);
+          db.prepare(`UPDATE tasks SET dependencies = ? WHERE id = ?`).run(
+            JSON.stringify(updated),
+            sibling.id
+          );
+        }
+      }
+
+      db.prepare(`DELETE FROM tasks WHERE id = ?`).run(task_id);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ deleted: true, task_id }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ── Add Notes ─────────────────────────────────────
+  server.tool(
+    "tb_add_notes",
+    "Append notes to a task without changing its status. Notes are stored as timestamped entries.",
+    {
+      task_id: z.string().describe("Task ID"),
+      notes: z.string().describe("Note text to append"),
+    },
+    async ({ task_id, notes }) => {
+      const db = getDb();
+      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
+
+      if (!task) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
+      }
+
+      const existing = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
+      existing.push({ text: notes, timestamp: new Date().toISOString() });
+
+      db.prepare(`UPDATE tasks SET notes = ?, updated_at = ? WHERE id = ?`).run(
+        JSON.stringify(existing),
+        new Date().toISOString(),
+        task_id
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ added: true, task_id, notes_count: existing.length }),
+          },
+        ],
+      };
+    }
+  );
+
   // ── List Boards ────────────────────────────────────
   server.tool(
     "tb_list",
