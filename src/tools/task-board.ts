@@ -7,7 +7,7 @@ import { generateId } from "../utils/id.js";
 export function registerTaskBoardTools(server: McpServer): void {
   // ── Create Board ───────────────────────────────────
   server.tool(
-    "board_create",
+    "tb_create_board",
     "Create a new task board for a project.",
     {
       project: z.string().describe("Project identifier (e.g. my-project)"),
@@ -34,7 +34,7 @@ export function registerTaskBoardTools(server: McpServer): void {
 
   // ── Add Task ───────────────────────────────────────
   server.tool(
-    "task_add",
+    "tb_add_task",
     "Add a task to an existing board. Every task should reference a spec and have acceptance criteria.",
     {
       board_id: z.string().describe("Board ID"),
@@ -74,7 +74,7 @@ export function registerTaskBoardTools(server: McpServer): void {
 
   // ── Get Board Status ───────────────────────────────
   server.tool(
-    "board_status",
+    "tb_status",
     "Get the current status of a task board with all tasks grouped by status.",
     {
       board_id: z.string().describe("Board ID"),
@@ -119,7 +119,7 @@ export function registerTaskBoardTools(server: McpServer): void {
 
   // ── Claim Task ─────────────────────────────────────
   server.tool(
-    "task_claim",
+    "tb_claim",
     "Claim a task for execution. Only claims tasks in 'ready' status with all dependencies resolved.",
     {
       task_id: z.string().describe("Task ID to claim"),
@@ -180,7 +180,7 @@ export function registerTaskBoardTools(server: McpServer): void {
 
   // ── Update Task Status ─────────────────────────────
   server.tool(
-    "task_update",
+    "tb_update",
     "Update a task's status. Moving to 'done' requires the task to be in 'in_progress' or 'in_review'.",
     {
       task_id: z.string().describe("Task ID"),
@@ -265,7 +265,7 @@ export function registerTaskBoardTools(server: McpServer): void {
 
   // ── List Unblocked Tasks ───────────────────────────
   server.tool(
-    "task_unblocked",
+    "tb_unblocked",
     "List all tasks that are ready to be worked on (no unresolved dependencies).",
     {
       board_id: z.string().describe("Board ID"),
@@ -297,9 +297,26 @@ export function registerTaskBoardTools(server: McpServer): void {
     }
   );
 
+  // ── Get Single Task ─────────────────────────────────
+  server.tool(
+    "tb_get",
+    "Get full details of a single task by ID.",
+    {
+      task_id: z.string().describe("Task ID"),
+    },
+    async ({ task_id }) => {
+      const db = getDb();
+      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id);
+      if (!task) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify({ task }) }] };
+    }
+  );
+
   // ── List Boards ────────────────────────────────────
   server.tool(
-    "board_list",
+    "tb_list",
     "List all task boards, optionally filtered by project.",
     {
       project: z.string().optional().describe("Filter by project"),
