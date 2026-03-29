@@ -93,6 +93,7 @@ export interface Task {
   spec_ref: string | null;
   acceptance_criteria: string;
   dependencies: string;
+  notes: string;
   created_at: string;
   updated_at: string;
   claimed_at: string | null;

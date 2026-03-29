@@ -56,6 +56,7 @@ function initSchema(db: Database.Database): void {
       spec_ref TEXT,
       acceptance_criteria TEXT NOT NULL DEFAULT '',
       dependencies TEXT NOT NULL DEFAULT '[]',
+      notes TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       claimed_at TEXT,
