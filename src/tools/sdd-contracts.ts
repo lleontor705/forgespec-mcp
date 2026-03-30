@@ -167,6 +167,82 @@ export function registerSddTools(server: McpServer): void {
     }
   );
 
+  // ── Get Single Contract ────────────────────────────
+  server.tool(
+    "sdd_get",
+    "Get a single SDD contract by ID. Returns full contract data.",
+    {
+      contract_id: z.string().describe("Contract ID to retrieve"),
+    },
+    async ({ contract_id }) => {
+      const db = getDb();
+      const row = db
+        .prepare(`SELECT * FROM contracts WHERE id = ?`)
+        .get(contract_id) as Record<string, unknown> | undefined;
+
+      if (!row) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ error: `Contract ${contract_id} not found` }),
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ contract: row }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ── List Contracts ────────────────────────────────
+  server.tool(
+    "sdd_list",
+    "List all SDD contracts with optional filters by project and phase.",
+    {
+      project: z.string().optional().describe("Filter by project identifier"),
+      phase: z.string().optional().describe("Filter by SDD phase"),
+      limit: z.number().default(20).describe("Max entries to return"),
+    },
+    async ({ project, phase, limit }) => {
+      const db = getDb();
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+
+      if (project) {
+        conditions.push("project = ?");
+        params.push(project);
+      }
+      if (phase) {
+        conditions.push("phase = ?");
+        params.push(phase);
+      }
+
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      params.push(limit);
+
+      const rows = db
+        .prepare(`SELECT * FROM contracts ${where} ORDER BY created_at DESC LIMIT ?`)
+        .all(...params);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ contracts: rows, count: rows.length }),
+          },
+        ],
+      };
+    }
+  );
+
   // ── Get Phase Info ─────────────────────────────────
   server.tool(
     "sdd_phases",
