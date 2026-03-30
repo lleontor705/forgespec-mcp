@@ -17,6 +17,7 @@ export function registerSddTools(server: McpServer): void {
     {
       contract: z
         .string()
+        .max(131072)
         .describe("JSON string of the SDD contract to validate"),
     },
     async ({ contract }) => {
@@ -87,7 +88,7 @@ export function registerSddTools(server: McpServer): void {
     "sdd_save",
     "Validate and persist an SDD contract. Records the phase transition for project traceability.",
     {
-      contract: z.string().describe("JSON string of the SDD contract to save"),
+      contract: z.string().max(131072).describe("JSON string of the SDD contract to save"),
     },
     async ({ contract }) => {
       try {
@@ -144,8 +145,8 @@ export function registerSddTools(server: McpServer): void {
     "sdd_history",
     "Get the SDD phase history for a project. Shows all contract transitions in chronological order.",
     {
-      project: z.string().describe("Project identifier"),
-      limit: z.number().default(20).describe("Max entries to return"),
+      project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Project identifier"),
+      limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
     },
     async ({ project, limit }) => {
       const db = getDb();
@@ -172,7 +173,7 @@ export function registerSddTools(server: McpServer): void {
     "sdd_get",
     "Get a single SDD contract by ID. Returns full contract data.",
     {
-      contract_id: z.string().describe("Contract ID to retrieve"),
+      contract_id: z.string().max(256).describe("Contract ID to retrieve"),
     },
     async ({ contract_id }) => {
       const db = getDb();
@@ -207,9 +208,9 @@ export function registerSddTools(server: McpServer): void {
     "sdd_list",
     "List all SDD contracts with optional filters by project and phase.",
     {
-      project: z.string().optional().describe("Filter by project identifier"),
-      phase: z.string().optional().describe("Filter by SDD phase"),
-      limit: z.number().default(20).describe("Max entries to return"),
+      project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).optional().describe("Filter by project identifier"),
+      phase: z.string().max(64).optional().describe("Filter by SDD phase"),
+      limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
     },
     async ({ project, phase, limit }) => {
       const db = getDb();

@@ -41,27 +41,27 @@ export const CONFIDENCE_THRESHOLDS: Record<SddPhase, number> = {
 
 // ── Contract Schema ─────────────────────────────────────
 export const RiskSchema = z.object({
-  description: z.string(),
+  description: z.string().max(4096),
   level: z.enum(["low", "medium", "high", "critical"]),
-});
+}).strict();
 
 export const ArtifactSchema = z.object({
-  topic_key: z.string(),
+  topic_key: z.string().max(512),
   type: z.enum(["engram", "openspec", "inline"]),
-  path: z.string().optional(),
-});
+  path: z.string().max(1024).optional(),
+}).strict();
 
 export const SddContractSchema = z.object({
-  schema_version: z.string().default("1.0"),
+  schema_version: z.string().max(32).default("1.0"),
   phase: z.enum(SDD_PHASES),
-  change_name: z.string().min(1),
-  project: z.string().min(1),
+  change_name: z.string().min(1).max(256),
+  project: z.string().min(1).max(256),
   status: z.enum(["success", "partial", "failed", "blocked"]),
   confidence: z.number().min(0).max(1),
-  executive_summary: z.string().min(10),
-  artifacts_saved: z.array(ArtifactSchema).default([]),
-  next_recommended: z.array(z.enum(SDD_PHASES)).default([]),
-  risks: z.array(RiskSchema).default([]),
+  executive_summary: z.string().min(10).max(65536),
+  artifacts_saved: z.array(ArtifactSchema).max(50).default([]),
+  next_recommended: z.array(z.enum(SDD_PHASES)).max(9).default([]),
+  risks: z.array(RiskSchema).max(50).default([]),
   data: z.record(z.unknown()).default({}),
 });
 
