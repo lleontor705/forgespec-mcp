@@ -10,8 +10,8 @@ export function registerTaskBoardTools(server: McpServer): void {
     "tb_create_board",
     "Create a new task board for a project.",
     {
-      project: z.string().describe("Project identifier (e.g. my-project)"),
-      name: z.string().describe("Board name"),
+      project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Project identifier (e.g. my-project)"),
+      name: z.string().max(256).describe("Board name"),
     },
     async ({ project, name }) => {
       const db = getDb();
@@ -37,12 +37,12 @@ export function registerTaskBoardTools(server: McpServer): void {
     "tb_add_task",
     "Add a task to an existing board. Every task should reference a spec and have acceptance criteria.",
     {
-      board_id: z.string().describe("Board ID"),
-      title: z.string().min(3).describe("Task title"),
-      description: z.string().default("").describe("Task description"),
+      board_id: z.string().max(256).describe("Board ID"),
+      title: z.string().min(3).max(512).describe("Task title"),
+      description: z.string().max(65536).default("").describe("Task description"),
       priority: z.enum(TASK_PRIORITIES).default("p2").describe("Priority: p0 (critical), p1 (high), p2 (medium), p3 (low)"),
-      spec_ref: z.string().optional().describe("Reference to spec document"),
-      acceptance_criteria: z.string().default("").describe("Acceptance criteria for completion"),
+      spec_ref: z.string().max(512).optional().describe("Reference to spec document"),
+      acceptance_criteria: z.string().max(65536).default("").describe("Acceptance criteria for completion"),
       dependencies: z.array(z.string()).default([]).describe("Task IDs this task depends on"),
     },
     async ({ board_id, title, description, priority, spec_ref, acceptance_criteria, dependencies }) => {
@@ -122,8 +122,8 @@ export function registerTaskBoardTools(server: McpServer): void {
     "tb_claim",
     "Claim a task for execution. Only claims tasks in 'ready' status with all dependencies resolved.",
     {
-      task_id: z.string().describe("Task ID to claim"),
-      agent: z.string().describe("Agent or developer claiming the task"),
+      task_id: z.string().max(256).describe("Task ID to claim"),
+      agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent or developer claiming the task"),
     },
     async ({ task_id, agent }) => {
       const db = getDb();
@@ -183,9 +183,9 @@ export function registerTaskBoardTools(server: McpServer): void {
     "tb_update",
     "Update a task's status. Moving to 'done' requires the task to be in 'in_progress' or 'in_review'.",
     {
-      task_id: z.string().describe("Task ID"),
+      task_id: z.string().max(256).describe("Task ID"),
       status: z.enum(TASK_STATUSES).describe("New status"),
-      notes: z.string().optional().describe("Optional notes about the update"),
+      notes: z.string().max(65536).optional().describe("Optional notes about the update"),
     },
     async ({ task_id, status, notes }) => {
       const db = getDb();
@@ -311,6 +311,99 @@ export function registerTaskBoardTools(server: McpServer): void {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
       }
       return { content: [{ type: "text" as const, text: JSON.stringify({ task }) }] };
+    }
+  );
+
+  // ── Delete Task ────────────────────────────────────
+  server.tool(
+    "tb_delete_task",
+    "Delete a task from the board. Only tasks in 'backlog' or 'done' status can be deleted.",
+    {
+      task_id: z.string().describe("Task ID to delete"),
+    },
+    async ({ task_id }) => {
+      const db = getDb();
+      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
+
+      if (!task) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
+      }
+
+      if (task.status !== "backlog" && task.status !== "done") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Cannot delete task in '${task.status}' status. Only 'backlog' or 'done' tasks can be deleted.`,
+              }),
+            },
+          ],
+        };
+      }
+
+      // Remove this task from other tasks' dependencies
+      const siblings = db
+        .prepare(`SELECT id, dependencies FROM tasks WHERE board_id = ? AND id != ?`)
+        .all(task.board_id as string, task_id) as Record<string, unknown>[];
+
+      for (const sibling of siblings) {
+        const deps = JSON.parse(sibling.dependencies as string) as string[];
+        if (deps.includes(task_id)) {
+          const updated = deps.filter((d) => d !== task_id);
+          db.prepare(`UPDATE tasks SET dependencies = ? WHERE id = ?`).run(
+            JSON.stringify(updated),
+            sibling.id
+          );
+        }
+      }
+
+      db.prepare(`DELETE FROM tasks WHERE id = ?`).run(task_id);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ deleted: true, task_id }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ── Add Notes ─────────────────────────────────────
+  server.tool(
+    "tb_add_notes",
+    "Append notes to a task without changing its status. Notes are stored as timestamped entries.",
+    {
+      task_id: z.string().max(256).describe("Task ID"),
+      notes: z.string().max(65536).describe("Note text to append"),
+    },
+    async ({ task_id, notes }) => {
+      const db = getDb();
+      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
+
+      if (!task) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
+      }
+
+      const existing = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
+      existing.push({ text: notes, timestamp: new Date().toISOString() });
+
+      db.prepare(`UPDATE tasks SET notes = ?, updated_at = ? WHERE id = ?`).run(
+        JSON.stringify(existing),
+        new Date().toISOString(),
+        task_id
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ added: true, task_id, notes_count: existing.length }),
+          },
+        ],
+      };
     }
   );
 

@@ -14,7 +14,7 @@ export function registerFileTools(server: McpServer): void {
       patterns: z
         .array(z.string())
         .describe("File paths or glob patterns to reserve (e.g. ['src/auth/**', 'package.json'])"),
-      agent: z.string().describe("Agent reserving the files"),
+      agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent reserving the files"),
       ttl_minutes: z
         .number()
         .default(DEFAULT_TTL_MINUTES)
@@ -100,7 +100,7 @@ export function registerFileTools(server: McpServer): void {
       patterns: z
         .array(z.string())
         .describe("File paths or glob patterns to check"),
-      agent: z.string().describe("Agent checking (to exclude own reservations)"),
+      agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent checking (to exclude own reservations)"),
     },
     async ({ patterns, agent }) => {
       const db = getDb();
@@ -140,7 +140,7 @@ export function registerFileTools(server: McpServer): void {
     "file_release",
     "Release file reservations held by an agent.",
     {
-      agent: z.string().describe("Agent releasing reservations"),
+      agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent releasing reservations"),
       patterns: z
         .array(z.string())
         .optional()

@@ -16,8 +16,14 @@ export function getDb(): Database.Database {
 
   db = new Database(DB_PATH);
   db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = normal");
+  db.pragma("cache_size = -32000");
+  db.pragma("temp_store = memory");
   db.pragma("busy_timeout = 5000");
   db.pragma("foreign_keys = ON");
+
+  const versionInfo = db.prepare("SELECT sqlite_version() as version").get() as { version: string };
+  console.error(`ForgeSpec MCP: SQLite ${versionInfo.version}, WAL mode enabled`);
 
   initSchema(db);
   return db;
@@ -56,6 +62,7 @@ function initSchema(db: Database.Database): void {
       spec_ref TEXT,
       acceptance_criteria TEXT NOT NULL DEFAULT '',
       dependencies TEXT NOT NULL DEFAULT '[]',
+      notes TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       claimed_at TEXT,
@@ -74,6 +81,16 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_contracts_project ON contracts(project);
     CREATE INDEX IF NOT EXISTS idx_reservations_agent ON file_reservations(agent);
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT DEFAULT (datetime('now')),
+      action TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      agent_name TEXT,
+      details TEXT
+    );
   `);
 }
 

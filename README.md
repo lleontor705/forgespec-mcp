@@ -71,6 +71,8 @@ mcp: {
 |------|-------------|
 | `sdd_validate` | Validate an SDD contract against phase schema |
 | `sdd_save` | Validate and persist a contract |
+| `sdd_get` | Get a single SDD contract by ID |
+| `sdd_list` | List all contracts with optional project/phase filters |
 | `sdd_history` | Get phase transition history for a project |
 | `sdd_phases` | Get all phases with transitions and confidence thresholds |
 
@@ -84,6 +86,8 @@ mcp: {
 | `task_add` | Add a task with priority, spec ref, and acceptance criteria |
 | `task_claim` | Claim a task (checks dependencies) |
 | `task_update` | Update task status (auto-unblocks dependents) |
+| `task_delete` | Delete a task (backlog/done only), cleans up dependencies |
+| `task_notes` | Append timestamped notes to a task |
 | `task_unblocked` | List tasks ready to work on |
 
 ### File Reservation Tools

@@ -17,6 +17,7 @@ export function registerSddTools(server: McpServer): void {
     {
       contract: z
         .string()
+        .max(131072)
         .describe("JSON string of the SDD contract to validate"),
     },
     async ({ contract }) => {
@@ -87,7 +88,7 @@ export function registerSddTools(server: McpServer): void {
     "sdd_save",
     "Validate and persist an SDD contract. Records the phase transition for project traceability.",
     {
-      contract: z.string().describe("JSON string of the SDD contract to save"),
+      contract: z.string().max(131072).describe("JSON string of the SDD contract to save"),
     },
     async ({ contract }) => {
       try {
@@ -144,8 +145,8 @@ export function registerSddTools(server: McpServer): void {
     "sdd_history",
     "Get the SDD phase history for a project. Shows all contract transitions in chronological order.",
     {
-      project: z.string().describe("Project identifier"),
-      limit: z.number().default(20).describe("Max entries to return"),
+      project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Project identifier"),
+      limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
     },
     async ({ project, limit }) => {
       const db = getDb();
@@ -161,6 +162,82 @@ export function registerSddTools(server: McpServer): void {
           {
             type: "text" as const,
             text: JSON.stringify({ project, history: rows }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ── Get Single Contract ────────────────────────────
+  server.tool(
+    "sdd_get",
+    "Get a single SDD contract by ID. Returns full contract data.",
+    {
+      contract_id: z.string().max(256).describe("Contract ID to retrieve"),
+    },
+    async ({ contract_id }) => {
+      const db = getDb();
+      const row = db
+        .prepare(`SELECT * FROM contracts WHERE id = ?`)
+        .get(contract_id) as Record<string, unknown> | undefined;
+
+      if (!row) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ error: `Contract ${contract_id} not found` }),
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ contract: row }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ── List Contracts ────────────────────────────────
+  server.tool(
+    "sdd_list",
+    "List all SDD contracts with optional filters by project and phase.",
+    {
+      project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).optional().describe("Filter by project identifier"),
+      phase: z.string().max(64).optional().describe("Filter by SDD phase"),
+      limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
+    },
+    async ({ project, phase, limit }) => {
+      const db = getDb();
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+
+      if (project) {
+        conditions.push("project = ?");
+        params.push(project);
+      }
+      if (phase) {
+        conditions.push("phase = ?");
+        params.push(phase);
+      }
+
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      params.push(limit);
+
+      const rows = db
+        .prepare(`SELECT * FROM contracts ${where} ORDER BY created_at DESC LIMIT ?`)
+        .all(...params);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ contracts: rows, count: rows.length }),
           },
         ],
       };
