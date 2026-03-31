@@ -1,0 +1,60 @@
+# forgespec-mcp
+
+> MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, and advisory file locking to coordinate work across multiple AI agents. Works with any MCP-compatible client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more.
+
+## Quick Start
+
+- [npm package](https://www.npmjs.com/package/forgespec-mcp): Install via `npx -y forgespec-mcp` or `npm install -g forgespec-mcp`
+- [GitHub Repository](https://github.com/lleontor705/forgespec-mcp): Source code, issues, and contributions
+
+## Core Concepts
+
+- [SDD Pipeline](#sdd-pipeline): 9-phase development lifecycle (init, explore, propose, spec, design, tasks, apply, verify, archive) with confidence thresholds and enforced phase transitions
+- [Task Board](#task-board): SQLite-backed task management with dependency tracking, auto-unblocking, priority levels (p0-p3), and status workflow (backlog, ready, in_progress, in_review, done, blocked)
+- [File Reservation](#file-reservation): Advisory file locking with TTL-based expiration and glob pattern matching to prevent multi-agent write conflicts
+
+## Tools (19 total)
+
+### SDD Contract Tools
+
+- `sdd_validate`: Validate an SDD contract against the phase schema with confidence checks and allowed transitions
+- `sdd_save`: Validate and persist a contract to SQLite with phase tracking
+- `sdd_get`: Retrieve a single contract by ID
+- `sdd_list`: List contracts with optional project and phase filters
+- `sdd_history`: Get phase transition history for a project
+- `sdd_phases`: Get all phases with transitions and confidence thresholds
+
+### Task Board Tools
+
+- `tb_create_board`: Create a new task board for a project
+- `tb_add_task`: Add a task with priority, spec ref, acceptance criteria, and dependencies
+- `tb_status`: Get board status with tasks grouped by status
+- `tb_claim`: Claim a task (checks dependencies, auto-moves to in_progress)
+- `tb_update`: Update task status (auto-unblocks dependents on completion)
+- `tb_unblocked`: List tasks ready to work on (no unresolved dependencies)
+- `tb_get`: Get full task details by ID
+- `tb_delete_task`: Delete a task (backlog/done only), cleans up dependencies
+- `tb_add_notes`: Append timestamped notes to a task
+- `tb_list`: List all boards (optionally filtered by project)
+
+### File Reservation Tools
+
+- `file_reserve`: Reserve files or glob patterns with TTL (default 15 min)
+- `file_check`: Check for conflicts on file patterns
+- `file_release`: Release reservations (specific patterns or all for an agent)
+
+## Configuration
+
+- [Claude Code setup](https://github.com/lleontor705/forgespec-mcp#configuration): `claude mcp add forgespec --transport stdio -- npx -y forgespec-mcp`
+- [Codex CLI setup](https://github.com/lleontor705/forgespec-mcp#configuration): Add to `~/.codex/config.toml`
+- [Gemini CLI setup](https://github.com/lleontor705/forgespec-mcp#configuration): Add to `settings.json`
+
+## Environment Variables
+
+- `FORGESPEC_DIR` (default `~/.forgespec`): Database directory
+- `FORGESPEC_DB` (default `~/.forgespec/forgespec.db`): Full database path
+
+## Optional
+
+- [Development guide](https://github.com/lleontor705/forgespec-mcp#development): Clone, install, dev/test/build commands
+- [License](https://github.com/lleontor705/forgespec-mcp/blob/master/LICENSE): MIT

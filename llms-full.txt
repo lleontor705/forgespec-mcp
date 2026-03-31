@@ -1,0 +1,379 @@
+# forgespec-mcp
+
+> MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, and advisory file locking to coordinate work across multiple AI agents. Built on the Model Context Protocol SDK with better-sqlite3 and Zod schema validation.
+
+## Overview
+
+forgespec-mcp is an MCP (Model Context Protocol) server designed for multi-agent AI development workflows. It enforces a structured 9-phase development pipeline through typed contracts, manages tasks with intelligent dependency resolution, and provides advisory file locking for agent coordination.
+
+**Key characteristics:**
+- TypeScript, compiled to ES2022 CommonJS
+- SQLite database with WAL mode for concurrent access
+- Zod runtime schema validation for all inputs
+- Runs as a stdio MCP transport (launched by client applications)
+- Node.js >= 18 required
+
+## Installation and Usage
+
+### Using npx (no installation required)
+
+```bash
+npx -y forgespec-mcp
+```
+
+### Install globally
+
+```bash
+npm install -g forgespec-mcp
+```
+
+### Claude Code
+
+```bash
+claude mcp add forgespec --transport stdio -- npx -y forgespec-mcp
+```
+
+### Codex CLI (`~/.codex/config.toml`)
+
+```toml
+[mcp_servers.forgespec]
+command = "npx"
+args = ["-y", "forgespec-mcp"]
+```
+
+### Gemini CLI (`settings.json`)
+
+```json
+{
+  "mcpServers": {
+    "forgespec": {
+      "command": "npx",
+      "args": ["-y", "forgespec-mcp"]
+    }
+  }
+}
+```
+
+### OpenClaw (`openclaw.json`)
+
+```json5
+mcp: {
+  servers: {
+    forgespec: { command: "npx", args: ["-y", "forgespec-mcp"] }
+  }
+}
+```
+
+## SDD Pipeline
+
+The 9-phase Spec-Driven Development lifecycle:
+
+```
+init → explore → propose → spec → design → tasks → apply → verify → archive
+```
+
+Each phase has confidence thresholds and allowed transitions enforced by the contract validator.
+
+| Phase | Confidence Threshold | Can Transition To |
+|-------|---------------------|-------------------|
+| init | 0.5 | explore, propose |
+| explore | 0.5 | propose, spec |
+| propose | 0.7 | spec, design, init |
+| spec | 0.8 | design, tasks |
+| design | 0.7 | tasks, spec |
+| tasks | 0.8 | apply |
+| apply | 0.6 | verify, tasks |
+| verify | 0.9 | archive, apply |
+| archive | 0.9 | — |
+
+### SDD Contract Schema
+
+Every SDD contract follows this structure:
+
+```typescript
+{
+  schema_version: string;           // defaults to "1.0"
+  phase: SddPhase;                 // init|explore|propose|spec|design|tasks|apply|verify|archive
+  change_name: string;              // 1-256 chars, identifies the change
+  project: string;                  // 1-256 chars, project identifier
+  status: "success" | "partial" | "failed" | "blocked";
+  confidence: number;               // 0.0-1.0 range
+  executive_summary: string;        // 10-65536 chars
+  artifacts_saved: Artifact[];      // max 50 items
+  next_recommended: SddPhase[];     // max 9 phases
+  risks: Risk[];                    // max 50 items
+  data: Record<string, unknown>;   // arbitrary metadata
+}
+```
+
+**Risk object:**
+```typescript
+{ description: string; level: "low" | "medium" | "high" | "critical"; }
+```
+
+**Artifact object:**
+```typescript
+{ topic_key: string; type: "engram" | "openspec" | "inline"; path?: string; }
+```
+
+## Tools Reference (19 total)
+
+### SDD Contract Tools (6 tools)
+
+#### `sdd_validate`
+Validate an SDD contract against the phase schema. Returns validation result with confidence check and allowed transitions.
+
+**Parameters:**
+- `contract` (string, required): JSON string of the SDD contract (max 128KB)
+
+**Returns:** Validation result including `valid`, `confidence_ok`, `threshold`, `allowed_next_phases`, and any `errors`.
+
+#### `sdd_save`
+Validate and persist an SDD contract to the database. The contract must pass validation before it is saved.
+
+**Parameters:**
+- `contract` (string, required): JSON string of the SDD contract (max 128KB)
+
+**Returns:** Saved contract with generated `id` and `created_at` timestamp.
+
+#### `sdd_get`
+Retrieve a single SDD contract by its ID.
+
+**Parameters:**
+- `id` (string, required): Contract ID
+
+**Returns:** Full contract data or not-found error.
+
+#### `sdd_list`
+List all contracts with optional filters.
+
+**Parameters:**
+- `project` (string, optional): Filter by project name
+- `phase` (string, optional): Filter by phase
+
+**Returns:** Array of matching contracts.
+
+#### `sdd_history`
+Get the phase transition history for a project, ordered by creation time.
+
+**Parameters:**
+- `project` (string, required): Project name
+- `change_name` (string, optional): Filter by change name
+
+**Returns:** Array of `{ phase, status, confidence, created_at }` entries.
+
+#### `sdd_phases`
+Get all phase definitions with their allowed transitions and confidence thresholds. No parameters required.
+
+**Returns:** Map of phase names to `{ allowed_next, confidence_threshold }`.
+
+### Task Board Tools (10 tools)
+
+#### `tb_create_board`
+Create a new task board for a project.
+
+**Parameters:**
+- `project` (string, required): Project identifier (alphanumeric, dots, hyphens, underscores)
+- `name` (string, required): Board name (max 256 chars)
+
+**Returns:** Board object with `id`, `project`, `name`, `created_at`.
+
+#### `tb_add_task`
+Add a task to a board with priority, spec reference, acceptance criteria, and dependencies.
+
+**Parameters:**
+- `board_id` (string, required): Board ID
+- `title` (string, required): Task title (max 512 chars)
+- `description` (string, optional): Task description (max 4096 chars)
+- `priority` (string, optional): p0 (critical), p1 (high), p2 (medium, default), p3 (low)
+- `spec_ref` (string, optional): Reference to a spec artifact
+- `acceptance_criteria` (string, optional): Criteria for task completion
+- `dependencies` (string[], optional): Array of task IDs this task depends on
+
+**Returns:** Created task object. Task status starts as `ready` (or `blocked` if dependencies exist).
+
+#### `tb_status`
+Get board status with tasks grouped by their current status.
+
+**Parameters:**
+- `board_id` (string, required): Board ID
+
+**Returns:** Board info plus tasks grouped as `{ backlog, ready, in_progress, in_review, done, blocked }` with counts.
+
+#### `tb_claim`
+Claim a task for an agent. Verifies all dependencies are met before allowing claim.
+
+**Parameters:**
+- `task_id` (string, required): Task ID
+- `agent` (string, required): Agent identifier claiming the task
+
+**Returns:** Updated task with status `in_progress`, assignee set, and `claimed_at` timestamp.
+
+#### `tb_update`
+Update task status. When a task is marked `done`, all dependent tasks with no remaining blockers are automatically moved to `ready`.
+
+**Parameters:**
+- `task_id` (string, required): Task ID
+- `status` (string, required): New status (backlog, ready, in_progress, in_review, done, blocked)
+
+**Returns:** Updated task. If status is `done`, also returns count of unblocked dependent tasks.
+
+#### `tb_unblocked`
+List tasks that are ready to work on — no unresolved dependencies.
+
+**Parameters:**
+- `board_id` (string, required): Board ID
+
+**Returns:** Array of tasks with status `ready` and all dependencies satisfied.
+
+#### `tb_get`
+Get full task details by ID.
+
+**Parameters:**
+- `task_id` (string, required): Task ID
+
+**Returns:** Complete task object with all fields.
+
+#### `tb_delete_task`
+Delete a task. Only tasks in `backlog` or `done` status can be deleted. Automatically cleans up this task from other tasks' dependency lists.
+
+**Parameters:**
+- `task_id` (string, required): Task ID
+
+**Returns:** Confirmation of deletion.
+
+#### `tb_add_notes`
+Append timestamped notes to a task.
+
+**Parameters:**
+- `task_id` (string, required): Task ID
+- `text` (string, required): Note text (max 4096 chars)
+
+**Returns:** Updated task with new note appended.
+
+#### `tb_list`
+List all boards, optionally filtered by project.
+
+**Parameters:**
+- `project` (string, optional): Filter by project name
+
+**Returns:** Array of board objects.
+
+### File Reservation Tools (3 tools)
+
+#### `file_reserve`
+Reserve files or glob patterns to prevent conflicts between agents. Reservations expire after the specified TTL.
+
+**Parameters:**
+- `patterns` (string[], required): File paths or glob patterns to reserve (max 50)
+- `agent` (string, required): Agent identifier making the reservation
+- `ttl_minutes` (number, optional): Time-to-live in minutes (default 15, max 1440)
+
+**Returns:** Created reservation objects with expiration timestamps.
+
+#### `file_check`
+Check for active conflicts on file patterns. Reports which patterns conflict and with which agent's existing reservations.
+
+**Parameters:**
+- `patterns` (string[], required): File paths or glob patterns to check
+
+**Returns:** Array of conflicts with `{ pattern, conflicting_pattern, agent, expires_at }`.
+
+#### `file_release`
+Release file reservations for an agent.
+
+**Parameters:**
+- `agent` (string, required): Agent identifier
+- `patterns` (string[], optional): Specific patterns to release. If omitted, releases all reservations for the agent.
+
+**Returns:** Count of released reservations.
+
+## Database Schema
+
+SQLite with WAL mode, foreign keys enabled. Stored at `~/.forgespec/forgespec.db` by default.
+
+### Tables
+
+**contracts** — SDD contract storage
+- `id` (TEXT PK), `phase`, `change_name`, `project`, `status`, `confidence` (REAL), `executive_summary`, `data` (JSON TEXT), `created_at`
+
+**boards** — Task board definitions
+- `id` (TEXT PK), `project`, `name`, `created_at`, `updated_at`
+
+**tasks** — Individual tasks within boards
+- `id` (TEXT PK), `board_id` (FK → boards), `title`, `description`, `status`, `priority`, `assignee`, `spec_ref`, `acceptance_criteria`, `dependencies` (JSON array), `notes` (JSON array of {text, timestamp}), `created_at`, `updated_at`, `claimed_at`, `completed_at`
+
+**file_reservations** — Active file locks
+- `id` (TEXT PK), `pattern`, `agent`, `expires_at`, `created_at`
+
+**audit_log** — Action audit trail
+- `id` (INTEGER PK AUTOINCREMENT), `timestamp`, `action`, `entity_type`, `entity_id`, `agent_name`, `details`
+
+### Indexes
+- `idx_tasks_board` on tasks(board_id)
+- `idx_tasks_status` on tasks(status)
+- `idx_contracts_project` on contracts(project)
+- `idx_reservations_agent` on file_reservations(agent)
+
+### SQLite Configuration
+- WAL journal mode for concurrent reads
+- Synchronous = NORMAL
+- 32MB cache size
+- Memory temp store
+- 5-second busy timeout
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FORGESPEC_DIR` | `~/.forgespec` | Database directory |
+| `FORGESPEC_DB` | `~/.forgespec/forgespec.db` | Full database path (overrides FORGESPEC_DIR) |
+
+## Project Structure
+
+```
+src/
+  index.ts              — Entry point: stdio transport bootstrap
+  server.ts             — MCP server factory, registers tool groups
+  types/index.ts        — Zod schemas, TypeScript types, phase definitions
+  database/index.ts     — SQLite initialization, schema creation, WAL config
+  tools/
+    sdd-contracts.ts    — 6 SDD contract management tools
+    task-board.ts       — 10 task board tools with dependency logic
+    file-reservation.ts — 3 file reservation tools with pattern matching
+  utils/id.ts           — UUID-based ID generation with prefixes
+tests/
+  sdd-contracts.test.ts — Schema validation, phase transitions, confidence thresholds
+  tools.test.ts         — Database tool integration tests
+```
+
+## Dependencies
+
+### Production
+- `@modelcontextprotocol/sdk` ^1.29.0 — MCP protocol implementation
+- `better-sqlite3` ^11.8.0 — Embedded SQLite database
+- `zod` ^3.23.0 — Runtime schema validation
+
+### Development
+- `typescript` ^5.7.0 — TypeScript compiler
+- `vitest` ^3.0.0 — Test runner
+- `tsx` ^4.0.0 — TypeScript executor with hot reload
+- `@types/better-sqlite3` ^7.6.12 — Type definitions
+- `@types/node` ^22.0.0 — Node.js types
+
+## Development
+
+```bash
+git clone https://github.com/lleontor705/forgespec-mcp.git
+cd forgespec-mcp
+npm install
+npm run dev       # Run with tsx (hot reload)
+npm test          # Run tests with vitest
+npm run build     # Compile TypeScript to build/
+npm run lint      # Type check (tsc --noEmit)
+npm run inspect   # Open MCP Inspector
+```
+
+## License
+
+MIT
