@@ -80,15 +80,16 @@ mcp: {
 
 | Tool | Description |
 |------|-------------|
-| `board_create` | Create a new task board |
-| `board_status` | Get board status with tasks grouped by status |
-| `board_list` | List all boards |
-| `task_add` | Add a task with priority, spec ref, and acceptance criteria |
-| `task_claim` | Claim a task (checks dependencies) |
-| `task_update` | Update task status (auto-unblocks dependents) |
-| `task_delete` | Delete a task (backlog/done only), cleans up dependencies |
-| `task_notes` | Append timestamped notes to a task |
-| `task_unblocked` | List tasks ready to work on |
+| `tb_create_board` | Create a new task board for a project |
+| `tb_add_task` | Add a task with priority, spec ref, acceptance criteria, and dependencies |
+| `tb_status` | Get board status with tasks grouped by status |
+| `tb_claim` | Claim a task (checks dependencies, auto-moves to in_progress) |
+| `tb_update` | Update task status (auto-unblocks dependents on completion) |
+| `tb_unblocked` | List tasks ready to work on (no unresolved dependencies) |
+| `tb_get` | Get full task details by ID |
+| `tb_delete_task` | Delete a task (backlog/done only), cleans up dependencies |
+| `tb_add_notes` | Append timestamped notes to a task |
+| `tb_list` | List all boards (optionally filtered by project) |
 
 ### File Reservation Tools
 
