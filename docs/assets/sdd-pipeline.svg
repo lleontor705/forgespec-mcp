@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 200" fill="none">
+  <defs>
+    <linearGradient id="phase-init" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1"/>
+      <stop offset="100%" style="stop-color:#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="phase-explore" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#8b5cf6"/>
+      <stop offset="100%" style="stop-color:#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="phase-propose" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#a78bfa"/>
+      <stop offset="100%" style="stop-color:#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="phase-spec" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#06b6d4"/>
+      <stop offset="100%" style="stop-color:#0891b2"/>
+    </linearGradient>
+    <linearGradient id="phase-design" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#14b8a6"/>
+      <stop offset="100%" style="stop-color:#0d9488"/>
+    </linearGradient>
+    <linearGradient id="phase-tasks" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f59e0b"/>
+      <stop offset="100%" style="stop-color:#d97706"/>
+    </linearGradient>
+    <linearGradient id="phase-apply" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f97316"/>
+      <stop offset="100%" style="stop-color:#ea580c"/>
+    </linearGradient>
+    <linearGradient id="phase-verify" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#22c55e"/>
+      <stop offset="100%" style="stop-color:#16a34a"/>
+    </linearGradient>
+    <linearGradient id="phase-archive" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#10b981"/>
+      <stop offset="100%" style="stop-color:#059669"/>
+    </linearGradient>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+
+  <!-- Title -->
+  <text x="460" y="25" font-family="system-ui, sans-serif" font-size="16" font-weight="600" fill="#e2e8f0" text-anchor="middle">
+    SDD Pipeline — 9 Phases of Spec-Driven Development
+  </text>
+
+  <!-- Phase boxes -->
+  <!-- init -->
+  <g transform="translate(10, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-init)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">init</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.5</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M100 75 L112 75" stroke="#475569" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- explore -->
+  <g transform="translate(112, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-explore)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">explore</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.5</text>
+  </g>
+
+  <path d="M202 75 L214 75" stroke="#475569" stroke-width="2"/>
+
+  <!-- propose -->
+  <g transform="translate(214, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-propose)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">propose</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.7</text>
+  </g>
+
+  <path d="M304 75 L316 75" stroke="#475569" stroke-width="2"/>
+
+  <!-- spec -->
+  <g transform="translate(316, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-spec)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">spec</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.8</text>
+  </g>
+
+  <path d="M406 75 L418 75" stroke="#475569" stroke-width="2"/>
+
+  <!-- design -->
+  <g transform="translate(418, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-design)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">design</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.7</text>
+  </g>
+
+  <path d="M508 75 L520 75" stroke="#475569" stroke-width="2"/>
+
+  <!-- tasks -->
+  <g transform="translate(520, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-tasks)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">tasks</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.8</text>
+  </g>
+
+  <path d="M610 75 L622 75" stroke="#475569" stroke-width="2"/>
+
+  <!-- apply -->
+  <g transform="translate(622, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-apply)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">apply</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.6</text>
+  </g>
+
+  <path d="M712 75 L724 75" stroke="#475569" stroke-width="2"/>
+
+  <!-- verify -->
+  <g transform="translate(724, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-verify)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">verify</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.9</text>
+  </g>
+
+  <path d="M814 75 L826 75" stroke="#475569" stroke-width="2"/>
+
+  <!-- archive -->
+  <g transform="translate(826, 45)" filter="url(#shadow)">
+    <rect width="85" height="60" rx="8" fill="url(#phase-archive)"/>
+    <text x="42" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="white" text-anchor="middle">archive</text>
+    <text x="42" y="48" font-family="system-ui, sans-serif" font-size="9" fill="rgba(255,255,255,0.8)" text-anchor="middle">threshold: 0.9</text>
+  </g>
+
+  <!-- Description labels below -->
+  <text x="52" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Bootstrap</text>
+  <text x="154" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Investigate</text>
+  <text x="256" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Proposal</text>
+  <text x="358" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Specifications</text>
+  <text x="460" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Architecture</text>
+  <text x="562" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Decompose</text>
+  <text x="664" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Implement</text>
+  <text x="766" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Validate</text>
+  <text x="868" y="135" font-family="system-ui, sans-serif" font-size="9" fill="#94a3b8" text-anchor="middle">Finalize</text>
+
+  <!-- Legend -->
+  <g transform="translate(250, 160)">
+    <rect x="0" y="0" width="12" height="12" rx="2" fill="#6366f1"/>
+    <text x="18" y="10" font-family="system-ui, sans-serif" font-size="10" fill="#94a3b8">Planning</text>
+    <rect x="90" y="0" width="12" height="12" rx="2" fill="#06b6d4"/>
+    <text x="108" y="10" font-family="system-ui, sans-serif" font-size="10" fill="#94a3b8">Specification</text>
+    <rect x="205" y="0" width="12" height="12" rx="2" fill="#f59e0b"/>
+    <text x="223" y="10" font-family="system-ui, sans-serif" font-size="10" fill="#94a3b8">Execution</text>
+    <rect x="305" y="0" width="12" height="12" rx="2" fill="#22c55e"/>
+    <text x="323" y="10" font-family="system-ui, sans-serif" font-size="10" fill="#94a3b8">Quality Gate</text>
+  </g>
+</svg>

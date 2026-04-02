@@ -2,11 +2,12 @@ name: Release
 
 on:
   push:
-    branches: [master]
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag (e.g. v1.1.0)"
+        description: "Version tag (e.g. v1.3.0)"
         required: true
         type: string
 
@@ -54,8 +55,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
           else
-            PKG_VERSION=$(node -p "require('./package.json').version")
-            TAG="v${PKG_VERSION}"
+            TAG="${GITHUB_REF#refs/tags/}"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           npm version "${TAG#v}" --no-git-tag-version --allow-same-version
@@ -65,10 +65,9 @@ jobs:
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Create tag and release
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.version.outputs.tag }}"
-          git tag "$TAG" 2>/dev/null && git push origin "$TAG" || echo "Tag exists"
           gh release create "$TAG" --title "$TAG" --generate-notes || echo "Release exists"
