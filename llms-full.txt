@@ -1,13 +1,33 @@
-# forgespec-mcp
+# ForgeSpec MCP
 
-> MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, and advisory file locking to coordinate work across multiple AI agents. Built on the Model Context Protocol SDK with better-sqlite3 and Zod schema validation.
+> The coordination backbone for multi-agent AI development. MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, and advisory file locking to coordinate work across multiple AI agents. Built on the Model Context Protocol SDK with better-sqlite3 and Zod schema validation.
+
+## Why ForgeSpec?
+
+Building software with multiple AI agents introduces coordination challenges that don't exist in single-agent workflows:
+
+| Problem | Without ForgeSpec | With ForgeSpec |
+|---------|-------------------|----------------|
+| Conflicting edits | Two agents modify the same file, causing merge conflicts | File reservation with TTL prevents conflicts |
+| No shared context | Each agent works in isolation | Contract validation creates shared audit trail |
+| Unstructured work | Agents jump to code without specs | 9-phase pipeline enforces structured flow |
+| Lost progress | No way to resume after failure | SQLite task board persists state |
+| No quality gates | Code ships without validation | Confidence thresholds block premature transitions |
+
+**Key advantages:**
+- Zero infrastructure — Embedded SQLite, no external services required
+- Universal compatibility — Any MCP client (Claude Code, Codex CLI, Gemini CLI, OpenClaw)
+- Instant setup — One command: `npx -y forgespec-mcp`
+- Battle-tested pipeline — 9 phases with confidence thresholds
+- Full audit trail — Every contract, task, and reservation is logged with timestamps
+- Cross-platform — Tested on Ubuntu, Windows, macOS with Node 18, 20, 22
 
 ## Overview
 
 forgespec-mcp is an MCP (Model Context Protocol) server designed for multi-agent AI development workflows. It enforces a structured 9-phase development pipeline through typed contracts, manages tasks with intelligent dependency resolution, and provides advisory file locking for agent coordination.
 
 **Key characteristics:**
-- TypeScript, compiled to ES2022 CommonJS
+- TypeScript, compiled to ES2022 with Node16 module resolution
 - SQLite database with WAL mode for concurrent access
 - Zod runtime schema validation for all inputs
 - Runs as a stdio MCP transport (launched by client applications)
@@ -74,17 +94,17 @@ init → explore → propose → spec → design → tasks → apply → verify 
 
 Each phase has confidence thresholds and allowed transitions enforced by the contract validator.
 
-| Phase | Confidence Threshold | Can Transition To |
-|-------|---------------------|-------------------|
-| init | 0.5 | explore, propose |
-| explore | 0.5 | propose, spec |
-| propose | 0.7 | spec, design, init |
-| spec | 0.8 | design, tasks |
-| design | 0.7 | tasks, spec |
-| tasks | 0.8 | apply |
-| apply | 0.6 | verify, tasks |
-| verify | 0.9 | archive, apply |
-| archive | 0.9 | — |
+| Phase | Confidence Threshold | Can Transition To | Purpose |
+|-------|---------------------|-------------------|---------|
+| init | 0.5 | explore, propose | Bootstrap project context and conventions |
+| explore | 0.5 | propose, spec | Investigate codebase, diagnose issues |
+| propose | 0.7 | spec, design, init | Draft change proposal with scope and risks |
+| spec | 0.8 | design, tasks | Write detailed specifications with Given/When/Then |
+| design | 0.7 | tasks, spec | Define architecture, data flows, file changes |
+| tasks | 0.8 | apply | Decompose into dependency-ordered implementation tasks |
+| apply | 0.6 | verify, tasks | Execute implementation (partial completion allowed) |
+| verify | 0.9 | archive, apply | Validate implementation against specs |
+| archive | 0.9 | — | Merge specs, generate retrospective |
 
 ### SDD Contract Schema
 
@@ -126,7 +146,16 @@ Validate an SDD contract against the phase schema. Returns validation result wit
 **Parameters:**
 - `contract` (string, required): JSON string of the SDD contract (max 128KB)
 
-**Returns:** Validation result including `valid`, `confidence_ok`, `threshold`, `allowed_next_phases`, and any `errors`.
+**Returns:** `{ valid, phase, confidence, threshold, meets_confidence, allowed_next_phases, warnings }` or `{ valid: false, errors }`.
+
+**Example:**
+```jsonc
+// Input
+{ "contract": "{\"phase\":\"propose\",\"change_name\":\"add-auth\",\"project\":\"my-app\",\"status\":\"success\",\"confidence\":0.85,\"executive_summary\":\"Add JWT auth service with login/logout endpoints.\"}" }
+
+// Output
+{ "valid": true, "phase": "propose", "confidence": 0.85, "threshold": 0.7, "meets_confidence": true, "allowed_next_phases": ["spec", "design", "init"], "warnings": [] }
+```
 
 #### `sdd_save`
 Validate and persist an SDD contract to the database. The contract must pass validation before it is saved.
@@ -134,38 +163,61 @@ Validate and persist an SDD contract to the database. The contract must pass val
 **Parameters:**
 - `contract` (string, required): JSON string of the SDD contract (max 128KB)
 
-**Returns:** Saved contract with generated `id` and `created_at` timestamp.
+**Returns:** `{ saved: true, id, phase, project }` or `{ saved: false, error }`.
+
+**Example:**
+```jsonc
+// Input
+{ "contract": "{\"phase\":\"propose\",\"change_name\":\"add-auth\",\"project\":\"my-app\",\"status\":\"success\",\"confidence\":0.85,\"executive_summary\":\"Add JWT auth service.\"}" }
+
+// Output
+{ "saved": true, "id": "sdd_a1b2c3d4-...", "phase": "propose", "project": "my-app" }
+```
 
 #### `sdd_get`
 Retrieve a single SDD contract by its ID.
 
 **Parameters:**
-- `id` (string, required): Contract ID
+- `contract_id` (string, required): Contract ID
 
-**Returns:** Full contract data or not-found error.
+**Returns:** Full contract data or `{ error: "Contract {id} not found" }`.
 
 #### `sdd_list`
 List all contracts with optional filters.
 
 **Parameters:**
-- `project` (string, optional): Filter by project name
-- `phase` (string, optional): Filter by phase
+- `project` (string, optional): Filter by project name (alphanumeric, dots, hyphens, underscores)
+- `phase` (string, optional): Filter by SDD phase
+- `limit` (number, optional): Max entries (1-100, default 20)
 
-**Returns:** Array of matching contracts.
+**Returns:** `{ contracts: [...], count }`.
 
 #### `sdd_history`
-Get the phase transition history for a project, ordered by creation time.
+Get the phase transition history for a project, ordered chronologically.
 
 **Parameters:**
-- `project` (string, required): Project name
-- `change_name` (string, optional): Filter by change name
+- `project` (string, required): Project name (alphanumeric, dots, hyphens, underscores)
+- `limit` (number, optional): Max entries (1-100, default 20)
 
-**Returns:** Array of `{ phase, status, confidence, created_at }` entries.
+**Returns:** `{ project, history: [{ id, phase, change_name, status, confidence, executive_summary, created_at }] }`.
+
+**Example:**
+```jsonc
+// Input
+{ "project": "my-app", "limit": 3 }
+
+// Output
+{ "project": "my-app", "history": [
+  { "id": "sdd_...", "phase": "verify", "change_name": "add-auth", "status": "success", "confidence": 0.92, "created_at": "2025-01-15T10:45:00Z" },
+  { "id": "sdd_...", "phase": "apply", "change_name": "add-auth", "status": "success", "confidence": 0.78, "created_at": "2025-01-15T10:30:00Z" },
+  { "id": "sdd_...", "phase": "spec", "change_name": "add-auth", "status": "success", "confidence": 0.85, "created_at": "2025-01-15T09:00:00Z" }
+]}
+```
 
 #### `sdd_phases`
 Get all phase definitions with their allowed transitions and confidence thresholds. No parameters required.
 
-**Returns:** Map of phase names to `{ allowed_next, confidence_threshold }`.
+**Returns:** `{ phases: [{ phase, confidence_threshold, can_transition_to }] }`.
 
 ### Task Board Tools (10 tools)
 
@@ -176,21 +228,39 @@ Create a new task board for a project.
 - `project` (string, required): Project identifier (alphanumeric, dots, hyphens, underscores)
 - `name` (string, required): Board name (max 256 chars)
 
-**Returns:** Board object with `id`, `project`, `name`, `created_at`.
+**Returns:** `{ created: true, board_id, project, name }`.
+
+**Example:**
+```jsonc
+// Input
+{ "project": "my-app", "name": "add-auth-service" }
+
+// Output
+{ "created": true, "board_id": "board_x7k9m2...", "project": "my-app", "name": "add-auth-service" }
+```
 
 #### `tb_add_task`
 Add a task to a board with priority, spec reference, acceptance criteria, and dependencies.
 
 **Parameters:**
 - `board_id` (string, required): Board ID
-- `title` (string, required): Task title (max 512 chars)
-- `description` (string, optional): Task description (max 4096 chars)
+- `title` (string, required): Task title (3-512 chars)
+- `description` (string, optional): Task description (max 65536 chars)
 - `priority` (string, optional): p0 (critical), p1 (high), p2 (medium, default), p3 (low)
-- `spec_ref` (string, optional): Reference to a spec artifact
-- `acceptance_criteria` (string, optional): Criteria for task completion
+- `spec_ref` (string, optional): Reference to a spec artifact (max 512 chars)
+- `acceptance_criteria` (string, optional): Criteria for task completion (max 65536 chars)
 - `dependencies` (string[], optional): Array of task IDs this task depends on
 
-**Returns:** Created task object. Task status starts as `ready` (or `blocked` if dependencies exist).
+**Returns:** `{ created: true, task_id, board_id, title, priority }`.
+
+**Example:**
+```jsonc
+// Input
+{ "board_id": "board_x7k9m2...", "title": "Create JWT utility module", "priority": "p0", "spec_ref": "sdd/add-auth/spec", "acceptance_criteria": "All token operations pass unit tests", "dependencies": [] }
+
+// Output
+{ "created": true, "task_id": "task_abc123...", "board_id": "board_x7k9m2...", "title": "Create JWT utility module", "priority": "p0" }
+```
 
 #### `tb_status`
 Get board status with tasks grouped by their current status.
@@ -198,25 +268,47 @@ Get board status with tasks grouped by their current status.
 **Parameters:**
 - `board_id` (string, required): Board ID
 
-**Returns:** Board info plus tasks grouped as `{ backlog, ready, in_progress, in_review, done, blocked }` with counts.
+**Returns:** `{ board, tasks: { backlog, ready, in_progress, in_review, done, blocked }, summary: { total, by_status } }`.
 
 #### `tb_claim`
-Claim a task for an agent. Verifies all dependencies are met before allowing claim.
+Claim a task for an agent. Verifies all dependencies are met before allowing claim. Only tasks in `ready` or `backlog` status can be claimed.
 
 **Parameters:**
 - `task_id` (string, required): Task ID
-- `agent` (string, required): Agent identifier claiming the task
+- `agent` (string, required): Agent identifier (alphanumeric, dots, hyphens, underscores)
 
-**Returns:** Updated task with status `in_progress`, assignee set, and `claimed_at` timestamp.
+**Returns:** `{ claimed: true, task_id, agent, status: "in_progress" }` or error with blockers.
+
+**Example:**
+```jsonc
+// Input
+{ "task_id": "task_abc123...", "agent": "implement-agent-1" }
+
+// Output (success)
+{ "claimed": true, "task_id": "task_abc123...", "agent": "implement-agent-1", "status": "in_progress" }
+
+// Output (blocked)
+{ "error": "Blocked by unfinished dependencies", "blockers": [{ "id": "task_xyz...", "status": "in_progress" }] }
+```
 
 #### `tb_update`
-Update task status. When a task is marked `done`, all dependent tasks with no remaining blockers are automatically moved to `ready`.
+Update task status. When a task is marked `done`, all dependent tasks with no remaining blockers are automatically moved to `ready`. Moving to `done` requires the task to be in `in_progress` or `in_review`.
 
 **Parameters:**
 - `task_id` (string, required): Task ID
 - `status` (string, required): New status (backlog, ready, in_progress, in_review, done, blocked)
+- `notes` (string, optional): Notes about the update (max 65536 chars)
 
-**Returns:** Updated task. If status is `done`, also returns count of unblocked dependent tasks.
+**Returns:** `{ updated: true, task_id, status, unblocked_tasks, notes }`.
+
+**Example:**
+```jsonc
+// Input
+{ "task_id": "task_abc123...", "status": "done", "notes": "JWT module complete with RS256" }
+
+// Output
+{ "updated": true, "task_id": "task_abc123...", "status": "done", "unblocked_tasks": ["task_def456..."], "notes": "JWT module complete with RS256" }
+```
 
 #### `tb_unblocked`
 List tasks that are ready to work on — no unresolved dependencies.
@@ -224,7 +316,7 @@ List tasks that are ready to work on — no unresolved dependencies.
 **Parameters:**
 - `board_id` (string, required): Board ID
 
-**Returns:** Array of tasks with status `ready` and all dependencies satisfied.
+**Returns:** `{ board_id, unblocked_count, tasks: [...] }`.
 
 #### `tb_get`
 Get full task details by ID.
@@ -232,24 +324,24 @@ Get full task details by ID.
 **Parameters:**
 - `task_id` (string, required): Task ID
 
-**Returns:** Complete task object with all fields.
+**Returns:** `{ task: { id, board_id, title, description, status, priority, assignee, spec_ref, acceptance_criteria, dependencies, notes, created_at, updated_at, claimed_at, completed_at } }`.
 
 #### `tb_delete_task`
-Delete a task. Only tasks in `backlog` or `done` status can be deleted. Automatically cleans up this task from other tasks' dependency lists.
+Delete a task. Only tasks in `backlog` or `done` status can be deleted. Automatically removes this task from other tasks' dependency lists.
 
 **Parameters:**
 - `task_id` (string, required): Task ID
 
-**Returns:** Confirmation of deletion.
+**Returns:** `{ deleted: true, task_id }`.
 
 #### `tb_add_notes`
-Append timestamped notes to a task.
+Append timestamped notes to a task without changing its status.
 
 **Parameters:**
 - `task_id` (string, required): Task ID
-- `text` (string, required): Note text (max 4096 chars)
+- `notes` (string, required): Note text (max 65536 chars)
 
-**Returns:** Updated task with new note appended.
+**Returns:** `{ added: true, task_id, notes_count }`.
 
 #### `tb_list`
 List all boards, optionally filtered by project.
@@ -257,36 +349,58 @@ List all boards, optionally filtered by project.
 **Parameters:**
 - `project` (string, optional): Filter by project name
 
-**Returns:** Array of board objects.
+**Returns:** `{ boards: [...] }`.
 
 ### File Reservation Tools (3 tools)
 
 #### `file_reserve`
-Reserve files or glob patterns to prevent conflicts between agents. Reservations expire after the specified TTL.
+Reserve files or glob patterns to prevent conflicts between agents. Reservations expire after the specified TTL. Checks for conflicts before reserving.
 
 **Parameters:**
-- `patterns` (string[], required): File paths or glob patterns to reserve (max 50)
-- `agent` (string, required): Agent identifier making the reservation
-- `ttl_minutes` (number, optional): Time-to-live in minutes (default 15, max 1440)
+- `patterns` (string[], required): File paths or glob patterns (e.g. `["src/auth/**", "package.json"]`)
+- `agent` (string, required): Agent identifier (alphanumeric, dots, hyphens, underscores)
+- `ttl_minutes` (number, optional): Time-to-live in minutes (default 15)
 
-**Returns:** Created reservation objects with expiration timestamps.
+**Returns:** `{ reserved: true, reservation_ids, agent, patterns, expires_at }` or `{ reserved: false, conflicts }`.
+
+**Example:**
+```jsonc
+// Input
+{ "patterns": ["src/auth/**", "src/middleware/auth.ts"], "agent": "implement-agent-1", "ttl_minutes": 30 }
+
+// Output (success)
+{ "reserved": true, "reservation_ids": ["res_..."], "agent": "implement-agent-1", "patterns": ["src/auth/**", "src/middleware/auth.ts"], "expires_at": "2025-01-15T10:30:00.000Z" }
+
+// Output (conflict)
+{ "reserved": false, "conflicts": [{ "pattern": "src/auth/**", "held_by": "implement-agent-2", "expires_at": "2025-01-15T10:15:00.000Z" }] }
+```
 
 #### `file_check`
-Check for active conflicts on file patterns. Reports which patterns conflict and with which agent's existing reservations.
+Check for active conflicts on file patterns against other agents' reservations.
 
 **Parameters:**
 - `patterns` (string[], required): File paths or glob patterns to check
+- `agent` (string, required): Agent checking (excludes own reservations)
 
-**Returns:** Array of conflicts with `{ pattern, conflicting_pattern, agent, expires_at }`.
+**Returns:** `{ has_conflicts, conflicts: [{ pattern, held_by, expires_at }] }`.
+
+**Example:**
+```jsonc
+// Input
+{ "patterns": ["src/auth/jwt.ts"], "agent": "implement-agent-2" }
+
+// Output
+{ "has_conflicts": true, "conflicts": [{ "pattern": "src/auth/**", "held_by": "implement-agent-1", "expires_at": "2025-01-15T10:30:00.000Z" }] }
+```
 
 #### `file_release`
 Release file reservations for an agent.
 
 **Parameters:**
-- `agent` (string, required): Agent identifier
+- `agent` (string, required): Agent identifier (alphanumeric, dots, hyphens, underscores)
 - `patterns` (string[], optional): Specific patterns to release. If omitted, releases all reservations for the agent.
 
-**Returns:** Count of released reservations.
+**Returns:** `{ released: true, count, agent }`.
 
 ## Database Schema
 
@@ -301,7 +415,7 @@ SQLite with WAL mode, foreign keys enabled. Stored at `~/.forgespec/forgespec.db
 - `id` (TEXT PK), `project`, `name`, `created_at`, `updated_at`
 
 **tasks** — Individual tasks within boards
-- `id` (TEXT PK), `board_id` (FK → boards), `title`, `description`, `status`, `priority`, `assignee`, `spec_ref`, `acceptance_criteria`, `dependencies` (JSON array), `notes` (JSON array of {text, timestamp}), `created_at`, `updated_at`, `claimed_at`, `completed_at`
+- `id` (TEXT PK), `board_id` (FK → boards, CASCADE delete), `title`, `description`, `status`, `priority`, `assignee`, `spec_ref`, `acceptance_criteria`, `dependencies` (JSON array), `notes` (JSON array of {text, timestamp}), `created_at`, `updated_at`, `claimed_at`, `completed_at`
 
 **file_reservations** — Active file locks
 - `id` (TEXT PK), `pattern`, `agent`, `expires_at`, `created_at`
@@ -345,6 +459,11 @@ src/
 tests/
   sdd-contracts.test.ts — Schema validation, phase transitions, confidence thresholds
   tools.test.ts         — Database tool integration tests
+docs/
+  assets/
+    logo.svg            — ForgeSpec logo
+    sdd-pipeline.svg    — SDD pipeline diagram
+    architecture.svg    — Architecture overview diagram
 ```
 
 ## Dependencies
@@ -356,8 +475,9 @@ tests/
 
 ### Development
 - `typescript` ^5.7.0 — TypeScript compiler
-- `vitest` ^3.0.0 — Test runner
+- `vitest` ^3.0.0 — Test runner with v8 coverage
 - `tsx` ^4.0.0 — TypeScript executor with hot reload
+- `standard-version` ^9.5.0 — Automatic semantic versioning from conventional commits
 - `@types/better-sqlite3` ^7.6.12 — Type definitions
 - `@types/node` ^22.0.0 — Node.js types
 
@@ -372,6 +492,24 @@ npm test          # Run tests with vitest
 npm run build     # Compile TypeScript to build/
 npm run lint      # Type check (tsc --noEmit)
 npm run inspect   # Open MCP Inspector
+```
+
+## Versioning
+
+ForgeSpec uses conventional commits with automatic semver bumping via standard-version:
+
+```bash
+# Commits determine the version bump:
+#   fix: ...    → patch (1.2.0 → 1.2.1)
+#   feat: ...   → minor (1.2.0 → 1.3.0)
+#   feat!: ...  → major (1.2.0 → 2.0.0)
+
+npm run release            # Auto-bump from commits
+npm run release:patch      # Force patch bump
+npm run release:minor      # Force minor bump
+npm run release:major      # Force major bump
+
+git push --follow-tags origin master   # Triggers CI/CD → npm publish
 ```
 
 ## License
