@@ -47,7 +47,7 @@ export const RiskSchema = z.object({
 
 export const ArtifactSchema = z.object({
   topic_key: z.string().max(512),
-  type: z.enum(["engram", "openspec", "inline"]),
+  type: z.enum(["cortex", "openspec", "inline"]),
   path: z.string().max(1024).optional(),
 }).strict();
 
