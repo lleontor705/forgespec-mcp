@@ -36,6 +36,42 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 - **Battle-tested pipeline** -- 9 phases with confidence thresholds prevent premature phase transitions
 - **Audit trail** -- Every contract, task transition, and file reservation is logged with timestamps
 - **Cross-platform** -- Tested on Ubuntu, Windows, and macOS with Node 18, 20, and 22
+- **Cortex-ready** -- Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph across sessions
+
+---
+
+## Recommended: Pair with Cortex
+
+ForgeSpec manages the **workflow** (contracts, tasks, file locks). [**Cortex**](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Together they form a complete multi-agent coordination stack:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   MCP Clients                       │
+│   Claude Code  ·  Codex CLI  ·  Gemini CLI  · ...  │
+└──────────┬──────────────────────────┬───────────────┘
+           │                          │
+     ┌─────▼─────┐            ┌──────▼──────┐
+     │ ForgeSpec  │            │   Cortex    │
+     │  MCP       │◄──────────►│   MCP       │
+     │            │  artifact  │             │
+     │ Contracts  │  type:     │ Observations│
+     │ Task Board │  "cortex"  │ Knowledge   │
+     │ File Locks │            │ Graph       │
+     └────────────┘            └─────────────┘
+```
+
+- **ForgeSpec** validates and persists SDD contracts, manages task dependencies, prevents file conflicts
+- **Cortex** stores artifacts as observations, connects them via knowledge graph, enables session recovery
+- Artifacts saved with `type: "cortex"` are persisted to Cortex via `mem_save` and linked with `mem_relate`
+
+Install both for the full experience:
+
+```bash
+claude mcp add forgespec --transport stdio -- npx -y forgespec-mcp
+claude mcp add cortex --transport stdio -- npx -y @anthropic/cortex-mcp
+```
+
+> ForgeSpec works standalone without Cortex -- artifacts can also use `type: "openspec"` (filesystem) or `type: "inline"` (returned in response).
 
 ---
 
@@ -181,7 +217,7 @@ An AI agent completing the "propose" phase saves its work as a validated contrac
 ```jsonc
 // Tool: sdd_validate
 {
-  "contract": "{\"phase\":\"propose\",\"change_name\":\"add-auth-service\",\"project\":\"my-app\",\"status\":\"success\",\"confidence\":0.85,\"executive_summary\":\"Add JWT-based authentication service with login, logout, and token refresh endpoints. Affects 4 files in src/auth/.\",\"artifacts_saved\":[{\"topic_key\":\"sdd/add-auth-service/proposal\",\"type\":\"engram\"}],\"next_recommended\":[\"spec\",\"design\"],\"risks\":[{\"description\":\"Token storage strategy needs security review\",\"level\":\"medium\"}]}"
+  "contract": "{\"phase\":\"propose\",\"change_name\":\"add-auth-service\",\"project\":\"my-app\",\"status\":\"success\",\"confidence\":0.85,\"executive_summary\":\"Add JWT-based authentication service with login, logout, and token refresh endpoints. Affects 4 files in src/auth/.\",\"artifacts_saved\":[{\"topic_key\":\"sdd/add-auth-service/proposal\",\"type\":\"cortex\"}],\"next_recommended\":[\"spec\",\"design\"],\"risks\":[{\"description\":\"Token storage strategy needs security review\",\"level\":\"medium\"}]}"
 }
 
 // Response:

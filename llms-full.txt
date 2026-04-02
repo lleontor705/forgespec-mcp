@@ -21,6 +21,16 @@ Building software with multiple AI agents introduces coordination challenges tha
 - Battle-tested pipeline — 9 phases with confidence thresholds
 - Full audit trail — Every contract, task, and reservation is logged with timestamps
 - Cross-platform — Tested on Ubuntu, Windows, macOS with Node 18, 20, 22
+- Cortex-ready — Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph
+
+## Recommended: Pair with Cortex
+
+ForgeSpec manages the **workflow** (contracts, tasks, file locks). [Cortex](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Together they form a complete multi-agent coordination stack:
+
+- **ForgeSpec** validates SDD contracts, manages task dependencies, prevents file conflicts
+- **Cortex** stores artifacts as observations, connects them via knowledge graph, enables session recovery
+- Artifacts saved with `type: "cortex"` are persisted to Cortex via `mem_save` and linked with `mem_relate`
+- ForgeSpec works standalone without Cortex — artifacts can also use `type: "openspec"` (filesystem) or `type: "inline"` (returned in response)
 
 ## Overview
 
@@ -133,7 +143,7 @@ Every SDD contract follows this structure:
 
 **Artifact object:**
 ```typescript
-{ topic_key: string; type: "engram" | "openspec" | "inline"; path?: string; }
+{ topic_key: string; type: "cortex" | "openspec" | "inline"; path?: string; }
 ```
 
 ## Tools Reference (19 total)
