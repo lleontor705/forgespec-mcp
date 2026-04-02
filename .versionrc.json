@@ -1,0 +1,15 @@
+{
+  "types": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Refactoring" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "chore", "section": "Maintenance", "hidden": true },
+    { "type": "ci", "hidden": true }
+  ],
+  "header": "# Changelog\n\nAll notable changes to ForgeSpec MCP are documented here.\n",
+  "commitUrlFormat": "https://github.com/lleontor705/forgespec-mcp/commit/{{hash}}",
+  "compareUrlFormat": "https://github.com/lleontor705/forgespec-mcp/compare/{{previousTag}}...{{currentTag}}"
+}
