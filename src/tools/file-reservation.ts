@@ -17,8 +17,10 @@ export function registerFileTools(server: McpServer): void {
       agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent reserving the files"),
       ttl_minutes: z
         .number()
+        .min(1)
+        .max(1440)
         .default(DEFAULT_TTL_MINUTES)
-        .describe("Reservation TTL in minutes (default 15)"),
+        .describe("Reservation TTL in minutes (default 15, max 1440)"),
     },
     async ({ patterns, agent, ttl_minutes }) => {
       const db = getDb();
@@ -193,12 +195,17 @@ export function registerFileTools(server: McpServer): void {
 
 function patternsOverlap(a: string, b: string): boolean {
   if (a === b) return true;
-  if (a.startsWith(b.replace("/**", "/")) || b.startsWith(a.replace("/**", "/")))
-    return true;
-  if (a.includes("**") || b.includes("**")) {
-    const aBase = a.split("/**")[0].split("/*")[0];
-    const bBase = b.split("/**")[0].split("/*")[0];
-    if (aBase.startsWith(bBase) || bBase.startsWith(aBase)) return true;
+  // Normalize: remove trailing slashes
+  const na = a.replace(/\/+$/, "");
+  const nb = b.replace(/\/+$/, "");
+  if (na === nb) return true;
+  // Check if one is a parent directory of the other
+  const aBase = na.replace(/\/\*\*$/, "").replace(/\/\*$/, "");
+  const bBase = nb.replace(/\/\*\*$/, "").replace(/\/\*$/, "");
+  // If either has wildcards, check prefix containment
+  if (na.includes("*") || nb.includes("*")) {
+    return aBase.startsWith(bBase) || bBase.startsWith(aBase);
   }
-  return false;
+  // Exact file paths: check if one is under the other's directory
+  return na.startsWith(nb + "/") || nb.startsWith(na + "/");
 }
