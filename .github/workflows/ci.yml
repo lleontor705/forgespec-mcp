@@ -7,10 +7,17 @@ on:
     branches: [main, develop]
 
 jobs:
+  quality:
+    uses: lleontor705/ats-deploy/.github/workflows/quality-node.yml@main
+    with:
+      node-version: "22"
+      lint-command: "npm run lint"
+      test-command: "npm test"
+
   security:
     uses: lleontor705/ats-deploy/.github/workflows/security-scan.yml@main
 
-  test:
+  test-matrix:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
