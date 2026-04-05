@@ -232,6 +232,16 @@ export function registerTaskBoardTools(server: McpServer): void {
             if (remaining.length === 0) {
               db.prepare(`UPDATE tasks SET status = 'ready', updated_at = ? WHERE id = ?`).run(now, dep.id);
               unblocked.push(dep.id as string);
+            } else {
+              // Check if ALL remaining deps are done
+              const placeholders = remaining.map(() => "?").join(",");
+              const notDone = db.prepare(
+                `SELECT COUNT(*) as cnt FROM tasks WHERE board_id = ? AND id IN (${placeholders}) AND status != 'done'`
+              ).get(task.board_id as string, ...remaining) as { cnt: number };
+              if (notDone.cnt === 0) {
+                db.prepare(`UPDATE tasks SET status = 'ready', updated_at = ? WHERE id = ?`).run(now, dep.id);
+                unblocked.push(dep.id as string);
+              }
             }
           }
         }

@@ -2,11 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [master, develop]
+    branches: [main, develop]
   pull_request:
-    branches: [master, develop]
+    branches: [main, develop]
 
 jobs:
+  security:
+    uses: lleontor705/ats-deploy/.github/workflows/security-scan.yml@main
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
