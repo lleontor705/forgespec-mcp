@@ -9,5 +9,6 @@ coverage/
 *.tgz
 .*
 !.github/
+!.husky/
 !.versionrc.json
 !.gitignore
