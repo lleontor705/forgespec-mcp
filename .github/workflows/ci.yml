@@ -11,9 +11,8 @@ jobs:
     uses: lleontor705/ats-deploy-public/.github/workflows/quality-node.yml@main
     with:
       node-version: "22"
-      package-manager: "bun"
-      lint-command: "bun run typecheck"
-      test-command: "bun test"
+      lint-command: "npm run lint"
+      test-command: "npm test"
 
   security:
     uses: lleontor705/ats-deploy-public/.github/workflows/security-scan.yml@main
@@ -26,9 +25,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
         with:
-          bun-version: latest
-      - run: bun install
-      - run: bun run lint
-      - run: bun test
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
