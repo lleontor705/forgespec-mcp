@@ -4,6 +4,14 @@
   "description": "MCP Server for Spec-Driven Development (SDD) — contract validation, task board, and file reservation for multi-agent AI systems",
   "type": "module",
   "main": "./build/index.js",
+  "module": "./build/index.js",
+  "types": "./build/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./build/index.js",
+      "types": "./build/index.d.ts"
+    }
+  },
   "bin": {
     "forgespec-mcp": "build/index.js"
   },
