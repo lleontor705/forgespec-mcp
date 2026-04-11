@@ -164,9 +164,9 @@ Each phase has a **confidence threshold** that must be met before transitioning 
 
 ## Tools Reference
 
-ForgeSpec exposes **19 MCP tools** organized in three categories.
+ForgeSpec exposes **15 MCP tools** organized in three categories.
 
-### SDD Contract Tools
+### SDD Contract Tools (5)
 
 Manage the development lifecycle with typed, validated contracts.
 
@@ -177,33 +177,29 @@ Manage the development lifecycle with typed, validated contracts.
 | `sdd_get` | Retrieve a single contract by ID |
 | `sdd_list` | List contracts with optional project/phase filters |
 | `sdd_history` | Get phase transition history for a project |
-| `sdd_phases` | Get all phases with transitions and thresholds |
 
-### Task Board Tools
+### Task Board Tools (8)
 
 SQLite-backed task management with dependency tracking and auto-unblocking.
 
 | Tool | Description |
 |------|-------------|
-| `tb_create_board` | Create a new task board for a project |
+| `tb_create_board` | Create a board with optional inline tasks (atomic, avoids N separate calls) |
 | `tb_add_task` | Add a task with priority, spec ref, criteria, and dependencies |
 | `tb_status` | Get board status with tasks grouped by status |
 | `tb_claim` | Claim a task (validates dependencies before assignment) |
-| `tb_update` | Update task status (auto-unblocks dependents on completion) |
+| `tb_update` | Update status and/or append timestamped notes (auto-unblocks dependents on done) |
 | `tb_unblocked` | List tasks ready to work on (all dependencies resolved) |
 | `tb_get` | Get full task details by ID |
-| `tb_delete_task` | Delete a task (backlog/done only), cleans up dependencies |
-| `tb_add_notes` | Append timestamped notes to a task |
-| `tb_list` | List all boards (optionally filtered by project) |
+| `tb_list_boards` | List all boards (for discovery after context loss) |
 
-### File Reservation Tools
+### File Reservation Tools (2)
 
 Advisory file locking to prevent multi-agent edit conflicts.
 
 | Tool | Description |
 |------|-------------|
-| `file_reserve` | Reserve files or glob patterns with configurable TTL |
-| `file_check` | Check if files are reserved by another agent |
+| `file_reserve` | Reserve files/globs with TTL. Use `check_only: true` to check conflicts without reserving |
 | `file_release` | Release reservations (specific patterns or all) |
 
 ---
@@ -297,22 +293,32 @@ Set up a board, add tasks with dependencies, and let agents claim work:
 Two agents working in parallel use file reservations to avoid conflicts:
 
 ```jsonc
-// Agent 1 reserves auth files
+// Agent 1 checks then reserves auth files (two-phase pattern)
+// Tool: file_reserve (check_only)
+{
+  "patterns": ["src/auth/**", "src/middleware/auth.ts"],
+  "agent": "implement-agent-1",
+  "check_only": true
+}
+// -> { "reserved": false, "has_conflicts": false, "conflicts": [] }
+
+// No conflicts — proceed to reserve
 // Tool: file_reserve
 {
   "patterns": ["src/auth/**", "src/middleware/auth.ts"],
   "agent": "implement-agent-1",
   "ttl_minutes": 30
 }
-// -> { "reserved": true, "expires_at": "2025-01-15T10:30:00.000Z" }
+// -> { "reserved": true, "has_conflicts": false, "expires_at": "2025-01-15T10:30:00.000Z" }
 
 // Agent 2 checks before editing
-// Tool: file_check
+// Tool: file_reserve (check_only)
 {
   "patterns": ["src/auth/jwt.ts"],
-  "agent": "implement-agent-2"
+  "agent": "implement-agent-2",
+  "check_only": true
 }
-// -> { "has_conflicts": true, "conflicts": [{ "pattern": "src/auth/**", "held_by": "implement-agent-1" }] }
+// -> { "reserved": false, "has_conflicts": true, "conflicts": [{ "pattern": "src/auth/**", "held_by": "implement-agent-1" }] }
 // Agent 2 knows to work on something else
 
 // Agent 1 finishes and releases
@@ -367,9 +373,9 @@ forgespec-mcp
 │   ├── types/index.ts        # Zod schemas, phase config, type definitions
 │   ├── database/index.ts     # SQLite init, WAL mode, schema creation
 │   ├── tools/
-│   │   ├── sdd-contracts.ts  # 6 contract lifecycle tools
-│   │   ├── task-board.ts     # 10 task management tools
-│   │   └── file-reservation.ts # 3 file locking tools
+│   │   ├── sdd-contracts.ts  # 5 contract lifecycle tools
+│   │   ├── task-board.ts     # 8 task management tools
+│   │   └── file-reservation.ts # 2 file locking tools
 │   └── utils/id.ts           # Prefixed UUID generation
 └── tests/
     ├── sdd-contracts.test.ts # Schema and phase transition tests
