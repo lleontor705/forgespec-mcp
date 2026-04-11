@@ -56,6 +56,14 @@ function initTestDb(): Database.Database {
       completed_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS file_reservations (
+      id TEXT PRIMARY KEY,
+      pattern TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_contracts_project ON contracts(project);
   `);
 
@@ -105,7 +113,6 @@ describe("sdd_get", () => {
 
 describe("sdd_list", () => {
   beforeAll(() => {
-    // Seed multiple contracts across projects and phases
     const insert = db.prepare(
       `INSERT INTO contracts (id, phase, change_name, project, status, confidence, executive_summary, data)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -160,133 +167,73 @@ describe("sdd_list", () => {
   });
 });
 
-// ── tb_delete_task tests ───────────────────────────────
+// ── tb_create_board with inline tasks tests ───────────
 
-describe("tb_delete_task", () => {
-  let boardId: string;
-
-  beforeAll(() => {
-    boardId = generateId("board");
+describe("tb_create_board with tasks", () => {
+  it("creates board without tasks (backward compatible)", () => {
+    const boardId = generateId("board");
     db.prepare(`INSERT INTO boards (id, project, name) VALUES (?, ?, ?)`).run(
-      boardId, "proj-del", "Delete Test Board"
+      boardId, "proj-compat", "Empty Board"
     );
+
+    const board = db.prepare(`SELECT * FROM boards WHERE id = ?`).get(boardId) as Record<string, unknown>;
+    expect(board).toBeDefined();
+    expect(board.project).toBe("proj-compat");
+
+    const tasks = db.prepare(`SELECT * FROM tasks WHERE board_id = ?`).all(boardId);
+    expect(tasks.length).toBe(0);
   });
 
-  it("deletes a task in backlog status", () => {
-    const taskId = generateId("task");
-    db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'backlog')`
-    ).run(taskId, boardId, "Backlog task");
+  it("creates board with inline tasks atomically", () => {
+    const boardId = generateId("board");
 
-    const before = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId);
-    expect(before).toBeDefined();
+    const insertBoard = db.prepare(`INSERT INTO boards (id, project, name) VALUES (?, ?, ?)`);
+    const insertTask = db.prepare(
+      `INSERT INTO tasks (id, board_id, title, description, priority, acceptance_criteria, dependencies, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
 
-    db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
+    const taskIds = [generateId("task"), generateId("task"), generateId("task")];
 
-    const after = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId);
-    expect(after).toBeUndefined();
+    const tx = db.transaction(() => {
+      insertBoard.run(boardId, "proj-inline", "Inline Board");
+      insertTask.run(taskIds[0], boardId, "Task A", "First task", "p0", "AC A", "[]", "ready");
+      insertTask.run(taskIds[1], boardId, "Task B", "Depends on A", "p1", "AC B", JSON.stringify([taskIds[0]]), "backlog");
+      insertTask.run(taskIds[2], boardId, "Task C", "Also depends on A", "p1", "AC C", JSON.stringify([taskIds[0]]), "backlog");
+    });
+    tx();
+
+    const board = db.prepare(`SELECT * FROM boards WHERE id = ?`).get(boardId) as Record<string, unknown>;
+    expect(board).toBeDefined();
+
+    const tasks = db.prepare(`SELECT * FROM tasks WHERE board_id = ? ORDER BY created_at`).all(boardId) as Record<string, unknown>[];
+    expect(tasks.length).toBe(3);
+    expect(tasks[0].title).toBe("Task A");
+    expect(tasks[0].status).toBe("ready");
+    expect(tasks[1].status).toBe("backlog");
+    expect(tasks[2].status).toBe("backlog");
+
+    // Verify dependencies
+    const depsB = JSON.parse(tasks[1].dependencies as string) as string[];
+    expect(depsB).toContain(taskIds[0]);
   });
 
-  it("deletes a task in done status", () => {
+  it("tasks without dependencies start as ready", () => {
+    const boardId = generateId("board");
     const taskId = generateId("task");
+
+    db.prepare(`INSERT INTO boards (id, project, name) VALUES (?, ?, ?)`).run(boardId, "proj-ready", "Ready Board");
     db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'done')`
-    ).run(taskId, boardId, "Done task");
-
-    db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
-
-    const after = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId);
-    expect(after).toBeUndefined();
-  });
-
-  it("rejects deletion of task in in_progress status", () => {
-    const taskId = generateId("task");
-    db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'in_progress')`
-    ).run(taskId, boardId, "In-progress task");
+      `INSERT INTO tasks (id, board_id, title, dependencies, status) VALUES (?, ?, ?, ?, ?)`
+    ).run(taskId, boardId, "No deps task", "[]", "ready");
 
     const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    expect(task.status).toBe("in_progress");
-
-    // Simulating the tool logic: only backlog/done can be deleted
-    const canDelete = task.status === "backlog" || task.status === "done";
-    expect(canDelete).toBe(false);
-
-    // Task should still exist
-    const after = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId);
-    expect(after).toBeDefined();
-  });
-
-  it("rejects deletion of task in in_review status", () => {
-    const taskId = generateId("task");
-    db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'in_review')`
-    ).run(taskId, boardId, "In-review task");
-
-    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    const canDelete = task.status === "backlog" || task.status === "done";
-    expect(canDelete).toBe(false);
-  });
-
-  it("rejects deletion of task in blocked status", () => {
-    const taskId = generateId("task");
-    db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'blocked')`
-    ).run(taskId, boardId, "Blocked task");
-
-    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    const canDelete = task.status === "backlog" || task.status === "done";
-    expect(canDelete).toBe(false);
-  });
-
-  it("removes deleted task from other tasks' dependencies", () => {
-    const taskA = generateId("task");
-    const taskB = generateId("task");
-
-    db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status, dependencies) VALUES (?, ?, ?, 'backlog', '[]')`
-    ).run(taskA, boardId, "Task A");
-
-    db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status, dependencies) VALUES (?, ?, ?, 'backlog', ?)`
-    ).run(taskB, boardId, "Task B", JSON.stringify([taskA]));
-
-    // Verify dependency is set
-    const beforeDel = db.prepare(`SELECT dependencies FROM tasks WHERE id = ?`).get(taskB) as Record<string, unknown>;
-    expect(JSON.parse(beforeDel.dependencies as string)).toContain(taskA);
-
-    // Simulate tb_delete_task logic: clean up dependencies before deleting
-    const siblings = db
-      .prepare(`SELECT id, dependencies FROM tasks WHERE board_id = ? AND id != ?`)
-      .all(boardId, taskA) as Record<string, unknown>[];
-
-    for (const sibling of siblings) {
-      const deps = JSON.parse(sibling.dependencies as string) as string[];
-      if (deps.includes(taskA)) {
-        const updated = deps.filter((d) => d !== taskA);
-        db.prepare(`UPDATE tasks SET dependencies = ? WHERE id = ?`).run(
-          JSON.stringify(updated), sibling.id
-        );
-      }
-    }
-
-    db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskA);
-
-    // Verify dependency was cleaned up
-    const afterDel = db.prepare(`SELECT dependencies FROM tasks WHERE id = ?`).get(taskB) as Record<string, unknown>;
-    expect(JSON.parse(afterDel.dependencies as string)).not.toContain(taskA);
-    expect(JSON.parse(afterDel.dependencies as string)).toEqual([]);
-  });
-
-  it("returns error for non-existent task", () => {
-    const row = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get("task-nonexistent");
-    expect(row).toBeUndefined();
+    expect(task.status).toBe("ready");
   });
 });
 
-// ── tb_add_notes tests ─────────────────────────────────
+// ── tb_update with notes tests ────────────────────────
 
-describe("tb_add_notes", () => {
+describe("tb_update with notes", () => {
   let boardId: string;
 
   beforeAll(() => {
@@ -296,23 +243,52 @@ describe("tb_add_notes", () => {
     );
   });
 
-  it("appends a note to a task with no prior notes", () => {
+  it("appends a note without changing status", () => {
     const taskId = generateId("task");
     db.prepare(
-      `INSERT INTO tasks (id, board_id, title) VALUES (?, ?, ?)`
+      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'in_progress')`
     ).run(taskId, boardId, "Notes task");
 
-    // Simulate tb_add_notes logic
+    // Simulate tb_update with notes only (no status change)
     const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
     const existing = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
     existing.push({ text: "First note", timestamp: new Date().toISOString() });
-    db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(JSON.stringify(existing), taskId);
+    db.prepare(`UPDATE tasks SET notes = ?, updated_at = ? WHERE id = ?`).run(
+      JSON.stringify(existing), new Date().toISOString(), taskId
+    );
 
-    const updated = db.prepare(`SELECT notes FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
+    const updated = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
     const notes = JSON.parse(updated.notes as string) as Array<{ text: string; timestamp: string }>;
     expect(notes).toHaveLength(1);
     expect(notes[0].text).toBe("First note");
-    expect(notes[0].timestamp).toBeDefined();
+    expect(updated.status).toBe("in_progress"); // status preserved
+  });
+
+  it("updates status and appends notes in a single call", () => {
+    const taskId = generateId("task");
+    db.prepare(
+      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'in_progress')`
+    ).run(taskId, boardId, "Status+notes task");
+
+    const now = new Date().toISOString();
+
+    // Append note
+    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
+    const existing = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
+    existing.push({ text: "Completing task", timestamp: now });
+    db.prepare(`UPDATE tasks SET notes = ?, updated_at = ? WHERE id = ?`).run(
+      JSON.stringify(existing), now, taskId
+    );
+
+    // Update status to done
+    db.prepare(`UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?`).run(now, now, taskId);
+
+    const updated = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
+    expect(updated.status).toBe("done");
+    expect(updated.completed_at).toBeDefined();
+    const notes = JSON.parse(updated.notes as string) as Array<{ text: string; timestamp: string }>;
+    expect(notes).toHaveLength(1);
+    expect(notes[0].text).toBe("Completing task");
   });
 
   it("appends multiple notes preserving order", () => {
@@ -321,23 +297,12 @@ describe("tb_add_notes", () => {
       `INSERT INTO tasks (id, board_id, title) VALUES (?, ?, ?)`
     ).run(taskId, boardId, "Multi-notes task");
 
-    // Add first note
-    let task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    let notes = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
-    notes.push({ text: "Note 1", timestamp: "2026-01-01T00:00:00.000Z" });
-    db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(JSON.stringify(notes), taskId);
-
-    // Add second note
-    task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    notes = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
-    notes.push({ text: "Note 2", timestamp: "2026-01-02T00:00:00.000Z" });
-    db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(JSON.stringify(notes), taskId);
-
-    // Add third note
-    task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    notes = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
-    notes.push({ text: "Note 3", timestamp: "2026-01-03T00:00:00.000Z" });
-    db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(JSON.stringify(notes), taskId);
+    for (const text of ["Note 1", "Note 2", "Note 3"]) {
+      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
+      const notes = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
+      notes.push({ text, timestamp: new Date().toISOString() });
+      db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(JSON.stringify(notes), taskId);
+    }
 
     const result = db.prepare(`SELECT notes FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
     const finalNotes = JSON.parse(result.notes as string) as Array<{ text: string; timestamp: string }>;
@@ -345,26 +310,6 @@ describe("tb_add_notes", () => {
     expect(finalNotes[0].text).toBe("Note 1");
     expect(finalNotes[1].text).toBe("Note 2");
     expect(finalNotes[2].text).toBe("Note 3");
-  });
-
-  it("does not change task status when adding notes", () => {
-    const taskId = generateId("task");
-    db.prepare(
-      `INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'in_progress')`
-    ).run(taskId, boardId, "Status-preserved task");
-
-    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    const notes = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
-    notes.push({ text: "A note", timestamp: new Date().toISOString() });
-    db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(JSON.stringify(notes), taskId);
-
-    const updated = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
-    expect(updated.status).toBe("in_progress");
-  });
-
-  it("returns error for non-existent task", () => {
-    const row = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get("task-nonexistent");
-    expect(row).toBeUndefined();
   });
 
   it("stores notes with correct structure", () => {
@@ -375,8 +320,7 @@ describe("tb_add_notes", () => {
 
     const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
     const notes = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
-    const timestamp = new Date().toISOString();
-    notes.push({ text: "Structured note", timestamp });
+    notes.push({ text: "Structured note", timestamp: new Date().toISOString() });
     db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(JSON.stringify(notes), taskId);
 
     const result = db.prepare(`SELECT notes FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
@@ -385,5 +329,36 @@ describe("tb_add_notes", () => {
     expect(parsed[0]).toHaveProperty("timestamp");
     expect(typeof parsed[0].text).toBe("string");
     expect(typeof parsed[0].timestamp).toBe("string");
+  });
+});
+
+// ── file_reserve with check_only tests ──��─────────────
+
+describe("file_reserve check_only", () => {
+  it("check_only returns no conflicts when nothing reserved", () => {
+    // Clean slate
+    db.prepare(`DELETE FROM file_reservations`).run();
+
+    const existing = db
+      .prepare(`SELECT * FROM file_reservations WHERE agent != ?`)
+      .all("agent-a") as Array<{ pattern: string; agent: string; expires_at: string }>;
+
+    expect(existing.length).toBe(0);
+  });
+
+  it("check_only detects conflicts from other agents", () => {
+    db.prepare(`DELETE FROM file_reservations`).run();
+
+    const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    db.prepare(
+      `INSERT INTO file_reservations (id, pattern, agent, expires_at) VALUES (?, ?, ?, ?)`
+    ).run(generateId("res"), "src/auth/**", "agent-b", expires);
+
+    const existing = db
+      .prepare(`SELECT * FROM file_reservations WHERE agent != ?`)
+      .all("agent-a") as Array<{ pattern: string; agent: string; expires_at: string }>;
+
+    expect(existing.length).toBe(1);
+    expect(existing[0].agent).toBe("agent-b");
   });
 });

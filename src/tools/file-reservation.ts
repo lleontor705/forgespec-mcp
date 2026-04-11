@@ -9,7 +9,7 @@ export function registerFileTools(server: McpServer): void {
   // ── Reserve Files ──────────────────────────────────
   server.tool(
     "file_reserve",
-    "Reserve files or glob patterns to prevent conflicts between agents. Reservations expire after TTL.",
+    "Reserve files or glob patterns to prevent conflicts between agents. Use check_only=true to check for conflicts without reserving. Reservations expire after TTL.",
     {
       patterns: z
         .array(z.string())
@@ -19,8 +19,12 @@ export function registerFileTools(server: McpServer): void {
         .number()
         .default(DEFAULT_TTL_MINUTES)
         .describe("Reservation TTL in minutes (default 15)"),
+      check_only: z
+        .boolean()
+        .default(false)
+        .describe("If true, only check for conflicts without creating reservations"),
     },
-    async ({ patterns, agent, ttl_minutes }) => {
+    async ({ patterns, agent, ttl_minutes, check_only }) => {
       const db = getDb();
       const now = new Date();
       const expiresAt = new Date(
@@ -50,11 +54,28 @@ export function registerFileTools(server: McpServer): void {
               type: "text" as const,
               text: JSON.stringify({
                 reserved: false,
+                has_conflicts: true,
                 conflicts: conflicts.map((c) => ({
                   pattern: c.pattern,
                   held_by: c.agent,
                   expires_at: c.expires_at,
                 })),
+              }),
+            },
+          ],
+        };
+      }
+
+      // Check-only mode: return clean result without reserving
+      if (check_only) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                reserved: false,
+                has_conflicts: false,
+                conflicts: [],
               }),
             },
           ],
@@ -81,53 +102,11 @@ export function registerFileTools(server: McpServer): void {
             type: "text" as const,
             text: JSON.stringify({
               reserved: true,
+              has_conflicts: false,
               reservation_ids: ids,
               agent,
               patterns,
               expires_at: expiresAt,
-            }),
-          },
-        ],
-      };
-    }
-  );
-
-  // ── Check File Reservations ────────────────────────
-  server.tool(
-    "file_check",
-    "Check if files or patterns are currently reserved by another agent.",
-    {
-      patterns: z
-        .array(z.string())
-        .describe("File paths or glob patterns to check"),
-      agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent checking (to exclude own reservations)"),
-    },
-    async ({ patterns, agent }) => {
-      const db = getDb();
-
-      db.prepare(
-        `DELETE FROM file_reservations WHERE expires_at < datetime('now')`
-      ).run();
-
-      const reservations = db
-        .prepare(`SELECT * FROM file_reservations WHERE agent != ?`)
-        .all(agent) as Array<{ pattern: string; agent: string; expires_at: string }>;
-
-      const conflicts = reservations.filter((r) =>
-        patterns.some((p) => patternsOverlap(p, r.pattern))
-      );
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              has_conflicts: conflicts.length > 0,
-              conflicts: conflicts.map((c) => ({
-                pattern: c.pattern,
-                held_by: c.agent,
-                expires_at: c.expires_at,
-              })),
             }),
           },
         ],
