@@ -209,7 +209,7 @@ export function registerSddTools(server: McpServer): void {
     "List all SDD contracts with optional filters by project and phase.",
     {
       project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).optional().describe("Filter by project identifier"),
-      phase: z.string().max(64).optional().describe("Filter by SDD phase"),
+      phase: z.enum(SDD_PHASES).optional().describe("Filter by SDD phase"),
       limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
     },
     async ({ project, phase, limit }) => {
@@ -244,26 +244,4 @@ export function registerSddTools(server: McpServer): void {
     }
   );
 
-  // ── Get Phase Info ─────────────────────────────────
-  server.tool(
-    "sdd_phases",
-    "Get information about all SDD phases, including transitions and confidence thresholds.",
-    {},
-    async () => {
-      const phases = SDD_PHASES.map((p) => ({
-        phase: p,
-        confidence_threshold: CONFIDENCE_THRESHOLDS[p],
-        can_transition_to: PHASE_TRANSITIONS[p],
-      }));
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ phases }),
-          },
-        ],
-      };
-    }
-  );
 }

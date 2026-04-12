@@ -4,11 +4,12 @@
   "description": "MCP Server for Spec-Driven Development (SDD) — contract validation, task board, and file reservation for multi-agent AI systems",
   "type": "module",
   "main": "./build/index.js",
+  "module": "./build/index.js",
   "types": "./build/index.d.ts",
   "exports": {
     ".": {
-      "types": "./build/index.d.ts",
-      "import": "./build/index.js"
+      "import": "./build/index.js",
+      "types": "./build/index.d.ts"
     }
   },
   "bin": {
@@ -29,7 +30,8 @@
     "release": "standard-version",
     "release:minor": "standard-version --release-as minor",
     "release:major": "standard-version --release-as major",
-    "release:patch": "standard-version --release-as patch"
+    "release:patch": "standard-version --release-as patch",
+    "prepare": "husky"
   },
   "keywords": [
     "mcp",
@@ -61,6 +63,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
+    "husky": "^9.1.7",
     "standard-version": "^9.5.0",
     "tsx": "^4.0.0",
     "typescript": "^5.7.0",
