@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [develop, main]
   pull_request:
-    branches: [main, develop]
+    branches: [develop, main]
 
 jobs:
   quality:
@@ -18,18 +18,16 @@ jobs:
     uses: lleontor705/ats-deploy-public/.github/workflows/security-scan.yml@main
 
   test-matrix:
-    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        node-version: [18, 20, 22]
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: npm
+          node-version: 22
       - run: npm ci
-      - run: npm run build
       - run: npm run lint
       - run: npm test

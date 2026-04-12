@@ -6,26 +6,99 @@ import { generateId } from "../utils/id.js";
 
 export function registerTaskBoardTools(server: McpServer): void {
   // ── Create Board ───────────────────────────────────
+  const TaskInputSchema = z.object({
+    title: z.string().min(3).max(512),
+    description: z.string().max(65536).default(""),
+    priority: z.enum(TASK_PRIORITIES).default("p2"),
+    spec_ref: z.string().max(512).optional(),
+    acceptance_criteria: z.string().max(65536).default(""),
+    dependencies: z.array(z.string()).default([]),
+  });
+
   server.tool(
     "tb_create_board",
-    "Create a new task board for a project.",
+    "Create a new task board for a project. Optionally include tasks inline to create board + all tasks in a single atomic call (avoids N separate tb_add_task calls).",
     {
       project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Project identifier (e.g. my-project)"),
       name: z.string().max(256).describe("Board name"),
+      tasks: z.array(TaskInputSchema).max(100).optional().describe("Optional: tasks to create with the board. Each task: {title, description?, priority?, spec_ref?, acceptance_criteria?, dependencies?}. Dependencies reference other task titles or indices."),
     },
-    async ({ project, name }) => {
+    async ({ project, name, tasks }) => {
       const db = getDb();
-      const id = generateId("board");
+      const boardId = generateId("board");
 
-      db.prepare(
+      if (!tasks || tasks.length === 0) {
+        db.prepare(
+          `INSERT INTO boards (id, project, name) VALUES (?, ?, ?)`
+        ).run(boardId, project, name);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ created: true, board_id: boardId, project, name, task_count: 0 }),
+            },
+          ],
+        };
+      }
+
+      // Atomic: create board + all tasks in one transaction
+      const insertBoard = db.prepare(
         `INSERT INTO boards (id, project, name) VALUES (?, ?, ?)`
-      ).run(id, project, name);
+      );
+      const insertTask = db.prepare(
+        `INSERT INTO tasks (id, board_id, title, description, priority, spec_ref, acceptance_criteria, dependencies, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+
+      const taskIds: string[] = [];
+      const taskIdMap: Record<string, string> = {};
+
+      // Pre-generate IDs so dependencies can reference them
+      for (let i = 0; i < tasks.length; i++) {
+        const id = generateId("task");
+        taskIds.push(id);
+        taskIdMap[tasks[i].title] = id;
+        taskIdMap[String(i)] = id;
+      }
+
+      const tx = db.transaction(() => {
+        insertBoard.run(boardId, project, name);
+
+        for (let i = 0; i < tasks.length; i++) {
+          const t = tasks[i];
+          // Resolve dependency references (by title or index) to generated IDs
+          const resolvedDeps = t.dependencies.map((dep) => taskIdMap[dep] || dep);
+          // Tasks with no dependencies start as "ready", others as "backlog"
+          const status = resolvedDeps.length === 0 ? "ready" : "backlog";
+
+          insertTask.run(
+            taskIds[i],
+            boardId,
+            t.title,
+            t.description,
+            t.priority,
+            t.spec_ref || null,
+            t.acceptance_criteria,
+            JSON.stringify(resolvedDeps),
+            status
+          );
+        }
+      });
+      tx();
 
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ created: true, board_id: id, project, name }),
+            text: JSON.stringify({
+              created: true,
+              board_id: boardId,
+              project,
+              name,
+              task_count: tasks.length,
+              task_ids: taskIds,
+            }),
           },
         ],
       };
@@ -181,11 +254,11 @@ export function registerTaskBoardTools(server: McpServer): void {
   // ── Update Task Status ─────────────────────────────
   server.tool(
     "tb_update",
-    "Update a task's status. Moving to 'done' requires the task to be in 'in_progress' or 'in_review'.",
+    "Update a task's status and/or append notes. Moving to 'done' requires 'in_progress' or 'in_review'. Notes are stored as timestamped entries.",
     {
       task_id: z.string().max(256).describe("Task ID"),
-      status: z.enum(TASK_STATUSES).describe("New status"),
-      notes: z.string().max(65536).optional().describe("Optional notes about the update"),
+      status: z.enum(TASK_STATUSES).optional().describe("New status (omit to keep current status and only add notes)"),
+      notes: z.string().max(65536).optional().describe("Notes to append (timestamped). Works with or without status change."),
     },
     async ({ task_id, status, notes }) => {
       const db = getDb();
@@ -196,8 +269,9 @@ export function registerTaskBoardTools(server: McpServer): void {
       }
 
       const now = new Date().toISOString();
-      const updates: Record<string, unknown> = { status, updated_at: now };
+      const effectiveStatus = status ?? task.status as string;
 
+      // Validate done transition
       if (status === "done") {
         if (task.status !== "in_progress" && task.status !== "in_review") {
           return {
@@ -209,64 +283,79 @@ export function registerTaskBoardTools(server: McpServer): void {
             ],
           };
         }
-        updates.completed_at = now;
       }
 
-      const setClauses = Object.keys(updates).map((k) => `${k} = ?`).join(", ");
-      db.prepare(`UPDATE tasks SET ${setClauses} WHERE id = ?`).run(
-        ...Object.values(updates),
-        task_id
-      );
+      // Append notes if provided
+      let notesCount: number | undefined;
+      if (notes) {
+        const existing = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
+        existing.push({ text: notes, timestamp: now });
+        db.prepare(`UPDATE tasks SET notes = ?, updated_at = ? WHERE id = ?`).run(
+          JSON.stringify(existing),
+          now,
+          task_id
+        );
+        notesCount = existing.length;
+      }
 
-      // Auto-unblock dependent tasks
-      if (status === "done") {
-        const dependents = db
-          .prepare(`SELECT id, dependencies FROM tasks WHERE board_id = ? AND status = 'backlog'`)
-          .all(task.board_id as string) as Record<string, unknown>[];
+      // Update status if provided
+      if (status) {
+        const updates: Record<string, unknown> = { status, updated_at: now };
+        if (status === "done") {
+          updates.completed_at = now;
+        }
 
-        const unblocked: string[] = [];
-        for (const dep of dependents) {
-          const depIds = JSON.parse(dep.dependencies as string) as string[];
-          if (depIds.includes(task_id)) {
-            const remaining = depIds.filter((d) => d !== task_id);
-            if (remaining.length === 0) {
-              db.prepare(`UPDATE tasks SET status = 'ready', updated_at = ? WHERE id = ?`).run(now, dep.id);
-              unblocked.push(dep.id as string);
-            } else {
-              // Check if ALL remaining deps are done
-              const placeholders = remaining.map(() => "?").join(",");
-              const notDone = db.prepare(
-                `SELECT COUNT(*) as cnt FROM tasks WHERE board_id = ? AND id IN (${placeholders}) AND status != 'done'`
-              ).get(task.board_id as string, ...remaining) as { cnt: number };
-              if (notDone.cnt === 0) {
+        const setClauses = Object.keys(updates).map((k) => `${k} = ?`).join(", ");
+        db.prepare(`UPDATE tasks SET ${setClauses} WHERE id = ?`).run(
+          ...Object.values(updates),
+          task_id
+        );
+
+        // Auto-unblock dependent tasks
+        if (status === "done") {
+          const dependents = db
+            .prepare(`SELECT id, dependencies FROM tasks WHERE board_id = ? AND status = 'backlog'`)
+            .all(task.board_id as string) as Record<string, unknown>[];
+
+          const unblocked: string[] = [];
+          for (const dep of dependents) {
+            const depIds = JSON.parse(dep.dependencies as string) as string[];
+            if (depIds.includes(task_id)) {
+              const remaining = depIds.filter((d) => d !== task_id);
+              if (remaining.length === 0) {
                 db.prepare(`UPDATE tasks SET status = 'ready', updated_at = ? WHERE id = ?`).run(now, dep.id);
                 unblocked.push(dep.id as string);
               }
             }
           }
-        }
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                updated: true,
-                task_id,
-                status,
-                unblocked_tasks: unblocked,
-                notes,
-              }),
-            },
-          ],
-        };
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  updated: true,
+                  task_id,
+                  status: effectiveStatus,
+                  unblocked_tasks: unblocked,
+                  notes_count: notesCount,
+                }),
+              },
+            ],
+          };
+        }
       }
 
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ updated: true, task_id, status, notes }),
+            text: JSON.stringify({
+              updated: true,
+              task_id,
+              status: effectiveStatus,
+              notes_count: notesCount,
+            }),
           },
         ],
       };
@@ -324,103 +413,10 @@ export function registerTaskBoardTools(server: McpServer): void {
     }
   );
 
-  // ── Delete Task ────────────────────────────────────
-  server.tool(
-    "tb_delete_task",
-    "Delete a task from the board. Only tasks in 'backlog' or 'done' status can be deleted.",
-    {
-      task_id: z.string().describe("Task ID to delete"),
-    },
-    async ({ task_id }) => {
-      const db = getDb();
-      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
-
-      if (!task) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
-      }
-
-      if (task.status !== "backlog" && task.status !== "done") {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                error: `Cannot delete task in '${task.status}' status. Only 'backlog' or 'done' tasks can be deleted.`,
-              }),
-            },
-          ],
-        };
-      }
-
-      // Remove this task from other tasks' dependencies
-      const siblings = db
-        .prepare(`SELECT id, dependencies FROM tasks WHERE board_id = ? AND id != ?`)
-        .all(task.board_id as string, task_id) as Record<string, unknown>[];
-
-      for (const sibling of siblings) {
-        const deps = JSON.parse(sibling.dependencies as string) as string[];
-        if (deps.includes(task_id)) {
-          const updated = deps.filter((d) => d !== task_id);
-          db.prepare(`UPDATE tasks SET dependencies = ? WHERE id = ?`).run(
-            JSON.stringify(updated),
-            sibling.id
-          );
-        }
-      }
-
-      db.prepare(`DELETE FROM tasks WHERE id = ?`).run(task_id);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ deleted: true, task_id }),
-          },
-        ],
-      };
-    }
-  );
-
-  // ── Add Notes ─────────────────────────────────────
-  server.tool(
-    "tb_add_notes",
-    "Append notes to a task without changing its status. Notes are stored as timestamped entries.",
-    {
-      task_id: z.string().max(256).describe("Task ID"),
-      notes: z.string().max(65536).describe("Note text to append"),
-    },
-    async ({ task_id, notes }) => {
-      const db = getDb();
-      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
-
-      if (!task) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
-      }
-
-      const existing = JSON.parse((task.notes as string) || "[]") as Array<{ text: string; timestamp: string }>;
-      existing.push({ text: notes, timestamp: new Date().toISOString() });
-
-      db.prepare(`UPDATE tasks SET notes = ?, updated_at = ? WHERE id = ?`).run(
-        JSON.stringify(existing),
-        new Date().toISOString(),
-        task_id
-      );
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ added: true, task_id, notes_count: existing.length }),
-          },
-        ],
-      };
-    }
-  );
-
   // ── List Boards ────────────────────────────────────
   server.tool(
-    "tb_list",
-    "List all task boards, optionally filtered by project.",
+    "tb_list_boards",
+    "List all task boards, optionally filtered by project. Use this to discover board IDs after context loss.",
     {
       project: z.string().optional().describe("Filter by project"),
     },

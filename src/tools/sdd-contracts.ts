@@ -3,7 +3,6 @@ import { z } from "zod";
 import { getDb } from "../database/index.js";
 import {
   SddContractSchema,
-  SDD_PHASES,
   PHASE_TRANSITIONS,
   CONFIDENCE_THRESHOLDS,
 } from "../types/index.js";
@@ -244,26 +243,4 @@ export function registerSddTools(server: McpServer): void {
     }
   );
 
-  // ── Get Phase Info ─────────────────────────────────
-  server.tool(
-    "sdd_phases",
-    "Get information about all SDD phases, including transitions and confidence thresholds.",
-    {},
-    async () => {
-      const phases = SDD_PHASES.map((p) => ({
-        phase: p,
-        confidence_threshold: CONFIDENCE_THRESHOLDS[p],
-        can_transition_to: PHASE_TRANSITIONS[p],
-      }));
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ phases }),
-          },
-        ],
-      };
-    }
-  );
 }
