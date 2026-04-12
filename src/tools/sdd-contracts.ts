@@ -208,7 +208,7 @@ export function registerSddTools(server: McpServer): void {
     "List all SDD contracts with optional filters by project and phase.",
     {
       project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).optional().describe("Filter by project identifier"),
-      phase: z.string().max(64).optional().describe("Filter by SDD phase"),
+      phase: z.enum(SDD_PHASES).optional().describe("Filter by SDD phase"),
       limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
     },
     async ({ project, phase, limit }) => {
