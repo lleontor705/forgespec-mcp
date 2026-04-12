@@ -1,6 +1,6 @@
 {
   "name": "forgespec-mcp",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "description": "MCP Server for Spec-Driven Development (SDD) — contract validation, task board, and file reservation for multi-agent AI systems",
   "type": "module",
   "main": "./build/index.js",
