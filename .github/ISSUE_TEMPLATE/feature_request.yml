@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a new capability or improvement
+title: "feat(scope): "
+labels:
+  - enhancement
+  - status:needs-review
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I have searched existing issues and this is not a duplicate
+          required: true
+        - label: I understand this issue needs status:approved before a PR can be opened
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description
+      description: Describe the user or system problem this feature should solve.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior and outcome.
+    validations:
+      required: true
+  - type: dropdown
+    id: affected_area
+    attributes:
+      label: Affected area
+      options:
+        - Coordination
+        - SDD contracts
+        - Task boards
+        - Database and migrations
+        - MCP tools
+        - Documentation
+        - CI and workflows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe alternatives, workarounds, and tradeoffs.
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add verification evidence, related links, exclusions, or other context.
