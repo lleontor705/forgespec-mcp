@@ -82,6 +82,19 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
 export const TASK_PRIORITIES = ["p0", "p1", "p2", "p3"] as const;
 export type TaskPriority = (typeof TASK_PRIORITIES)[number];
 
+export interface EvidenceRefV1 {
+  provider: string;
+  kind: string;
+  external_id: string;
+  digest: `sha256:${string}`;
+}
+
+export interface ApprovalGateV1 {
+  gate_id: string;
+  required_for: TaskStatus[];
+  allowed_actors: string[];
+}
+
 export interface Task {
   id: string;
   board_id: string;
@@ -115,4 +128,25 @@ export interface FileReservation {
   agent: string;
   expires_at: string;
   created_at: string;
+}
+
+export interface FileLeaseScope {
+  normalized_scope: string;
+  base_path: string;
+  scope_kind: "exact" | "children" | "tree";
+}
+
+export interface FileLease {
+  id: string;
+  workspace_id: string;
+  case_policy: "sensitive" | "insensitive";
+  actor: string;
+  task_id: string;
+  attempt_id: string;
+  revision: number;
+  state: "active" | "released" | "expired";
+  expires_at_ms: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+  released_at_ms: number | null;
 }

@@ -7,9 +7,13 @@ import {
   PHASE_TRANSITIONS,
   CONFIDENCE_THRESHOLDS,
 } from "../types/index.js";
-import { generateId } from "../utils/id.js";
+import {
+  ContractConflictError,
+  ContractService,
+  type DirectContractSaveInput,
+} from "../services/contract-service.js";
 
-export function registerSddTools(server: McpServer): void {
+export function registerSddTools(server: McpServer, databaseProvider = getDb): void {
   // ── Validate SDD Contract ───────────────────────────
   server.tool(
     "sdd_validate",
@@ -89,52 +93,53 @@ export function registerSddTools(server: McpServer): void {
     "Validate and persist an SDD contract. Records the phase transition for project traceability.",
     {
       contract: z.string().max(131072).describe("JSON string of the SDD contract to save"),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
+      actor: z.string().min(1).max(256).optional(),
+      idempotency_key: z.string().min(1).max(256).optional(),
+      expected_head_revision: z.number().int().min(0).optional(),
+      parent_contract_id: z.string().max(256).optional(),
+      submitted_digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
     },
-    async ({ contract }) => {
+    async (input) => {
       try {
-        const parsed = JSON.parse(contract);
-        const result = SddContractSchema.parse(parsed);
-        const db = getDb();
-        const id = generateId("sdd");
-
-        db.prepare(
-          `INSERT INTO contracts (id, phase, change_name, project, status, confidence, executive_summary, data)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          id,
-          result.phase,
-          result.change_name,
-          result.project,
-          result.status,
-          result.confidence,
-          result.executive_summary,
-          JSON.stringify(result.data)
-        );
-
+        const service = new ContractService(databaseProvider());
+        const response = input.coordination_mode === "direct-v1"
+          ? service.saveDirect(input as DirectContractSaveInput)
+          : service.saveLegacy(input.contract);
         return {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({
-                saved: true,
-                id,
-                phase: result.phase,
-                project: result.project,
-              }),
+              text: JSON.stringify(response),
             },
           ],
+          structuredContent: response as unknown as Record<string, unknown>,
         };
       } catch (e) {
+        const conflict = e instanceof ContractConflictError ? e : null;
+        const response = input.coordination_mode === "direct-v1"
+          ? {
+              ok: false as const,
+              error: {
+                category: conflict?.category ?? "validation",
+                code: conflict ? `contract_${conflict.category}_conflict` : "contract_invalid",
+                message: `${e instanceof Error ? e.message : e}`,
+                retryable: conflict?.category === "cas",
+                ...(conflict?.currentRevision === undefined ? {} : { current_revision: conflict.currentRevision }),
+              },
+            }
+          : { saved: false as const, error: `${e}` };
         return {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({
-                saved: false,
-                error: `${e}`,
-              }),
+              text: JSON.stringify(response),
             },
           ],
+          structuredContent: response as Record<string, unknown>,
+          ...(input.coordination_mode === "direct-v1" ? { isError: true } : {}),
         };
       }
     }
@@ -146,10 +151,43 @@ export function registerSddTools(server: McpServer): void {
     "Get the SDD phase history for a project. Shows all contract transitions in chronological order.",
     {
       project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Project identifier"),
+      change_name: z.string().max(256).optional(),
+      phase: z.enum(SDD_PHASES).optional(),
+      since_revision: z.number().int().min(0).optional(),
+      cursor: z.string().max(256).optional(),
       limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
     },
-    async ({ project, limit }) => {
-      const db = getDb();
+    async ({ project, change_name, phase, since_revision, cursor, limit }) => {
+      const db = databaseProvider();
+      const hasDirectHistory = Boolean(
+        db.prepare("SELECT 1 FROM contract_revisions WHERE project = ? LIMIT 1").get(project)
+      );
+      if (hasDirectHistory || change_name || phase || since_revision !== undefined || cursor) {
+        let cursorRevision: number | undefined;
+        if (cursor !== undefined) {
+          const parsedCursor = Number.parseInt(cursor, 10);
+          if (!Number.isSafeInteger(parsedCursor) || parsedCursor < 0) {
+            const response = { ok: false, error: { category: "cursor", code: "invalid_cursor", message: "Invalid history cursor", retryable: false } };
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify(response) }],
+              structuredContent: response,
+              isError: true,
+            };
+          }
+          cursorRevision = parsedCursor;
+        }
+        const response = new ContractService(db).history({
+          project,
+          change_name,
+          phase,
+          since_revision: cursorRevision ?? since_revision,
+          limit,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(response) }],
+          structuredContent: response as unknown as Record<string, unknown>,
+        };
+      }
       const rows = db
         .prepare(
           `SELECT id, phase, change_name, status, confidence, executive_summary, created_at
@@ -176,30 +214,22 @@ export function registerSddTools(server: McpServer): void {
       contract_id: z.string().max(256).describe("Contract ID to retrieve"),
     },
     async ({ contract_id }) => {
-      const db = getDb();
-      const row = db
-        .prepare(`SELECT * FROM contracts WHERE id = ?`)
-        .get(contract_id) as Record<string, unknown> | undefined;
-
-      if (!row) {
+      try {
+        const response = new ContractService(databaseProvider()).get(contract_id);
         return {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ error: `Contract ${contract_id} not found` }),
+              text: JSON.stringify(response),
             },
           ],
+          structuredContent: response,
+        };
+      } catch {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: `Contract ${contract_id} not found` }) }],
         };
       }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ contract: row }),
-          },
-        ],
-      };
     }
   );
 
@@ -213,7 +243,7 @@ export function registerSddTools(server: McpServer): void {
       limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
     },
     async ({ project, phase, limit }) => {
-      const db = getDb();
+      const db = databaseProvider();
       const conditions: string[] = [];
       const params: unknown[] = [];
 

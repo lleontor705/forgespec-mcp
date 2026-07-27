@@ -1,10 +1,60 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type Database from "better-sqlite3";
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
+import { directErrorResponse } from "../core/errors.js";
 import { getDb } from "../database/index.js";
 import { TASK_STATUSES, TASK_PRIORITIES } from "../types/index.js";
 import { generateId } from "../utils/id.js";
+import {
+  TaskService,
+  type DirectBoardCreateInput,
+  type DirectTaskAddInput,
+  type DirectClaimInput,
+  type DirectHeartbeatInput,
+  type DirectRecoverClaimsInput,
+  type DirectRequeueInput,
+  type DirectSetDependenciesInput,
+  type DirectTaskUpdateInput,
+  type DirectApproveInput,
+} from "../services/task-service.js";
+import { QueryService } from "../services/query-service.js";
 
-export function registerTaskBoardTools(server: McpServer): void {
+type ToolResponse = Record<string, unknown>;
+
+function success(response: ToolResponse) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(response) }],
+    structuredContent: response,
+  };
+}
+
+function directFailure(error: unknown) {
+  const response = directErrorResponse(error);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(response) }],
+    structuredContent: response,
+    isError: true,
+  };
+}
+
+export function registerTaskBoardTools(
+  server: McpServer,
+  databaseProvider: () => Database.Database = getDb,
+  options: { cursorSecret?: Buffer } = {}
+): void {
+  const cursorSecret = options.cursorSecret ?? randomBytes(32);
+  const EvidenceRefSchema = z.object({
+    provider: z.string().min(1).max(128),
+    kind: z.string().min(1).max(128),
+    external_id: z.string().min(1).max(1024),
+    digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  }).strict();
+  const ApprovalGateSchema = z.object({
+    gate_id: z.string().min(1).max(128),
+    required_for: z.array(z.enum(TASK_STATUSES)).min(1).max(TASK_STATUSES.length),
+    allowed_actors: z.array(z.string().min(1).max(256)).min(1).max(100),
+  }).strict();
   // ── Create Board ───────────────────────────────────
   const TaskInputSchema = z.object({
     title: z.string().min(3).max(512),
@@ -13,7 +63,9 @@ export function registerTaskBoardTools(server: McpServer): void {
     spec_ref: z.string().max(512).optional(),
     acceptance_criteria: z.string().max(65536).default(""),
     dependencies: z.array(z.string()).default([]),
-  });
+    work_unit: z.string().min(1).max(128).optional(),
+    gates: z.array(ApprovalGateSchema).max(20).optional(),
+  }).strict();
 
   server.tool(
     "tb_create_board",
@@ -22,9 +74,23 @@ export function registerTaskBoardTools(server: McpServer): void {
       project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Project identifier (e.g. my-project)"),
       name: z.string().max(256).describe("Board name"),
       tasks: z.array(TaskInputSchema).max(100).optional().describe("Optional: tasks to create with the board. Each task: {title, description?, priority?, spec_ref?, acceptance_criteria?, dependencies?}. Dependencies reference other task titles or indices."),
+      change_name: z.string().max(256).optional(),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
+      actor: z.string().min(1).max(256).optional(),
+      idempotency_key: z.string().min(1).max(256).optional(),
     },
-    async ({ project, name, tasks }) => {
-      const db = getDb();
+    async (input) => {
+      const { project, name, tasks } = input;
+      const db = databaseProvider();
+      if (input.coordination_mode === "direct-v1") {
+        try {
+          return success(new TaskService(db).createDirectBoard(input as DirectBoardCreateInput) as unknown as ToolResponse);
+        } catch (error) {
+          return directFailure(error);
+        }
+      }
       const boardId = generateId("board");
 
       if (!tasks || tasks.length === 0) {
@@ -117,15 +183,37 @@ export function registerTaskBoardTools(server: McpServer): void {
       spec_ref: z.string().max(512).optional().describe("Reference to spec document"),
       acceptance_criteria: z.string().max(65536).default("").describe("Acceptance criteria for completion"),
       dependencies: z.array(z.string()).default([]).describe("Task IDs this task depends on"),
+      work_unit: z.string().min(1).max(128).optional(),
+      gates: z.array(ApprovalGateSchema).max(20).optional(),
+      expected_board_revision: z.number().int().min(1).optional(),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
+      actor: z.string().min(1).max(256).optional(),
+      idempotency_key: z.string().min(1).max(256).optional(),
     },
-    async ({ board_id, title, description, priority, spec_ref, acceptance_criteria, dependencies }) => {
-      const db = getDb();
+    async (input) => {
+      const { board_id, title, description, priority, spec_ref, acceptance_criteria, dependencies } = input;
+      const db = databaseProvider();
+      const service = new TaskService(db);
+      if (input.coordination_mode === "direct-v1") {
+        try {
+          return success(service.addDirectTask(input as DirectTaskAddInput) as unknown as ToolResponse);
+        } catch (error) {
+          return directFailure(error);
+        }
+      }
 
       const board = db.prepare(`SELECT id FROM boards WHERE id = ?`).get(board_id);
       if (!board) {
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ error: `Board ${board_id} not found` }) }],
         };
+      }
+      try {
+        service.assertLegacyBoardMutationAllowed(board_id);
+      } catch (error) {
+        return directFailure(error);
       }
 
       const id = generateId("task");
@@ -153,19 +241,16 @@ export function registerTaskBoardTools(server: McpServer): void {
       board_id: z.string().describe("Board ID"),
     },
     async ({ board_id }) => {
-      const db = getDb();
-      const board = db.prepare(`SELECT * FROM boards WHERE id = ?`).get(board_id) as Record<string, unknown> | undefined;
-      if (!board) {
+      const db = databaseProvider();
+      let snapshot: { board: Record<string, unknown>; tasks: Record<string, unknown>[] };
+      try {
+        snapshot = new TaskService(db).getBoard(board_id);
+      } catch {
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ error: `Board ${board_id} not found` }) }],
         };
       }
-
-      const tasks = db.prepare(
-        `SELECT * FROM tasks WHERE board_id = ? ORDER BY
-         CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 WHEN 'p3' THEN 3 END,
-         created_at ASC`
-      ).all(board_id) as Record<string, unknown>[];
+      const { board, tasks } = snapshot;
 
       const grouped: Record<string, unknown[]> = {};
       for (const status of TASK_STATUSES) {
@@ -197,9 +282,28 @@ export function registerTaskBoardTools(server: McpServer): void {
     {
       task_id: z.string().max(256).describe("Task ID to claim"),
       agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent or developer claiming the task"),
+      expected_revision: z.number().int().min(1).optional(),
+      lease_seconds: z.number().int().min(15).max(3600).optional(),
+      idempotency_key: z.string().min(1).max(256).optional(),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
     },
-    async ({ task_id, agent }) => {
-      const db = getDb();
+    async (input) => {
+      const { task_id, agent } = input;
+      const db = databaseProvider();
+      if (input.coordination_mode === "direct-v1") {
+        try {
+          return success(new TaskService(db).claimDirectTask(input as DirectClaimInput) as unknown as ToolResponse);
+        } catch (error) {
+          return directFailure(error);
+        }
+      }
+      try {
+        new TaskService(db).assertLegacyTaskMutationAllowed(task_id);
+      } catch (error) {
+        return directFailure(error);
+      }
       const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
 
       if (!task) {
@@ -251,6 +355,188 @@ export function registerTaskBoardTools(server: McpServer): void {
     }
   );
 
+  server.tool(
+    "tb_set_dependencies",
+    "Atomically replace a direct-v1 task's normalized same-board dependency set.",
+    {
+      board_id: z.string().max(256),
+      task_id: z.string().max(256),
+      dependency_task_ids: z.array(z.string().max(256)).max(100),
+      expected_board_revision: z.number().int().min(1),
+      expected_task_revision: z.number().int().min(1),
+      actor: z.string().min(1).max(256),
+      idempotency_key: z.string().min(1).max(256),
+      coordination_mode: z.literal("direct-v1"),
+      api_version: z.literal("1.0.0"),
+      schema_version: z.literal("1.0.0"),
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).setDirectDependencies(input as DirectSetDependenciesInput) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_heartbeat",
+    "Renew an active direct-v1 task attempt lease.",
+    {
+      task_id: z.string().max(256),
+      attempt_id: z.string().max(256),
+      claim_token: z.string().min(1).max(512),
+      expected_revision: z.number().int().min(1),
+      extend_seconds: z.number().int().min(15).max(3600),
+      actor: z.string().min(1).max(256),
+      idempotency_key: z.string().min(1).max(256),
+      coordination_mode: z.literal("direct-v1"),
+      api_version: z.literal("1.0.0"),
+      schema_version: z.literal("1.0.0"),
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).heartbeatDirectTask(input as DirectHeartbeatInput) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_recover_claims",
+    "Recover expired direct-v1 attempts. Tasks require explicit requeue afterward.",
+    {
+      board_id: z.string().max(256),
+      expected_board_revision: z.number().int().min(1),
+      limit: z.number().int().min(1).max(100).optional(),
+      attempt_ids: z.array(z.string().max(256)).max(100).optional(),
+      actor: z.string().min(1).max(256),
+      idempotency_key: z.string().min(1).max(256),
+      coordination_mode: z.literal("direct-v1"),
+      api_version: z.literal("1.0.0"),
+      schema_version: z.literal("1.0.0"),
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).recoverDirectClaims(input as DirectRecoverClaimsInput) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_requeue",
+    "Explicitly requeue a recovered direct-v1 task.",
+    {
+      task_id: z.string().max(256),
+      expected_revision: z.number().int().min(1),
+      reason: z.string().min(1).max(4096),
+      recover_active_dependents: z.array(z.object({
+        task_id: z.string().max(256),
+        attempt_id: z.string().max(256),
+        claim_token: z.string().min(1).max(512),
+      })).max(100).optional(),
+      actor: z.string().min(1).max(256),
+      idempotency_key: z.string().min(1).max(256),
+      coordination_mode: z.literal("direct-v1"),
+      api_version: z.literal("1.0.0"),
+      schema_version: z.literal("1.0.0"),
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).requeueDirectTask(input as DirectRequeueInput) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_approve",
+    "Record an immutable direct-v1 approval decision for a declared task gate.",
+    {
+      task_id: z.string().max(256),
+      gate_id: z.string().min(1).max(128),
+      decision: z.enum(["allow", "deny"]),
+      expected_revision: z.number().int().min(1),
+      evidence_links: z.array(EvidenceRefSchema).max(100).optional(),
+      reason: z.string().max(4096).optional(),
+      actor: z.string().min(1).max(256),
+      idempotency_key: z.string().min(1).max(256),
+      coordination_mode: z.literal("direct-v1"),
+      api_version: z.literal("1.0.0"),
+      schema_version: z.literal("1.0.0"),
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).approveDirectTask(input as DirectApproveInput) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  const TaskQuerySchema = {
+    board_id: z.string().max(256),
+    actor: z.string().min(1).max(256),
+    status: z.array(z.enum(TASK_STATUSES)).max(TASK_STATUSES.length).optional(),
+    ready: z.boolean().optional(),
+    work_unit: z.string().min(1).max(128).optional(),
+    task_ids: z.array(z.string().max(256)).max(100).optional(),
+    updated_after_revision: z.number().int().min(0).optional(),
+    limit: z.number().int().min(1).max(200).optional(),
+    cursor: z.string().max(4096).optional(),
+  };
+
+  server.tool(
+    "tb_query",
+    "Query a stable, bounded, authorized direct-v1 task snapshot.",
+    TaskQuerySchema,
+    async (input) => {
+      try {
+        return success(new QueryService(databaseProvider(), { cursorSecret }).queryTasks(input) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_batch_status",
+    "Query bounded direct-v1 task status summaries for recovery without messaging.",
+    TaskQuerySchema,
+    async (input) => {
+      try {
+        return success(new QueryService(databaseProvider(), { cursorSecret }).batchStatus(input) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_events",
+    "Query authorized immutable direct-v1 event deltas in stable revision order.",
+    {
+      board_id: z.string().max(256),
+      actor: z.string().min(1).max(256),
+      task_id: z.string().max(256).optional(),
+      since_revision: z.number().int().min(0).optional(),
+      event_type: z.array(z.string().min(1).max(128)).max(100).optional(),
+      limit: z.number().int().min(1).max(200).optional(),
+      cursor: z.string().max(4096).optional(),
+    },
+    async (input) => {
+      try {
+        return success(new QueryService(databaseProvider(), { cursorSecret }).queryEvents(input) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
   // ── Update Task Status ─────────────────────────────
   server.tool(
     "tb_update",
@@ -259,9 +545,32 @@ export function registerTaskBoardTools(server: McpServer): void {
       task_id: z.string().max(256).describe("Task ID"),
       status: z.enum(TASK_STATUSES).optional().describe("New status (omit to keep current status and only add notes)"),
       notes: z.string().max(65536).optional().describe("Notes to append (timestamped). Works with or without status change."),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
+      actor: z.string().min(1).max(256).optional(),
+      idempotency_key: z.string().min(1).max(256).optional(),
+      expected_revision: z.number().int().min(1).optional(),
+      attempt_id: z.string().max(256).optional(),
+      claim_token: z.string().min(1).max(512).optional(),
+      evidence_links: z.array(EvidenceRefSchema).max(100).optional(),
     },
-    async ({ task_id, status, notes }) => {
-      const db = getDb();
+    async (input) => {
+      const { task_id, status, notes } = input;
+      const db = databaseProvider();
+      const service = new TaskService(db);
+      if (input.coordination_mode === "direct-v1") {
+        try {
+          return success(service.updateDirectTask(input as DirectTaskUpdateInput) as unknown as ToolResponse);
+        } catch (error) {
+          return directFailure(error);
+        }
+      }
+      try {
+        service.assertLegacyTaskMutationAllowed(task_id);
+      } catch (error) {
+        return directFailure(error);
+      }
       const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id) as Record<string, unknown> | undefined;
 
       if (!task) {
@@ -370,7 +679,7 @@ export function registerTaskBoardTools(server: McpServer): void {
       board_id: z.string().describe("Board ID"),
     },
     async ({ board_id }) => {
-      const db = getDb();
+      const db = databaseProvider();
       const tasks = db
         .prepare(`SELECT * FROM tasks WHERE board_id = ? AND status IN ('ready', 'backlog') ORDER BY
                   CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 WHEN 'p3' THEN 3 END`)
@@ -404,7 +713,7 @@ export function registerTaskBoardTools(server: McpServer): void {
       task_id: z.string().describe("Task ID"),
     },
     async ({ task_id }) => {
-      const db = getDb();
+      const db = databaseProvider();
       const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id);
       if (!task) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
@@ -421,7 +730,7 @@ export function registerTaskBoardTools(server: McpServer): void {
       project: z.string().optional().describe("Filter by project"),
     },
     async ({ project }) => {
-      const db = getDb();
+      const db = databaseProvider();
       const boards = project
         ? db.prepare(`SELECT * FROM boards WHERE project = ? ORDER BY created_at DESC`).all(project)
         : db.prepare(`SELECT * FROM boards ORDER BY created_at DESC`).all();

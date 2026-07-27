@@ -1,11 +1,46 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type Database from "better-sqlite3";
 import { z } from "zod";
+import type { Clock } from "../core/clock.js";
+import { directErrorResponse } from "../core/errors.js";
 import { getDb } from "../database/index.js";
+import {
+  FileLeaseService,
+  type DirectFileReleaseInput,
+  type DirectFileRenewInput,
+  type DirectFileReserveInput,
+} from "../services/file-lease-service.js";
 import { generateId } from "../utils/id.js";
 
 const DEFAULT_TTL_MINUTES = 15;
 
-export function registerFileTools(server: McpServer): void {
+function success(response: Record<string, unknown>) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(response) }],
+    structuredContent: response,
+  };
+}
+
+function directFailure(error: unknown) {
+  const response = directErrorResponse(error);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(response) }],
+    structuredContent: response,
+    isError: true,
+  };
+}
+
+const directVersionFields = {
+  coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+  api_version: z.string().max(32).optional(),
+  schema_version: z.string().max(32).optional(),
+};
+
+export function registerFileTools(
+  server: McpServer,
+  databaseProvider: () => Database.Database = getDb,
+  options: { clock?: Clock } = {}
+): void {
   // ── Reserve Files ──────────────────────────────────
   server.tool(
     "file_reserve",
@@ -25,9 +60,26 @@ export function registerFileTools(server: McpServer): void {
         .boolean()
         .default(false)
         .describe("If true, only check for conflicts without creating reservations"),
+      ...directVersionFields,
+      workspace_id: z.string().min(1).max(512).optional(),
+      case_policy: z.enum(["sensitive", "insensitive"]).optional(),
+      task_id: z.string().min(1).max(256).optional(),
+      attempt_id: z.string().min(1).max(256).optional(),
+      claim_token: z.string().min(1).max(512).optional(),
+      expected_task_revision: z.number().int().min(1).optional(),
+      idempotency_key: z.string().min(1).max(256).optional(),
     },
-    async ({ patterns, agent, ttl_minutes, check_only }) => {
-      const db = getDb();
+    async (input) => {
+      const { patterns, agent, ttl_minutes, check_only } = input;
+      const db = databaseProvider();
+      if (input.coordination_mode === "direct-v1") {
+        if (check_only) return directFailure(new Error("check_only is a legacy advisory operation"));
+        try {
+          return success(new FileLeaseService(db, options).reserve(input as DirectFileReserveInput) as unknown as Record<string, unknown>);
+        } catch (error) {
+          return directFailure(error);
+        }
+      }
       const now = new Date();
       const expiresAt = new Date(
         now.getTime() + ttl_minutes * 60 * 1000
@@ -126,9 +178,26 @@ export function registerFileTools(server: McpServer): void {
         .array(z.string())
         .optional()
         .describe("Specific patterns to release (omit to release all)"),
+      ...directVersionFields,
+      actor: z.string().min(1).max(256).optional(),
+      lease_id: z.string().min(1).max(256).optional(),
+      lease_token: z.string().min(1).max(512).optional(),
+      task_id: z.string().min(1).max(256).optional(),
+      attempt_id: z.string().min(1).max(256).optional(),
+      claim_token: z.string().min(1).max(512).optional(),
+      expected_revision: z.number().int().min(1).optional(),
+      idempotency_key: z.string().min(1).max(256).optional(),
     },
-    async ({ agent, patterns }) => {
-      const db = getDb();
+    async (input) => {
+      const { agent, patterns } = input;
+      const db = databaseProvider();
+      if (input.coordination_mode === "direct-v1") {
+        try {
+          return success(new FileLeaseService(db, options).release(input as DirectFileReleaseInput) as unknown as Record<string, unknown>);
+        } catch (error) {
+          return directFailure(error);
+        }
+      }
 
       if (patterns && patterns.length > 0) {
         const placeholders = patterns.map(() => "?").join(",");
@@ -168,6 +237,34 @@ export function registerFileTools(server: McpServer): void {
           },
         ],
       };
+    }
+  );
+
+  server.tool(
+    "file_renew",
+    "Renew an active direct-v1 file lease with matching task-attempt authority and revision.",
+    {
+      coordination_mode: z.literal("direct-v1"),
+      api_version: z.string().max(32),
+      schema_version: z.string().max(32),
+      actor: z.string().min(1).max(256),
+      lease_id: z.string().min(1).max(256),
+      lease_token: z.string().min(1).max(512),
+      task_id: z.string().min(1).max(256),
+      attempt_id: z.string().min(1).max(256),
+      claim_token: z.string().min(1).max(512),
+      expected_revision: z.number().int().min(1),
+      extend_seconds: z.number().int().min(15).max(3600),
+      idempotency_key: z.string().min(1).max(256),
+    },
+    async (input) => {
+      try {
+        return success(
+          new FileLeaseService(databaseProvider(), options).renew(input as DirectFileRenewInput) as unknown as Record<string, unknown>
+        );
+      } catch (error) {
+        return directFailure(error);
+      }
     }
   );
 }
