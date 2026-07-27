@@ -4,6 +4,13 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
 import { generateId } from "../src/utils/id.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { migrateDatabase } from "../src/database/migrations.js";
+import { registerTaskBoardTools } from "../src/tools/task-board.js";
+import { createServer } from "../src/server.js";
+import { createTestDatabase, removeTestDatabases } from "./helpers/database.js";
 
 // Use a temporary database for testing
 const TEST_DB_DIR = path.join(os.tmpdir(), `forgespec-test-${Date.now()}`);
@@ -231,6 +238,84 @@ describe("tb_create_board with tasks", () => {
   });
 });
 
+describe("direct-v1 task-board handlers", () => {
+  it("returns structured CAS errors, exact replay, and rejects legacy bypass", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgespec-handler-"));
+    const databasePath = path.join(directory, "handler.db");
+    migrateDatabase(databasePath);
+    const database = new Database(databasePath);
+    database.pragma("foreign_keys = ON");
+    const server = new McpServer({ name: "task-handler-test", version: "1.0.0" });
+    registerTaskBoardTools(server, () => database);
+    const client = new Client({ name: "task-handler-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const createArguments = {
+      project: "handler-tests",
+      name: "Direct handler board",
+      tasks: [{ title: "Handler task" }],
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      actor: "handler-owner",
+      idempotency_key: "handler-board",
+    };
+    const created = await client.callTool({ name: "tb_create_board", arguments: createArguments });
+    const replayed = await client.callTool({ name: "tb_create_board", arguments: createArguments });
+    expect(replayed.structuredContent).toEqual({ ...created.structuredContent, replayed: true });
+    const direct = created.structuredContent as { board_id: string; task_ids: string[] };
+
+    const absentCas = await client.callTool({
+      name: "tb_update",
+      arguments: {
+        task_id: direct.task_ids[0],
+        status: "blocked",
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        actor: "handler-owner",
+        idempotency_key: "missing-cas",
+      },
+    });
+    expect(absentCas.isError).toBe(true);
+    expect(absentCas.structuredContent).toMatchObject({
+      ok: false,
+      error: { category: "cas", code: "expected_revision_required", retryable: false },
+    });
+
+    const bypass = await client.callTool({
+      name: "tb_update",
+      arguments: { task_id: direct.task_ids[0], status: "blocked" },
+    });
+    expect(bypass.isError).toBe(true);
+    expect(bypass.structuredContent).toMatchObject({ ok: false, error: { category: "compatibility" } });
+
+    const claimBypass = await client.callTool({
+      name: "tb_claim",
+      arguments: { task_id: direct.task_ids[0], agent: "legacy-worker" },
+    });
+    expect(claimBypass.isError).toBe(true);
+    expect(claimBypass.structuredContent).toMatchObject({
+      ok: false,
+      error: { category: "compatibility", code: "legacy_direct_bypass" },
+    });
+    expect(database.prepare("SELECT revision, status FROM direct_tasks WHERE task_id = ?").get(direct.task_ids[0])).toEqual({
+      revision: 1,
+      status: "ready",
+    });
+    expect(database.prepare("SELECT status, assignee FROM tasks WHERE id = ?").get(direct.task_ids[0])).toEqual({
+      status: "ready",
+      assignee: null,
+    });
+
+    await client.close();
+    await server.close();
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+});
+
 // ── tb_update with notes tests ────────────────────────
 
 describe("tb_update with notes", () => {
@@ -360,5 +445,447 @@ describe("file_reserve check_only", () => {
 
     expect(existing.length).toBe(1);
     expect(existing[0].agent).toBe("agent-b");
+  });
+});
+
+// ── WU8 release integration tests ─────────────────────
+
+const RELEASE_P0_CAPS = [
+  "forgespec.capabilities", "task-cas", "idempotency", "task-attempt-lease",
+  "claim-recovery", "dependency-transitions", "audit-events", "sdd-contract-revisions",
+];
+const RELEASE_P1_CAPS = [
+  "structured-evidence-links", "approval-gates", "batch-status", "query-cursors", "file-lease",
+];
+const EXCLUDED_TOOL_NAMES = [
+  "msg_send", "msg_read_inbox", "msg_broadcast", "msg_request",
+  "msg_search", "msg_list_threads", "msg_list_agents", "msg_count", "msg_activity_feed",
+  "dlq_list", "dlq_purge", "dlq_retry",
+  "a2a_submit_task", "a2a_respond_task", "a2a_get_task", "a2a_cancel_task", "a2a_list_tasks",
+  "resource_acquire", "resource_check", "resource_release",
+];
+
+const PROJECT_ROOT = path.resolve(__dirname, "..");
+
+function range1x(): { min_inclusive: string; max_exclusive: string } {
+  return { min_inclusive: "1.0.0", max_exclusive: "2.0.0" };
+}
+
+describe("release integration — composed server registration", () => {
+  it("registers forgespec_capabilities alongside all direct-v1 tools", async () => {
+    const server = createServer();
+    const client = new Client({ name: "release-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const toolsList = await client.listTools();
+    const names = toolsList.tools.map((t) => t.name);
+
+    expect(names).toContain("forgespec_capabilities");
+    expect(names).toContain("sdd_save");
+    expect(names).toContain("sdd_get");
+    expect(names).toContain("sdd_history");
+    expect(names).toContain("tb_create_board");
+    expect(names).toContain("tb_claim");
+    expect(names).toContain("tb_update");
+    expect(names).toContain("tb_approve");
+    expect(names).toContain("tb_query");
+    expect(names).toContain("tb_events");
+    expect(names).toContain("file_reserve");
+
+    await client.close();
+    await server.close();
+  });
+});
+
+describe("release integration — capability manifest for cortex-ia", () => {
+  it("advertises qualified P0 and P1 intervals with local-trusted-client and version >= 1.3.0", async () => {
+    const server = createServer();
+    const client = new Client({ name: "cortex-ia-probe", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: "forgespec_capabilities",
+      arguments: {
+        client: { name: "cortex-ia", version: "1.0.0" },
+        requested_mode: "direct-v1",
+        required: [
+          ...RELEASE_P0_CAPS.map((id) => ({ id, range: range1x() })),
+          ...RELEASE_P1_CAPS.map((id) => ({ id, range: range1x() })),
+        ],
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    const caps = result.structuredContent as Record<string, unknown>;
+
+    // Server identity and API version
+    expect(caps.server).toMatchObject({ name: "forgespec-mcp", api_version: "1.0.0" });
+    const serverVersion = (caps.server as { version: string }).version;
+    const [major, minor] = serverVersion.split(".").map(Number);
+    expect(major).toBe(1);
+    expect(minor).toBeGreaterThanOrEqual(3);
+
+    // Security boundary disclosure
+    expect(caps.security).toMatchObject({ identity_model: "local-trusted-client" });
+
+    // Modes
+    expect(caps.modes).toEqual(["legacy", "direct-v1"]);
+
+    // Schemas
+    expect(caps.schemas).toMatchObject({
+      sdd_envelope: range1x(),
+      task_metadata: range1x(),
+      evidence_ref: range1x(),
+    });
+
+    // All P0 and P1 capabilities advertised
+    const capabilityIds = (caps.capabilities as Array<{ id: string }>).map((c) => c.id);
+    for (const p0 of RELEASE_P0_CAPS) {
+      expect(capabilityIds).toContain(p0);
+    }
+    for (const p1 of RELEASE_P1_CAPS) {
+      expect(capabilityIds).toContain(p1);
+    }
+
+    // Compatibility negotiation
+    expect(caps.compatibility).toMatchObject({
+      compatible: true,
+      selected_mode: "direct-v1",
+      missing: [],
+      incompatible: [],
+    });
+
+    // Limits
+    expect(caps.limits).toMatchObject({
+      max_page_size: 200,
+      max_batch_tasks: 100,
+      max_dependencies_per_task: 100,
+      min_lease_seconds: 15,
+      max_lease_seconds: 3600,
+      clock_skew_grace_ms: 5000,
+      max_file_scopes: 100,
+      max_idempotency_key_bytes: 256,
+    });
+
+    await client.close();
+    await server.close();
+  });
+
+  it("classifies unavailable optional P1 as unavailable without breaking compatibility", async () => {
+    const server = createServer();
+    const client = new Client({ name: "cortex-ia-probe", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: "forgespec_capabilities",
+      arguments: {
+        client: { name: "cortex-ia", version: "1.0.0" },
+        requested_mode: "direct-v1",
+        required: [
+          ...RELEASE_P0_CAPS.map((id) => ({ id, range: range1x() })),
+          { id: "nonexistent-optional-feature", range: range1x(), optional: true },
+        ],
+      },
+    });
+
+    const caps = result.structuredContent as Record<string, unknown>;
+    const compatibility = caps.compatibility as { compatible: boolean; unavailable_optional: unknown[] };
+    expect(compatibility.compatible).toBe(true);
+    expect(compatibility.unavailable_optional.length).toBe(1);
+
+    await client.close();
+    await server.close();
+  });
+
+  it("rejects incompatible required major", async () => {
+    const server = createServer();
+    const client = new Client({ name: "cortex-ia-probe", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({
+      name: "forgespec_capabilities",
+      arguments: {
+        client: { name: "cortex-ia", version: "1.0.0" },
+        requested_mode: "direct-v1",
+        required: [
+          { id: "task-cas", range: { min_inclusive: "2.0.0", max_exclusive: "3.0.0" } },
+        ],
+      },
+    });
+
+    const caps = result.structuredContent as Record<string, unknown>;
+    const compatibility = caps.compatibility as {
+      compatible: boolean;
+      incompatible: Array<{ id: string }>;
+      selected_mode?: string;
+    };
+    expect(compatibility.compatible).toBe(false);
+    expect(compatibility.incompatible.length).toBe(1);
+    expect(compatibility.incompatible[0].id).toBe("task-cas");
+    expect(compatibility.selected_mode).toBeUndefined();
+
+    await client.close();
+    await server.close();
+  });
+});
+
+describe("release integration — excluded boundary inventory", () => {
+  it("exposes no messaging, DLQ, A2A, remote, or non-file external-lease tools", async () => {
+    const server = createServer();
+    const client = new Client({ name: "boundary-audit", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const toolsList = await client.listTools();
+    const names = toolsList.tools.map((t) => t.name);
+
+    for (const excluded of EXCLUDED_TOOL_NAMES) {
+      expect(names).not.toContain(excluded);
+    }
+
+    await client.close();
+    await server.close();
+  });
+});
+
+describe("release integration — docs and version contract", () => {
+  it("ships docs/direct-v1.md documenting capabilities, security boundary, and cortex-ia contract", () => {
+    const docPath = path.join(PROJECT_ROOT, "docs", "direct-v1.md");
+    expect(fs.existsSync(docPath)).toBe(true);
+    const content = fs.readFileSync(docPath, "utf-8");
+    expect(content).toMatch(/direct-v1/i);
+    expect(content).toMatch(/local-trusted-client/);
+    expect(content).toMatch(/P0/i);
+    expect(content).toMatch(/cortex-ia/i);
+  });
+
+  it("ships docs/migrations.md documenting migration, rollback, and interruption recovery", () => {
+    const docPath = path.join(PROJECT_ROOT, "docs", "migrations.md");
+    expect(fs.existsSync(docPath)).toBe(true);
+    const content = fs.readFileSync(docPath, "utf-8");
+    expect(content).toMatch(/migration/i);
+    expect(content).toMatch(/rollback|restore|backup/i);
+    expect(content).toMatch(/interrupt/i);
+  });
+
+  it("uses additive 1.x versioning (not a breaking major bump)", () => {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf-8")
+    ) as { version: string };
+    const major = Number(pkg.version.split(".")[0]);
+    expect(major).toBe(1);
+  });
+
+  it("documents direct-v1 in README.md", () => {
+    const readme = fs.readFileSync(path.join(PROJECT_ROOT, "README.md"), "utf-8");
+    expect(readme).toMatch(/direct-v1/i);
+  });
+});
+
+describe("release integration — E2E direct-v1 lifecycle through composed server", () => {
+  let testDb: { path: string; database: Database.Database };
+  let sharedBoardId: string;
+
+  beforeAll(() => {
+    testDb = createTestDatabase("forgespec-release-");
+  });
+
+  afterAll(() => {
+    testDb.database.close();
+    removeTestDatabases();
+  });
+
+  it("completes capability -> board -> claim -> evidence -> approval -> complete -> delta recovery", async () => {
+    const server = createServer({ database: () => testDb.database });
+    const client = new Client({ name: "e2e-lifecycle", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    // 1. Capability negotiation — all P0 and P1 satisfied
+    const capsResult = await client.callTool({
+      name: "forgespec_capabilities",
+      arguments: {
+        client: { name: "cortex-ia", version: "1.0.0" },
+        requested_mode: "direct-v1",
+        required: [
+          ...RELEASE_P0_CAPS.map((id) => ({ id, range: range1x() })),
+          ...RELEASE_P1_CAPS.map((id) => ({ id, range: range1x() })),
+        ],
+      },
+    });
+    expect(capsResult.isError).not.toBe(true);
+    const caps = capsResult.structuredContent as { compatibility: { compatible: boolean; selected_mode: string } };
+    expect(caps.compatibility.compatible).toBe(true);
+    expect(caps.compatibility.selected_mode).toBe("direct-v1");
+
+    // 2. Create direct board with one gated task
+    const boardResult = await client.callTool({
+      name: "tb_create_board",
+      arguments: {
+        project: "release-e2e",
+        name: "E2E release board",
+        tasks: [
+          {
+            title: "E2E release task",
+            priority: "p0",
+            work_unit: "wu8-e2e",
+            gates: [{ gate_id: "review", required_for: ["done"], allowed_actors: ["reviewer"] }],
+          },
+        ],
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        actor: "e2e-owner",
+        idempotency_key: "e2e-board",
+      },
+    });
+    expect(boardResult.isError).not.toBe(true);
+    const board = boardResult.structuredContent as { board_id: string; task_ids: string[]; board_revision: number };
+    sharedBoardId = board.board_id;
+    const taskId = board.task_ids[0];
+
+    // 3. Claim the ready task
+    const claimResult = await client.callTool({
+      name: "tb_claim",
+      arguments: {
+        task_id: taskId,
+        agent: "e2e-worker",
+        expected_revision: 1,
+        lease_seconds: 120,
+        idempotency_key: "e2e-claim",
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+      },
+    });
+    expect(claimResult.isError).not.toBe(true);
+    const claim = claimResult.structuredContent as {
+      attempt_id: string;
+      claim_token: string;
+      task_revision: number;
+    };
+    expect(claim.attempt_id).toBeDefined();
+    expect(typeof claim.claim_token).toBe("string");
+    expect(claim.claim_token.length).toBeGreaterThan(0);
+    expect(claim.task_revision).toBe(2);
+
+    // 4. Attach evidence and move to in_review
+    const evidenceResult = await client.callTool({
+      name: "tb_update",
+      arguments: {
+        task_id: taskId,
+        status: "in_review",
+        expected_revision: claim.task_revision,
+        attempt_id: claim.attempt_id,
+        claim_token: claim.claim_token,
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        actor: "e2e-worker",
+        evidence_links: [
+          {
+            provider: "cortex",
+            kind: "session-summary",
+            external_id: "obs-e2e-001",
+            digest: "sha256:" + "a".repeat(64),
+          },
+        ],
+        idempotency_key: "e2e-evidence",
+      },
+    });
+    expect(evidenceResult.isError).not.toBe(true);
+    const evidence = evidenceResult.structuredContent as { task_revision: number };
+    expect(evidence.task_revision).toBeGreaterThan(claim.task_revision);
+
+    // 5. Approve the gate as authorized actor
+    const approveResult = await client.callTool({
+      name: "tb_approve",
+      arguments: {
+        task_id: taskId,
+        gate_id: "review",
+        decision: "allow",
+        expected_revision: evidence.task_revision,
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        actor: "reviewer",
+        idempotency_key: "e2e-approve",
+      },
+    });
+    expect(approveResult.isError).not.toBe(true);
+    const approval = approveResult.structuredContent as {
+      task_revision: number;
+      effective_decision: string;
+    };
+    expect(approval.effective_decision).toBe("allow");
+
+    // 6. Complete the task
+    const completeResult = await client.callTool({
+      name: "tb_update",
+      arguments: {
+        task_id: taskId,
+        status: "done",
+        expected_revision: approval.task_revision,
+        attempt_id: claim.attempt_id,
+        claim_token: claim.claim_token,
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        actor: "e2e-worker",
+        idempotency_key: "e2e-complete",
+      },
+    });
+    expect(completeResult.isError).not.toBe(true);
+
+    // 7. Delta recovery — query events since revision 1
+    const eventsResult = await client.callTool({
+      name: "tb_events",
+      arguments: {
+        board_id: board.board_id,
+        actor: "e2e-owner",
+        since_revision: 1,
+        limit: 50,
+      },
+    });
+    expect(eventsResult.isError).not.toBe(true);
+    const events = eventsResult.structuredContent as {
+      items: unknown[];
+      snapshot_revision: number;
+    };
+    expect(events.items.length).toBeGreaterThan(0);
+    expect(events.snapshot_revision).toBeGreaterThanOrEqual(approval.task_revision);
+
+    await client.close();
+    await server.close();
+  });
+
+  it("recovers deltas without messaging or broadcasts (tb_events only)", async () => {
+    const server = createServer({ database: () => testDb.database });
+    const client = new Client({ name: "delta-recovery", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    // Query events from the board created in the previous test
+    const result = await client.callTool({
+      name: "tb_events",
+      arguments: { board_id: sharedBoardId, actor: "e2e-owner", limit: 100 },
+    });
+    expect(result.isError).not.toBe(true);
+    const events = result.structuredContent as { items: unknown[] };
+    expect(events.items.length).toBeGreaterThan(0);
+
+    // The tools list MUST not include any broadcast/messaging tools
+    const toolsList = await client.listTools();
+    const names = toolsList.tools.map((t) => t.name);
+    for (const excluded of EXCLUDED_TOOL_NAMES) {
+      expect(names).not.toContain(excluded);
+    }
+
+    await client.close();
+    await server.close();
   });
 });

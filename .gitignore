@@ -1,6 +1,7 @@
 node_modules/
 build/
 *.db
+!tests/fixtures/forgespec-1.2.2.db
 *.db-wal
 *.db-shm
 .env

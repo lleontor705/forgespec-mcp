@@ -5,6 +5,7 @@ import {
   CONFIDENCE_THRESHOLDS,
   SDD_PHASES,
 } from "../src/types/index.js";
+import { canonicalJson, canonicalSha256 } from "../src/core/canonical-json.js";
 
 describe("SDD Contract Schema", () => {
   const validContract = {
@@ -92,5 +93,28 @@ describe("Confidence Thresholds", () => {
   it("init and explore have lowest thresholds", () => {
     expect(CONFIDENCE_THRESHOLDS.init).toBe(0.5);
     expect(CONFIDENCE_THRESHOLDS.explore).toBe(0.5);
+  });
+});
+
+describe("Canonical contract JSON", () => {
+  it("produces one semantic encoding and digest regardless of object key order", () => {
+    const left = {
+      z: [{ beta: true, alpha: null }],
+      a: { nested: "value", count: 2 },
+    };
+    const right = {
+      a: { count: 2, nested: "value" },
+      z: [{ alpha: null, beta: true }],
+    };
+
+    expect(canonicalJson(left)).toBe(canonicalJson(right));
+    expect(canonicalSha256(left)).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(canonicalSha256(left)).toBe(canonicalSha256(right));
+    expect(JSON.parse(canonicalJson(left))).toEqual(left);
+  });
+
+  it("rejects values that cannot be represented durably in JSON", () => {
+    expect(() => canonicalJson({ value: Number.NaN })).toThrow(/finite/i);
+    expect(() => canonicalJson({ value: undefined })).toThrow(/undefined/i);
   });
 });

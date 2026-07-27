@@ -37,6 +37,15 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 - **Audit trail** -- Every contract, task transition, and file reservation is logged with timestamps
 - **Cross-platform** -- Tested on Ubuntu, Windows, and macOS with Node 18, 20, and 22
 - **Cortex-ready** -- Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph across sessions
+- **direct-v1 mode** -- Additive transactional coordination with CAS, idempotency, immutable audit, attempt leases, and capability negotiation for race-safe multi-agent work
+
+---
+
+## direct-v1 Coordination Mode
+
+ForgeSpec 1.3.0+ introduces **direct-v1**, an additive coordination mode that provides transactional CAS, scoped idempotency, immutable audit history, exclusive attempt-based claim leases, normalized dependency DAGs, structured evidence references, approval gates, bounded cursor queries, and atomic file reservation leases.
+
+Legacy 1.2.2 behavior remains fully available. Clients negotiate via `forgespec_capabilities` before using direct-v1 tools. See [docs/direct-v1.md](docs/direct-v1.md) for the full capability manifest, cortex-ia contract, and security boundary. See [docs/migrations.md](docs/migrations.md) for migration, rollback, and interruption recovery details.
 
 ---
 
