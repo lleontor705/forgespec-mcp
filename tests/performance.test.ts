@@ -9,6 +9,7 @@ const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgespec-performance-"
 const databasePath = path.join(directory, "benchmark.db");
 let database: Database.Database;
 
+// Windows runners can need a larger hook budget for this 200k-row fixture.
 beforeAll(() => {
   migrateDatabase(databasePath);
   database = new Database(databasePath);
@@ -46,7 +47,7 @@ beforeAll(() => {
     }
   });
   insertFixture();
-});
+}, 30_000);
 
 afterAll(() => {
   database?.close();
@@ -54,6 +55,11 @@ afterAll(() => {
 });
 
 describe("historical task query performance contract", () => {
+  it("gives only the heavy fixture hook a 30-second preparation budget", () => {
+    const source = fs.readFileSync(new URL(import.meta.url), "utf8");
+    expect(source).toMatch(/beforeAll\([\s\S]*?\},\s*30_000\);/);
+  });
+
   it("qualifies schema v3 and the snapshot selection indexes", () => {
     expect(LATEST_SCHEMA_VERSION).toBe(3);
 

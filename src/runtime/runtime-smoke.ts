@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { collectRuntimeEvidence, type RuntimeSmokeOptions } from "./runtime-evidence.js";
+import { collectRuntimeEvidence, expectedAbiForNodeMajor, type RuntimeSmokeOptions } from "./runtime-evidence.js";
 
 const EXIT_USAGE = 2;
 const EXIT_RUNTIME = 3;
@@ -34,9 +34,10 @@ function parseArguments(argv: string[]): RuntimeSmokeOptions {
   }
   const mode = values.get("mode");
   const entrypoint = values.get("entrypoint");
-  const expectedAbi = values.get("expected-abi") ?? (process.versions.modules === "137" ? "137" : "127");
-  if ((mode !== "source" && mode !== "build") || !entrypoint || (expectedAbi !== "127" && expectedAbi !== "137")) throw new SmokeError(EXIT_USAGE, "Required arguments: --mode source|build --entrypoint path [--expected-abi 127|137]");
-  return { mode, entrypoint, expectedAbi };
+  const expectedAbi = values.get("expected-abi");
+  if ((mode !== "source" && mode !== "build") || !entrypoint || (expectedAbi !== undefined && expectedAbi !== "127" && expectedAbi !== "137")) throw new SmokeError(EXIT_USAGE, "Required arguments: --mode source|build --entrypoint path [--expected-abi 127|137]");
+  const nodeMajor = Number(/^v(\d+)/.exec(process.version)?.[1]);
+  return { mode, entrypoint, expectedAbi: expectedAbi === undefined ? expectedAbiForNodeMajor(nodeMajor) : expectedAbi as "127" | "137" };
 }
 
 function classifyError(error: unknown): SmokeError {
