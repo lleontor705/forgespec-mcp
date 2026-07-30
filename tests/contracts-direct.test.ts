@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -32,7 +32,7 @@ function open(databasePath: string): Database.Database {
   return database;
 }
 
-function contract(phase: "init" | "explore" = "init") {
+function contract(phase: "init" | "propose" | "explore" = "init") {
   return {
     schema_version: "1.0",
     phase,
@@ -250,6 +250,199 @@ describe("direct-v1 contract authority", () => {
     expect(() => service.saveDirect(directInput(contract(), { api_version: "2.0.0" }))).toThrow(/version/i);
     expect(() => service.saveDirect(directInput(contract(), { submitted_digest: `sha256:${"0".repeat(64)}` }))).toThrow(/digest/i);
     expect(database.prepare("SELECT COUNT(*) AS count FROM contract_revisions").get()).toEqual({ count: 0 });
+    database.close();
+  });
+});
+
+describe("direct-v1 contract-history compound cursor contract", () => {
+  async function historyTool(
+    database: Database.Database,
+    input: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    const server = new McpServer({ name: "contract-cursor-test-server", version: "1.0.0" });
+    registerSddTools(server, () => database);
+    const client = new Client({ name: "contract-cursor-test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const response = await client.callTool({ name: "sdd_history", arguments: input });
+    await client.close();
+    await server.close();
+    const text = response.content[0];
+    if (text?.type !== "text") throw new Error("Expected text response");
+    return JSON.parse(text.text) as Record<string, unknown>;
+  }
+
+  function saveFirstRevision(
+    database: Database.Database,
+    changeName: string,
+    actor = "test-actor",
+    summary = `Complete ${changeName} contract envelope.`
+  ) {
+    const service = new ContractService(database, { now: () => 1_800_000_000_000 });
+    return service.saveDirect(
+      directInput({ ...contract(), change_name: changeName, project: "compound-cursor-tests", executive_summary: summary }, {
+        actor,
+        idempotency_key: `save-${changeName}-${actor}`,
+      })
+    );
+  }
+
+  function appendRevision(
+    database: Database.Database,
+    parent: { contract_id: string; revision: number },
+    changeName: string,
+    actor: string,
+    summary: string
+  ) {
+    const id = `synthetic-${changeName}-${actor}`;
+    database.prepare(
+      `INSERT INTO contract_revisions
+         (id, project, change_name, phase, revision, parent_contract_id, contract_json, digest, actor, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      "compound-cursor-tests",
+      changeName,
+      "init",
+      parent.revision + 1,
+      parent.contract_id,
+      JSON.stringify({ ...contract(), change_name: changeName, project: "compound-cursor-tests", executive_summary: summary }),
+      `sha256:${String(parent.revision + 1).repeat(64).slice(0, 64)}`,
+      actor,
+      1_800_000_000_001
+    );
+    database.prepare(
+      "UPDATE contract_streams SET head_revision = ?, head_contract_id = ? WHERE project = ? AND change_name = ?"
+    ).run(parent.revision + 1, id, "compound-cursor-tests", changeName);
+    return { contract_id: id, revision: parent.revision + 1 };
+  }
+
+  it("uses an opaque compound (revision,id) cursor and returns tied revisions exactly once", async () => {
+    const { database } = createDatabase();
+    const first = saveFirstRevision(database, "stream-a");
+    const second = saveFirstRevision(database, "stream-b");
+
+    const pageOne = await historyTool(database, {
+      project: "compound-cursor-tests",
+      limit: 1,
+    });
+    expect(pageOne).toMatchObject({ items: [{ revision: 1 }] });
+    expect(pageOne.next_cursor).toEqual(expect.any(String));
+    expect(pageOne.next_cursor).not.toMatch(/^\d+$/);
+
+    const pageTwo = await historyTool(database, {
+      project: "compound-cursor-tests",
+      cursor: pageOne.next_cursor,
+      limit: 10,
+    });
+    expect(pageTwo).toMatchObject({ items: [{ revision: 1 }], next_cursor: null });
+    const ids = [
+      ...((pageOne.items as Array<{ contract_id: string }>).map((item) => item.contract_id)),
+      ...((pageTwo.items as Array<{ contract_id: string }>).map((item) => item.contract_id)),
+    ];
+    expect(ids).toEqual(expect.arrayContaining([first.contract_id, second.contract_id]));
+    expect(new Set(ids).size).toBe(2);
+    database.close();
+  });
+
+  it("freezes the upper bound at the first page and preserves canonical filters", async () => {
+    const { database } = createDatabase();
+    saveFirstRevision(database, "filtered-stream");
+    saveFirstRevision(database, "other-stream");
+    const filteredRoot = new ContractService(database).history({
+      project: "compound-cursor-tests",
+      change_name: "filtered-stream",
+      limit: 10,
+    }).items[0] as { contract_id: string; revision: number };
+    appendRevision(database, filteredRoot, "filtered-stream", "second-actor", "A second filtered revision.");
+
+    const pageOne = await historyTool(database, {
+      project: "compound-cursor-tests",
+      change_name: "filtered-stream",
+      phase: "init",
+      limit: 1,
+    });
+    const filteredSecond = new ContractService(database).history({
+      project: "compound-cursor-tests",
+      change_name: "filtered-stream",
+      limit: 10,
+    }).items.find((item) => item.revision === 2) as { contract_id: string; revision: number };
+    appendRevision(database, filteredSecond, "filtered-stream", "third-actor", "A third filtered revision.");
+
+    const pageTwo = await historyTool(database, {
+      project: "compound-cursor-tests",
+      change_name: "filtered-stream",
+      phase: "init",
+      cursor: pageOne.next_cursor,
+      limit: 10,
+    });
+    expect((pageTwo.items as Array<{ change_name: string }>).every((item) => item.change_name === "filtered-stream")).toBe(true);
+    expect(pageTwo.items).toHaveLength(1);
+    expect((pageTwo.items as Array<{ revision: number }>)[0].revision).toBe(2);
+    expect(pageTwo.next_cursor).toBeNull();
+    database.close();
+  });
+
+  it.each([
+    ["tamper", "not-a-valid-signed-cursor", "CURSOR_INVALID"],
+    ["version", "v0.invalid", "CURSOR_VERSION_UNSUPPORTED"],
+    ["context", "context-mismatch", "CURSOR_CONTEXT_MISMATCH"],
+  ])("rejects %s without querying partial history", async (_kind, cursor, expectedCode) => {
+    const { database } = createDatabase();
+    saveFirstRevision(database, "error-stream");
+    const response = await historyTool(database, {
+      project: "compound-cursor-tests",
+      change_name: "error-stream",
+      cursor,
+      limit: 10,
+    });
+    expect(response).toMatchObject({ ok: false, error: { code: expectedCode } });
+    database.close();
+  });
+
+  it("rejects a cursor exactly at expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2027-01-01T00:00:00.000Z"));
+    const { database } = createDatabase();
+    saveFirstRevision(database, "expiry-stream");
+    const expiryRoot = new ContractService(database).history({
+      project: "compound-cursor-tests",
+      change_name: "expiry-stream",
+      limit: 10,
+    }).items[0] as { contract_id: string; revision: number };
+    appendRevision(database, expiryRoot, "expiry-stream", "expiry-actor", "A second expiry revision.");
+    const first = await historyTool(database, {
+      project: "compound-cursor-tests",
+      change_name: "expiry-stream",
+      limit: 1,
+    });
+    vi.setSystemTime(new Date("2027-01-02T00:00:00.000Z"));
+    const expired = await historyTool(database, {
+      project: "compound-cursor-tests",
+      change_name: "expiry-stream",
+      cursor: first.next_cursor,
+      limit: 1,
+    });
+    expect(expired).toMatchObject({ ok: false, error: { code: "CURSOR_EXPIRED" } });
+    database.close();
+    vi.useRealTimers();
+  });
+
+  it("keeps legacy history explicitly best-effort and does not bridge it into strong mode", async () => {
+    const { database } = createDatabase();
+    const service = new ContractService(database);
+    service.saveLegacy(JSON.stringify(contract()));
+
+    const defaultResponse = await historyTool(database, { project: "forgespec-tests", limit: 10 });
+    expect(defaultResponse).toMatchObject({ ok: false, error: { code: "LEGACY_OPT_IN_REQUIRED" } });
+
+    const legacyResponse = await historyTool(database, {
+      project: "forgespec-tests",
+      consistency: "best_effort",
+      limit: 10,
+    });
+    expect(legacyResponse).toMatchObject({ consistency: "best_effort" });
+    expect(legacyResponse.next_cursor).toBeUndefined();
     database.close();
   });
 });

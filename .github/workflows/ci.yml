@@ -10,24 +10,95 @@ jobs:
   quality:
     uses: lleontor705/ats-deploy-public/.github/workflows/quality-node.yml@main
     with:
-      node-version: "22"
+      node-version: "24.18.1"
       lint-command: "npm run lint"
       test-command: "npm test"
 
   security:
     uses: lleontor705/ats-deploy-public/.github/workflows/security-scan.yml@main
 
-  test-matrix:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  primary-node24:
+    name: Primary Node 24.18.1 quality
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: "24.18.1"
+      - name: Cache npm downloads only
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-${{ hashFiles('package-lock.json') }}
       - run: npm ci
+      - name: Print Node 24.18.1 runtime evidence
+        shell: bash
+        run: |
+          node --version
+          npm --version
+          node -e "const b=require('better-sqlite3'); const db=new b(':memory:'); console.log(JSON.stringify({modules:process.versions.modules,napi:process.versions.napi,sqlite:db.prepare('select sqlite_version() as version').get().version,betterSqlite3Loaded:true})); db.close()"
+          node -e "if (process.version !== 'v24.18.1' || process.versions.modules !== '137') process.exit(1)"
       - run: npm run lint
       - run: npm test
+      - name: Migration and temporary MCP handshake
+        shell: bash
+        run: npm test -- --run tests/migrations.test.ts tests/runtime-compatibility.test.ts
+
+  runtime-quality:
+    name: Runtime ${{ matrix.node-line }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node-line: "22.x"
+            node-version: "22.x"
+            os: ubuntu-latest
+            expected-abi: "127"
+          - node-line: "22.x"
+            node-version: "22.x"
+            os: windows-latest
+            expected-abi: "127"
+          - node-line: "22.x"
+            node-version: "22.x"
+            os: macos-latest
+            expected-abi: "127"
+          - node-line: "24.x"
+            node-version: "24.x"
+            os: ubuntu-latest
+            expected-abi: "137"
+          - node-line: "24.x"
+            node-version: "24.x"
+            os: windows-latest
+            expected-abi: "137"
+          - node-line: "24.x"
+            node-version: "24.x"
+            os: macos-latest
+            expected-abi: "137"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Cache npm downloads only
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.node-line }}-${{ hashFiles('package-lock.json') }}
+      - name: Install isolated dependencies
+        run: npm ci
+      - name: Print runtime and native evidence
+        shell: bash
+        run: |
+          node --version
+          npm --version
+          node -e "const b=require('better-sqlite3'); const db=new b(':memory:'); console.log(JSON.stringify({modules:process.versions.modules,napi:process.versions.napi,expectedAbi:'${{ matrix.expected-abi }}',sqlite:db.prepare('select sqlite_version() as version').get().version,betterSqlite3Loaded:true})); db.close()"
+          node -e "if (process.versions.modules !== '${{ matrix.expected-abi }}') process.exit(1)"
+      - name: Lint and typecheck
+        run: npm run lint
+      - name: Full test suite
+        run: npm test
+      - name: Migration and native smoke
+        run: npm test -- --run tests/migrations.test.ts
+      - name: Temporary MCP initialize and tools/list handshake
+        run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi ${{ matrix.expected-abi }}

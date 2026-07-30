@@ -257,6 +257,83 @@ describe("direct-v1 normalized file leases", () => {
     created.database.close();
   });
 
+  it("keeps one winner when independent connections contend repeatedly for the same scope", async () => {
+    const created = createTestDatabase("forgespec-file-contention-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const { claim } = createAuthority(created.database, clock, "contention");
+    const connections = Array.from({ length: 8 }, () => openTestDatabase(created.path));
+    const requests = connections.map((database, index) => ({
+      database,
+      input: reserveInput(claim, {
+        patterns: ["src/shared/**"],
+        agent: "worker-a",
+        idempotency_key: `contention-${index}`,
+      }),
+    }));
+
+    try {
+      const outcomes = await Promise.all(requests.map(async ({ database, input }) => {
+        try {
+          return { result: new FileLeaseService(database, { clock }).reserve(input) };
+        } catch (error) {
+          return { error };
+        }
+      }));
+
+      expect(outcomes.filter((outcome) => "result" in outcome)).toHaveLength(1);
+      expect(outcomes.filter((outcome) => "error" in outcome)).toHaveLength(7);
+      expect(outcomes.filter((outcome) => "error" in outcome).every(({ error }) =>
+        error instanceof FileLeaseConflictError && error.code === "scope_overlap"
+      )).toBe(true);
+      expect(created.database.prepare("SELECT COUNT(*) AS count FROM file_leases WHERE state = 'active'").get())
+        .toEqual({ count: 1 });
+    } finally {
+      for (const database of connections) database.close();
+      created.database.close();
+    }
+  });
+
+  it("repeats a request safely after the first connection is closed", () => {
+    const created = createTestDatabase("forgespec-file-repeat-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const { claim } = createAuthority(created.database, clock, "repeat");
+    const request = reserveInput(claim, { patterns: ["src/repeat/**"], idempotency_key: "repeat-reserve" });
+    const service = new FileLeaseService(created.database, { clock });
+    const original = service.reserve(request);
+    created.database.close();
+
+    expect(() => service.reserve(request)).toThrowError(
+      expect.objectContaining({ code: "connection_closed", category: "lease" })
+    );
+    expect(original.lease_id).toBeTruthy();
+  });
+
+  it("rolls back and reports an injected audit failure without leaking a partial lease", () => {
+    const created = createTestDatabase("forgespec-file-audit-failure-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const { claim } = createAuthority(created.database, clock, "audit-failure");
+    const service = new FileLeaseService(created.database, { clock });
+    const request = reserveInput(claim, { patterns: ["src/audit/**"], idempotency_key: "audit-failure" });
+    created.database.exec(`
+      CREATE TRIGGER fail_file_lease_audit
+      BEFORE INSERT ON authority_events
+      WHEN NEW.resource_type = 'file_lease'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected audit failure');
+      END;
+    `);
+
+    try {
+      expect(() => service.reserve(request)).toThrowError(
+        expect.objectContaining({ code: "audit_write_failed", category: "lease" })
+      );
+      expect(created.database.prepare("SELECT COUNT(*) AS count FROM file_leases").get()).toEqual({ count: 0 });
+      expect(created.database.prepare("SELECT COUNT(*) AS count FROM file_lease_scopes").get()).toEqual({ count: 0 });
+    } finally {
+      created.database.close();
+    }
+  });
+
   it("preserves legacy advisory reserve/release handlers beside direct leases", async () => {
     const created = createTestDatabase("forgespec-file-legacy-");
     const server = new McpServer({ name: "file-handler-test", version: "1.0.0" });

@@ -16,28 +16,92 @@ permissions:
   id-token: write
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  node22-compatibility-gate:
+    name: Node 22 compatibility gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
+          node-version: "22.x"
+      - name: Cache npm downloads only
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ runner.arch }}-22.x-${{ hashFiles('package-lock.json') }}
+      - name: Install clean Node 22 dependencies
+        run: npm ci
+      - name: Record Node 22 native runtime evidence
+        shell: bash
+        run: |
+          node --version
+          npm --version
+          node -e "const b=require('better-sqlite3'); const db=new b(':memory:'); const sqlite=db.prepare('select sqlite_version() as version').get().version; console.log(JSON.stringify({node:process.version,npm:process.env.npm_config_user_agent,modules:process.versions.modules,napi:process.versions.napi,sqlite,betterSqlite3Loaded:true})); if (process.versions.modules !== '127') process.exit(1); db.close()"
+      - name: Run full Node 22 test suite
+        run: npm test
+      - name: Run Node 22 migrations and native handshake
+        run: npm test -- --run tests/migrations.test.ts
+      - name: Run Node 22 runtime smoke CLI
+        run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi 127
+
+  release-node24:
+    name: Verify release on Node 24.18.1
+    runs-on: ubuntu-latest
+    needs: node22-compatibility-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.1"
+      - name: Cache npm downloads only
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-${{ hashFiles('package-lock.json') }}
+      - name: Install clean Node 24.18.1 dependencies
+        run: npm ci
+      - name: Record exact Node 24 native runtime evidence
+        shell: bash
+        run: |
+          node --version
+          npm --version
+          node -e "const b=require('better-sqlite3'); const db=new b(':memory:'); const sqlite=db.prepare('select sqlite_version() as version').get().version; console.log(JSON.stringify({node:process.version,npm:process.env.npm_config_user_agent,modules:process.versions.modules,napi:process.versions.napi,sqlite,betterSqlite3Loaded:true})); if (process.version !== 'v24.18.1' || process.versions.modules !== '137') process.exit(1); db.close()"
+      - run: npm run lint
       - run: npm test
+      - run: npm run build
+      - name: Run migrations and temporary MCP handshake
+        run: npm test -- --run tests/migrations.test.ts
+      - name: Run exact Node 24 runtime smoke CLI
+        run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi 137
+      - name: Run built runtime smoke CLI
+        run: node build/runtime/runtime-smoke.js --mode build --entrypoint build/index.js --expected-abi 137
+      - name: Validate packed manifest without publishing
+        shell: bash
+        run: |
+          npm pack --json > pack-manifest.json
+          TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
+          tar -xOf "$TARBALL" package/package.json > packed-package.json
+          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log(JSON.stringify({tarball:process.env.TARBALL,bin:p.bin}))"
+          rm -f "$TARBALL" pack-manifest.json packed-package.json
 
   approve-release:
     name: Approve Release
     runs-on: ubuntu-latest
-    needs: test
+    needs: [node22-compatibility-gate, release-node24]
     environment: production
     steps:
-      - run: echo "Release approved."
+      - run: echo "Release approved after Node22 compatibility and Node24.18.1 verification."
 
   publish:
-    needs: approve-release
+    name: Publish verified Node 24.18.1 release
+    needs: [node22-compatibility-gate, release-node24, approve-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,10 +109,15 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: "24.18.1"
           registry-url: https://registry.npmjs.org
-          cache: npm
-      - run: npm ci
+      - name: Cache npm downloads only
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-publish-${{ hashFiles('package-lock.json') }}
+      - name: Install clean publish dependencies
+        run: npm ci
       - name: Determine version
         id: version
         run: |
@@ -59,8 +128,16 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           npm version "${TAG#v}" --no-git-tag-version --allow-same-version
-      - run: npm run build
+      - run: npm run lint
       - run: npm test
+      - run: npm run build
+      - name: Validate packed manifest before publish
+        shell: bash
+        run: |
+          npm pack --json > pack-manifest.json
+          TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
+          tar -xOf "$TARBALL" package/package.json > packed-package.json
+          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); console.log('packed manifest verified; publish is the only publishing step')"
       - name: Publish to npm
         run: npm publish --provenance --access public
         env:

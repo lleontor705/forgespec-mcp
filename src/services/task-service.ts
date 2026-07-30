@@ -6,6 +6,8 @@ import {
   storeIdempotentResponse,
 } from "../core/idempotency.js";
 import { observeServerTime, SystemClock, type Clock } from "../core/clock.js";
+import { appendTaskVersion as appendTaskVersionRow } from "../core/events.js";
+import { hasHeartbeatAuthority, mayRecover } from "../core/attempt-authority.js";
 import { authorityTokenMatches, generateAuthorityToken, hashAuthorityToken } from "../core/tokens.js";
 import {
   TASK_PRIORITIES,
@@ -294,6 +296,11 @@ export class TaskService {
              (task_id, board_id, revision, status, metadata_json, created_at_ms, updated_at_ms)
            VALUES (?, ?, 1, ?, ?, ?, ?)`
         ).run(taskId, boardId, status, JSON.stringify(metadata), now, now);
+        this.appendTaskVersion({
+          board_id: boardId, task_id: taskId, board_revision: 1, task_revision: 1,
+          status, current_attempt_id: null, blocked_reason: null, metadata_json: JSON.stringify(metadata),
+          created_at_ms: now, updated_at_ms: now,
+        });
         this.insertApprovalGates(taskId, metadata.gates, 1);
       }
 
@@ -353,6 +360,11 @@ export class TaskService {
            (task_id, board_id, revision, status, metadata_json, created_at_ms, updated_at_ms)
          VALUES (?, ?, 1, ?, ?, ?, ?)`
       ).run(taskId, board.board_id, status, JSON.stringify(metadata), now, now);
+      this.appendTaskVersion({
+        board_id: board.board_id, task_id: taskId, board_revision: boardRevision, task_revision: 1,
+        status, current_attempt_id: null, blocked_reason: null, metadata_json: JSON.stringify(metadata),
+        created_at_ms: now, updated_at_ms: now,
+      });
       this.insertApprovalGates(taskId, metadata.gates, 1);
       this.replaceDependencyEdges(board.board_id, taskId, dependencies, boardRevision);
       this.updateBoardRevision(board, boardRevision, now);
@@ -388,10 +400,22 @@ export class TaskService {
       const task = this.requireDirectTask(input.task_id);
       if (task.board_id !== board.board_id) throw new TaskConflictError("Task is not on the requested board", "dependency", "cross_board_dependency");
       if (task.revision !== input.expected_task_revision) this.stale("task", task.revision);
+      const currentMetadata = JSON.parse(task.metadata_json) as TaskMetadata;
+      if (JSON.stringify(currentMetadata.dependencies) === JSON.stringify(input.dependency_task_ids)) {
+        const response: DirectTaskMutationResult = {
+          ok: true, replayed: false, board_id: board.board_id, board_revision: board.revision,
+          task_id: task.task_id, task_revision: task.revision, status: task.status, newly_ready: [], reblocked: [],
+        };
+        storeIdempotentResponse(this.database, {
+          scope, keyHash, requestDigest: digest, response, resourceType: "task", resourceId: task.task_id,
+          resultingRevision: task.revision, createdAtMs: this.effectiveNow(),
+        });
+        return response;
+      }
       const now = this.effectiveNow();
       const taskRevision = task.revision + 1;
       const boardRevision = board.revision + 1;
-      const metadata = JSON.parse(task.metadata_json) as TaskMetadata;
+      const metadata = currentMetadata;
       metadata.dependencies = [...input.dependency_task_ids];
       this.replaceDependencyEdges(board.board_id, task.task_id, input.dependency_task_ids, boardRevision);
       const status = task.current_attempt_id ? task.status : this.readinessStatus(task, input.dependency_task_ids);
@@ -402,6 +426,11 @@ export class TaskService {
          WHERE task_id = ? AND revision = ?`
       ).run(taskRevision, status, JSON.stringify(metadata), now, task.task_id, task.revision);
       this.syncTaskProjection({ ...task, revision: taskRevision, status, blocked_reason: null, metadata_json: JSON.stringify(metadata), updated_at_ms: now });
+      this.appendTaskVersion({
+        board_id: board.board_id, task_id: task.task_id, board_revision: boardRevision, task_revision: taskRevision,
+        status, current_attempt_id: task.current_attempt_id, blocked_reason: null,
+        metadata_json: JSON.stringify(metadata), created_at_ms: task.created_at_ms, updated_at_ms: now,
+      });
       this.updateBoardRevision(board, boardRevision, now);
       this.appendBoardEvent(board.board_id, boardRevision, 0, "task_dependencies_set", input.actor, keyHash, {
         dependency_task_ids: input.dependency_task_ids,
@@ -454,7 +483,7 @@ export class TaskService {
       ).run(attemptId, task.task_id, attemptNo, input.agent, hashAuthorityToken(token), now, expiresAt);
       const taskRevision = task.revision + 1;
       const boardRevision = board.revision + 1;
-      this.updateTaskAuthority(task, taskRevision, "in_progress", attemptId, null, now);
+      this.updateTaskAuthority(task, taskRevision, "in_progress", attemptId, null, now, boardRevision);
       this.updateBoardRevision(board, boardRevision, now);
       this.appendBoardEvent(board.board_id, boardRevision, 0, "task_claimed", input.agent, keyHash, {
         attempt_no: attemptNo,
@@ -494,7 +523,9 @@ export class TaskService {
       if (task.revision !== input.expected_revision) this.stale("task", task.revision);
       const attempt = this.requireAttemptAuthority(task, input.attempt_id, input.actor, input.claim_token);
       const now = this.effectiveNow();
-      if (now >= attempt.expires_at_ms + 5_000) this.authorityDenied("Attempt lease has expired", "attempt_expired");
+      if (!hasHeartbeatAuthority({ expiresAtMs: attempt.expires_at_ms, nowMs: now })) {
+        this.authorityDenied("Attempt lease has expired", "attempt_expired");
+      }
       const expiresAt = Math.min(
         Math.max(attempt.expires_at_ms, now) + input.extend_seconds * 1000,
         now + 3_600_000
@@ -505,7 +536,7 @@ export class TaskService {
       const board = this.requireDirectBoard(task.board_id);
       const taskRevision = task.revision + 1;
       const boardRevision = board.revision + 1;
-      this.updateTaskAuthority(task, taskRevision, task.status, attempt.id, task.blocked_reason, now);
+      this.updateTaskAuthority(task, taskRevision, task.status, attempt.id, task.blocked_reason, now, boardRevision);
       this.updateBoardRevision(board, boardRevision, now);
       this.appendBoardEvent(board.board_id, boardRevision, 0, "attempt_heartbeat", input.actor, keyHash, {
         lease_expires_at: new Date(expiresAt).toISOString(),
@@ -552,7 +583,7 @@ export class TaskService {
         throw new TaskConflictError("Recovery attempt is not active on this board", "state", "attempt_not_recoverable");
       }
       for (const attempt of attempts) {
-        if (attempt.state !== "active" || now < attempt.expires_at_ms + 5_000) {
+        if (attempt.state !== "active" || !mayRecover({ expiresAtMs: attempt.expires_at_ms, nowMs: now })) {
           throw new TaskConflictError("Attempt recovery is premature", "lease", "recovery_premature");
         }
       }
@@ -567,13 +598,13 @@ export class TaskService {
            WHERE id = ? AND state = 'active' AND revision = ?`
         ).run(now, attempt.id, attempt.revision);
         const taskRevision = task.revision + 1;
-        this.updateTaskAuthority(task, taskRevision, "blocked", null, "requeue_required", now);
+        this.updateTaskAuthority(task, taskRevision, "blocked", null, "requeue_required", now, boardRevision);
         this.appendBoardEvent(board.board_id, boardRevision, index, "attempt_recovered", input.actor, keyHash, {
           classification: "expired",
           reason: "lease_expired",
         }, now, task.task_id, taskRevision, attempt.id);
         recovered.push({ task_id: task.task_id, attempt_id: attempt.id, classification: "expired" });
-        this.reconcileDependents(task.task_id, now).reblocked.forEach((taskId) => reblocked.add(taskId));
+        this.reconcileDependents(task.task_id, now, boardRevision).reblocked.forEach((taskId) => reblocked.add(taskId));
       });
       this.updateBoardRevision(board, boardRevision, now);
       this.appendReadinessEvents(board.board_id, boardRevision, recovered.length, input.actor, keyHash, [], [...reblocked], now);
@@ -612,10 +643,10 @@ export class TaskService {
       const taskRevision = task.revision + 1;
       const boardRevision = board.revision + 1;
       const reblocked = dependencyReopen
-        ? this.reblockDependentsForReopen(task.task_id, input.recover_active_dependents ?? [], now)
+        ? this.reblockDependentsForReopen(task.task_id, input.recover_active_dependents ?? [], now, boardRevision)
         : [];
       const status = this.dependenciesSatisfiedForTask(task.task_id) ? "ready" : "backlog";
-      this.updateTaskAuthority(task, taskRevision, status, null, null, now);
+      this.updateTaskAuthority(task, taskRevision, status, null, null, now, boardRevision);
       this.updateBoardRevision(board, boardRevision, now);
       this.appendBoardEvent(board.board_id, boardRevision, 0, "task_requeued", input.actor, keyHash, {
         reason: input.reason,
@@ -667,6 +698,17 @@ export class TaskService {
       if (input.status !== undefined && input.status !== task.status && !validTransitions[task.status].includes(input.status)) {
         throw new TaskConflictError(`Invalid task transition from ${task.status} to ${input.status}`, "state", "invalid_transition");
       }
+      if (status === task.status && input.notes === undefined && (input.evidence_links?.length ?? 0) === 0) {
+        const response: DirectTaskMutationResult = {
+          ok: true, replayed: false, board_id: board.board_id, board_revision: board.revision,
+          task_id: task.task_id, task_revision: task.revision, status: task.status, newly_ready: [], reblocked: [],
+        };
+        storeIdempotentResponse(this.database, {
+          scope, keyHash, requestDigest: digest, response, resourceType: "task", resourceId: task.task_id,
+          resultingRevision: task.revision, createdAtMs: this.effectiveNow(),
+        });
+        return response;
+      }
       this.requireEffectiveApprovals(task.task_id, status);
       const metadata = JSON.parse(task.metadata_json) as TaskMetadata;
       const now = this.effectiveNow();
@@ -687,9 +729,14 @@ export class TaskService {
          WHERE task_id = ? AND revision = ?`
       ).run(taskRevision, status, currentAttemptId, JSON.stringify(metadata), now, task.task_id, task.revision);
       if (changed.changes !== 1) this.stale("task", task.revision);
-      const readiness = status === "done" ? this.reconcileDependents(task.task_id, now) : { newly_ready: [], reblocked: [] };
+      const readiness = status === "done" ? this.reconcileDependents(task.task_id, now, boardRevision) : { newly_ready: [], reblocked: [] };
       this.updateBoardRevision(board, boardRevision, now);
       this.syncTaskProjection({ ...task, revision: taskRevision, status, current_attempt_id: currentAttemptId, blocked_reason: null, metadata_json: JSON.stringify(metadata), updated_at_ms: now });
+      this.appendTaskVersion({
+        board_id: board.board_id, task_id: task.task_id, board_revision: boardRevision, task_revision: taskRevision,
+        status, current_attempt_id: currentAttemptId, blocked_reason: null,
+        metadata_json: JSON.stringify(metadata), created_at_ms: task.created_at_ms, updated_at_ms: now,
+      });
       this.appendBoardEvent(board.board_id, boardRevision, 0, "task_updated", input.actor, keyHash, {
         from_status: task.status,
         to_status: status,
@@ -759,7 +806,7 @@ export class TaskService {
         "INSERT OR IGNORE INTO approval_decision_evidence (decision_id, evidence_id) VALUES (?, ?)"
       );
       evidenceIds.forEach((evidenceId) => linkDecision.run(decisionId, evidenceId));
-      this.updateTaskAuthority(task, taskRevision, task.status, task.current_attempt_id, task.blocked_reason, now);
+      this.updateTaskAuthority(task, taskRevision, task.status, task.current_attempt_id, task.blocked_reason, now, boardRevision);
       this.updateBoardRevision(board, boardRevision, now);
       this.appendBoardEvent(board.board_id, boardRevision, 0, "approval_decided", input.actor, keyHash, {
         gate_id: input.gate_id,
@@ -1088,7 +1135,7 @@ export class TaskService {
     return satisfied ? "ready" : "backlog";
   }
 
-  private reconcileDependents(taskId: string, now: number): { newly_ready: string[]; reblocked: string[] } {
+  private reconcileDependents(taskId: string, now: number, boardRevision: number): { newly_ready: string[]; reblocked: string[] } {
     const dependents = this.database.prepare(
       `SELECT t.* FROM task_dependencies d JOIN direct_tasks t ON t.task_id = d.task_id
        WHERE d.dependency_task_id = ? ORDER BY t.task_id`
@@ -1099,7 +1146,7 @@ export class TaskService {
       if (dependent.current_attempt_id || !["backlog", "ready"].includes(dependent.status)) continue;
       const status = this.readinessStatus(dependent);
       if (status === dependent.status) continue;
-      this.updateTaskAuthority(dependent, dependent.revision + 1, status, null, null, now);
+      this.updateTaskAuthority(dependent, dependent.revision + 1, status, null, null, now, boardRevision);
       (status === "ready" ? newlyReady : reblocked).push(dependent.task_id);
     }
     return { newly_ready: newlyReady, reblocked };
@@ -1118,7 +1165,8 @@ export class TaskService {
   private reblockDependentsForReopen(
     taskId: string,
     recovery: Array<{ task_id: string; attempt_id: string; claim_token: string }>,
-    now: number
+    now: number,
+    boardRevision: number
   ): string[] {
     const affected = this.transitiveDependents(taskId);
     const supplied = new Map(recovery.map((item) => [item.task_id, item]));
@@ -1141,10 +1189,10 @@ export class TaskService {
           `UPDATE task_attempts SET state = 'abandoned', revision = revision + 1, closed_at_ms = ?, reason = 'dependency_reopened'
            WHERE id = ? AND state = 'active' AND revision = ?`
         ).run(now, attempt.id, attempt.revision);
-        this.updateTaskAuthority(dependent, dependent.revision + 1, "blocked", null, "requeue_required", now);
+        this.updateTaskAuthority(dependent, dependent.revision + 1, "blocked", null, "requeue_required", now, boardRevision);
         reblocked.push(dependent.task_id);
       } else if (dependent.status === "ready") {
-        this.updateTaskAuthority(dependent, dependent.revision + 1, "backlog", null, "dependency_reopened", now);
+        this.updateTaskAuthority(dependent, dependent.revision + 1, "backlog", null, "dependency_reopened", now, boardRevision);
         reblocked.push(dependent.task_id);
       }
     }
@@ -1236,7 +1284,8 @@ export class TaskService {
     status: TaskStatus,
     currentAttemptId: string | null,
     blockedReason: string | null,
-    now: number
+    now: number,
+    boardRevision?: number
   ): void {
     const changed = this.database.prepare(
       `UPDATE direct_tasks
@@ -1252,6 +1301,17 @@ export class TaskService {
       blocked_reason: blockedReason,
       updated_at_ms: now,
     });
+    if (boardRevision !== undefined) {
+      this.appendTaskVersion({
+        board_id: task.board_id, task_id: task.task_id, board_revision: boardRevision, task_revision: revision,
+        status, current_attempt_id: currentAttemptId, blocked_reason: blockedReason,
+        metadata_json: task.metadata_json, created_at_ms: task.created_at_ms, updated_at_ms: now,
+      });
+    }
+  }
+
+  private appendTaskVersion(version: Parameters<typeof appendTaskVersionRow>[1]): void {
+    appendTaskVersionRow(this.database, version);
   }
 
   private appendBoardEvent(

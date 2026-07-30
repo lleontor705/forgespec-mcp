@@ -327,3 +327,29 @@ export const DIRECT_CORE_SCHEMA_SQL = `
   CREATE TRIGGER IF NOT EXISTS immutable_file_lease_scopes_delete
     BEFORE DELETE ON file_lease_scopes BEGIN SELECT RAISE(ABORT, 'file lease scopes are immutable'); END;
 `;
+
+export const DIRECT_TASK_HISTORY_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS direct_task_versions (
+    version_id TEXT PRIMARY KEY DEFAULT ('task-version:' || lower(hex(randomblob(16)))),
+    board_id TEXT NOT NULL REFERENCES direct_boards(board_id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL REFERENCES direct_tasks(task_id) ON DELETE RESTRICT,
+    board_revision INTEGER NOT NULL CHECK (board_revision >= 1),
+    task_revision INTEGER NOT NULL CHECK (task_revision >= 1),
+    status TEXT NOT NULL,
+    current_attempt_id TEXT,
+    blocked_reason TEXT,
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0, 1)),
+    UNIQUE (task_id, board_revision),
+    UNIQUE (task_id, task_revision)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_task_versions_board_snapshot
+    ON direct_task_versions(board_id, board_revision DESC, task_id);
+  CREATE INDEX IF NOT EXISTS idx_task_versions_board_task_snapshot
+    ON direct_task_versions(board_id, task_id, board_revision DESC, version_id DESC);
+  CREATE INDEX IF NOT EXISTS idx_task_versions_task_history
+    ON direct_task_versions(task_id, board_revision, task_revision);
+`;

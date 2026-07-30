@@ -79,6 +79,58 @@ describe("direct-v1 board/task authority", () => {
     database.close();
   });
 
+  it("records one historical version for each visible change and suppresses no-op updates", () => {
+    const { database } = createDatabase();
+    const service = new TaskService(database);
+    const taskId = service.createDirectBoard(boardInput()).task_ids[0];
+
+    expect(database.prepare("SELECT task_id, board_revision, task_revision, status FROM direct_task_versions ORDER BY board_revision, task_revision, task_id").all()).toEqual([
+      { task_id: taskId, board_revision: 1, task_revision: 1, status: "ready" },
+    ]);
+
+    service.updateDirectTask(updateInput(taskId, { idempotency_key: "history-change" }));
+    expect(database.prepare("SELECT task_id, board_revision, task_revision, status FROM direct_task_versions ORDER BY board_revision, task_revision, task_id").all()).toEqual([
+      { task_id: taskId, board_revision: 1, task_revision: 1, status: "ready" },
+      { task_id: taskId, board_revision: 2, task_revision: 2, status: "blocked" },
+    ]);
+
+    service.updateDirectTask(updateInput(taskId, {
+      expected_revision: 2,
+      status: "blocked",
+      notes: undefined,
+      idempotency_key: "history-no-op",
+    }));
+    expect(database.prepare("SELECT revision, status FROM direct_tasks WHERE task_id = ?").get(taskId)).toEqual({
+      revision: 2,
+      status: "blocked",
+    });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM direct_task_versions WHERE task_id = ?").get(taskId)).toEqual({ count: 2 });
+    database.close();
+  });
+
+  it("rolls back projection, event, and history when the historical write fails", () => {
+    const { database } = createDatabase();
+    const service = new TaskService(database);
+    const taskId = service.createDirectBoard(boardInput()).task_ids[0];
+    database.exec(`
+      CREATE TRIGGER fail_task_history
+      BEFORE INSERT ON direct_task_versions
+      WHEN NEW.board_revision = 2
+      BEGIN SELECT RAISE(ABORT, 'injected task history failure'); END;
+    `);
+
+    expect(() => service.updateDirectTask(updateInput(taskId, { idempotency_key: "history-failure" }))).toThrow(/injected task history failure/);
+    expect(database.prepare("SELECT revision, status FROM direct_tasks WHERE task_id = ?").get(taskId)).toEqual({
+      revision: 1,
+      status: "ready",
+    });
+    expect(database.prepare("SELECT revision FROM direct_boards").get()).toEqual({ revision: 1 });
+    expect(database.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId)).toEqual({ status: "ready" });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM direct_task_versions WHERE task_id = ?").get(taskId)).toEqual({ count: 1 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM authority_events WHERE resource_id = ?").get(taskId)).toEqual({ count: 1 });
+    database.close();
+  });
+
   it("allows exactly one independent connection to win task CAS without a partial merge", () => {
     const created = createDatabase();
     const secondConnection = open(created.path);

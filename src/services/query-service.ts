@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { TASK_STATUSES, type TaskStatus } from "../types/index.js";
+import { observeServerTime, SystemClock, type Clock } from "../core/clock.js";
+import { hasOrdinaryAuthority } from "../core/attempt-authority.js";
 
 export interface TaskQueryInput {
   board_id: string;
@@ -70,7 +72,11 @@ interface CursorPayload {
   filter: string;
   snapshot: number;
   last: string;
+  issued_at_ms: number;
+  expires_at_ms: number;
 }
+
+const QUERY_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface TaskRow {
   task_id: string;
@@ -112,13 +118,15 @@ export class QueryError extends Error {
 
 export class QueryService {
   private readonly cursorSecret: Buffer;
+  private readonly clock: Clock;
 
   constructor(
     private readonly database: Database.Database,
-    options: { cursorSecret: Buffer }
+    options: { cursorSecret: Buffer; now?: () => number; clock?: Clock }
   ) {
     if (options.cursorSecret.length < 32) throw new Error("Cursor secret must contain at least 32 bytes");
     this.cursorSecret = options.cursorSecret;
+    this.clock = options.clock ?? (options.now ? { now: options.now } : new SystemClock());
   }
 
   queryTasks(input: TaskQueryInput): Page<TaskSummary> {
@@ -140,16 +148,9 @@ export class QueryService {
     if (snapshot > boardRevision) throw new QueryError("Cursor snapshot is unavailable", "cursor", "cursor_restart", true);
     const last = cursor?.last ?? "";
 
-    const clauses = [
-      "t.board_id = ?",
-      "t.task_id > ?",
-      `EXISTS (
-         SELECT 1 FROM authority_events e
-         WHERE e.board_id = t.board_id AND e.resource_id = t.task_id
-           AND e.event_type = 'task_created' AND e.board_revision <= ?
-       )`,
-    ];
-    const parameters: unknown[] = [input.board_id, last, snapshot];
+    this.verifySnapshotHistory(input.board_id, snapshot);
+    const clauses = ["t.task_id > ?", "t.is_deleted = 0"];
+    const parameters: unknown[] = [last];
     if (input.status?.length) {
       clauses.push(`t.status IN (${input.status.map(() => "?").join(",")})`);
       parameters.push(...input.status);
@@ -169,12 +170,23 @@ export class QueryService {
       clauses.push("t.revision > ?");
       parameters.push(input.updated_after_revision);
     }
-    parameters.push(limit + 1);
     const rows = this.database.prepare(
-      `SELECT t.* FROM direct_tasks t
-       WHERE ${clauses.join(" AND ")}
-       ORDER BY t.task_id LIMIT ?`
-    ).all(...parameters) as TaskRow[];
+      `SELECT t.*, t.task_revision AS revision
+         FROM direct_task_versions t
+        WHERE t.board_id = ?
+          AND t.board_revision <= ?
+          AND ${clauses.join(" AND ")}
+          AND NOT EXISTS (
+            SELECT 1
+              FROM direct_task_versions newer
+             WHERE newer.board_id = t.board_id
+               AND newer.task_id = t.task_id
+               AND newer.board_revision <= ?
+               AND newer.board_revision > t.board_revision
+          )
+        ORDER BY t.task_id
+        LIMIT ?`
+    ).all(input.board_id, snapshot, ...parameters, snapshot, limit + 1) as TaskRow[];
     const pageItems = rows.slice(0, limit).map((row) => this.taskSummary(row));
     const hasMore = rows.length > limit;
     return {
@@ -258,10 +270,43 @@ export class QueryService {
       "SELECT revision, metadata_json FROM direct_boards WHERE board_id = ?"
     ).get(boardId) as { revision: number; metadata_json: string } | undefined;
     const owner = row ? (JSON.parse(row.metadata_json) as { owner_actor?: string }).owner_actor : undefined;
-    if (!row || !actor || actor !== owner) {
-      throw new QueryError("Query authority is invalid", "authorization", "query_not_authorized");
+    const now = observeServerTime(this.database, this.clock);
+    const assignedAttempts = (row && actor ? this.database.prepare(
+      `SELECT a.expires_at_ms
+         FROM direct_tasks t
+         JOIN task_attempts a ON a.id = t.current_attempt_id
+        WHERE t.board_id = ?
+          AND a.actor = ?
+          AND a.state = 'active'
+        LIMIT 100`
+    ).all(boardId, actor) : []) as Array<{ expires_at_ms: number }>;
+    const assignedAttempt = assignedAttempts.some((attempt) =>
+      hasOrdinaryAuthority({ expiresAtMs: attempt.expires_at_ms, nowMs: now })
+    );
+    if (!row || !actor || (actor !== owner && !assignedAttempt)) {
+      throw new QueryError("Query authority is invalid", "authorization", "BOARD_QUERY_FORBIDDEN");
     }
     return row.revision;
+  }
+
+  private verifySnapshotHistory(boardId: string, snapshot: number): void {
+    const missing = this.database.prepare(
+      `SELECT COUNT(*) AS count
+         FROM authority_events e
+        WHERE e.board_id = ?
+          AND e.resource_type = 'task'
+          AND e.event_type = 'task_created'
+          AND e.board_revision <= ?
+          AND NOT EXISTS (
+            SELECT 1 FROM direct_task_versions v
+             WHERE v.board_id = e.board_id
+               AND v.task_id = e.resource_id
+               AND v.board_revision <= ?
+          )`
+    ).get(boardId, snapshot, snapshot) as { count: number };
+    if (missing.count > 0) {
+      throw new QueryError("Task snapshot history is incomplete", "cursor", "SNAPSHOT_INTEGRITY_ERROR", true);
+    }
   }
 
   private taskSummary(row: TaskRow): TaskSummary {
@@ -327,8 +372,13 @@ export class QueryService {
     return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
   }
 
-  private encodeCursor(payload: CursorPayload): string {
-    const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  private encodeCursor(payload: Omit<CursorPayload, "issued_at_ms" | "expires_at_ms">): string {
+    const now = observeServerTime(this.database, this.clock);
+    const body = Buffer.from(JSON.stringify({
+      ...payload,
+      issued_at_ms: now,
+      expires_at_ms: now + QUERY_CURSOR_TTL_MS,
+    })).toString("base64url");
     const signature = createHmac("sha256", this.cursorSecret).update(body).digest("base64url");
     return `${body}.${signature}`;
   }
@@ -340,14 +390,27 @@ export class QueryService {
       const expected = createHmac("sha256", this.cursorSecret).update(body).digest();
       const received = Buffer.from(signature, "base64url");
       if (received.length !== expected.length || !timingSafeEqual(received, expected)) throw new Error("signature");
-      const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as CursorPayload;
-      if (payload.v !== 1 || payload.kind !== kind || payload.filter !== filter ||
-          !Number.isSafeInteger(payload.snapshot) || payload.snapshot < 1 || typeof payload.last !== "string") {
+      const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as Partial<CursorPayload>;
+      if (payload.v !== 1) throw new QueryError("Cursor version is unsupported", "cursor", "CURSOR_VERSION_UNSUPPORTED");
+      if (payload.kind !== kind || payload.filter !== filter) {
+        throw new QueryError("Cursor context does not match this query", "cursor", "CURSOR_CONTEXT_MISMATCH");
+      }
+      const { snapshot, last, issued_at_ms, expires_at_ms } = payload;
+      if (typeof snapshot !== "number" || !Number.isSafeInteger(snapshot) || snapshot < 1 ||
+          typeof last !== "string" || typeof issued_at_ms !== "number" || !Number.isSafeInteger(issued_at_ms) ||
+          typeof expires_at_ms !== "number" || !Number.isSafeInteger(expires_at_ms) ||
+          issued_at_ms < 0 || expires_at_ms <= issued_at_ms) {
         throw new Error("payload");
       }
-      return payload;
-    } catch {
-      throw new QueryError("Cursor is invalid for this query", "cursor", "cursor_invalid");
+      const validPayload = payload as CursorPayload;
+      const now = observeServerTime(this.database, this.clock);
+      if (now >= validPayload.expires_at_ms) {
+        throw new QueryError("Cursor has expired", "cursor", "CURSOR_EXPIRED", true);
+      }
+      return validPayload;
+    } catch (error) {
+      if (error instanceof QueryError) throw error;
+      throw new QueryError("Cursor is invalid for this query", "cursor", "CURSOR_INVALID");
     }
   }
 

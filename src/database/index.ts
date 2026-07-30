@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { migrateDatabase } from "./migrations.js";
+import { migrateDatabase, qualifyDatabase } from "./migrations.js";
 import { TaskService } from "../services/task-service.js";
 
 const DEFAULT_DIR = path.join(os.homedir(), ".forgespec");
@@ -25,12 +25,21 @@ export function getDb(): Database.Database {
   db.pragma("temp_store = memory");
   db.pragma("busy_timeout = 5000");
   db.pragma("foreign_keys = ON");
+  const qualification = qualifyDatabase(db, { requireWal: true });
   new TaskService(db).reconcileAllProjections();
 
-  const versionInfo = db.prepare("SELECT sqlite_version() as version").get() as { version: string };
-  console.error(`ForgeSpec MCP: SQLite ${versionInfo.version}, WAL mode enabled`);
+  console.error(formatQualification(qualification));
 
   return db;
+}
+
+function formatQualification(qualification: ReturnType<typeof qualifyDatabase>): string {
+  const capabilities = [
+    `STRICT=${qualification.strictTables ? "ok" : "missing"}`,
+    `JSON1=${qualification.json1 ? "ok" : "missing"}`,
+    `journal_mode=${qualification.journalMode}`,
+  ];
+  return `ForgeSpec MCP: SQLite ${qualification.sqliteVersion}; ${capabilities.join("; ")}`;
 }
 
 export function closeDb(): void {
