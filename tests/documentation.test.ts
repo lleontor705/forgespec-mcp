@@ -78,7 +78,6 @@ describe("documentation truth checks", () => {
     expect(release).toMatch(/npm pack --json/);
     expect(release).toMatch(/tar -xOf/);
     expect(release).toMatch(/build\/index\.js/);
-    expect(release).toMatch(/if:\s*github\.event_name/);
     const verification = release.split("  publish:")[0];
     expect(verification).not.toMatch(/npm publish\b/);
   });

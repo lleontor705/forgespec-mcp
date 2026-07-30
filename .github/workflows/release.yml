@@ -3,13 +3,10 @@ name: Release
 # Actions v5 requires GitHub Actions runner >=2.327.1 (observed runner: 2.336.0).
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag (e.g. v1.3.0)"
+        description: "New version tag (e.g. v1.5.0)"
         required: true
         type: string
 
@@ -17,12 +14,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-publication
   cancel-in-progress: false
+
+env:
+  SOURCE_SHA: ${{ github.sha }}
 
 jobs:
   prepare-release:
-    name: Resolve release tag and source
+    name: Validate release request
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}
@@ -32,34 +32,24 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Validate tag and resolve immutable source
+          ref: ${{ env.SOURCE_SHA }}
+      - name: Validate new tag and immutable source
         id: release
         shell: bash
         env:
-          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_REF_TYPE: ${{ github.ref_type }}
-          EVENT_REF_NAME: ${{ github.ref_name }}
-          EVENT_SHA: ${{ github.sha }}
+          TAG: ${{ inputs.tag }}
         run: |
-          TAG="$REQUESTED_TAG"
           VERSION="${TAG#v}"
           if [ "$TAG" = "$VERSION" ] || [[ "$VERSION" == v* ]]; then
-            echo "Invalid release tag: $TAG" >&2
+            echo "Invalid release tag: $TAG (this workflow publishes stable releases only; expected vMAJOR.MINOR.PATCH)" >&2
             exit 1
           fi
-          if ! npm exec --yes --package=semver@7.7.4 -- node -e 'const path = require("node:path"); const semver = require(path.join(process.env.PATH.split(path.delimiter)[0], "..", "semver")); process.exit(semver.valid(process.argv[1]) === null ? 1 : 0)' "$VERSION"; then
-            echo "Invalid release tag: $TAG" >&2
+          if ! npm exec --yes --package=semver@7.7.4 -- node -e 'const path = require("node:path"); const semver = require(path.join(process.env.PATH.split(path.delimiter)[0], "..", "semver")); const version = process.argv[1]; process.exit(semver.valid(version) !== null && semver.prerelease(version) === null && semver.parse(version).build.length === 0 ? 0 : 1)' "$VERSION"; then
+            echo "Invalid release tag: $TAG (this workflow publishes stable releases only; expected vMAJOR.MINOR.PATCH)" >&2
             exit 1
           fi
-          if ! git show-ref --verify --quiet "refs/tags/$TAG"; then
-            echo "Release tag does not exist: $TAG" >&2
-            exit 1
-          fi
-          SOURCE_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
-          git cat-file -e "$SOURCE_SHA^{commit}"
-          node .github/scripts/release-policy.mjs assert-dispatch \
-            "$EVENT_NAME" "$EVENT_REF_TYPE" "$EVENT_REF_NAME" "$EVENT_SHA" "$TAG" "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          node .github/scripts/release-policy.mjs assert-remote-tag-absent "$TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
@@ -136,7 +126,7 @@ jobs:
       - name: Validate packed manifest without publishing
         shell: bash
         run: |
-          npm pack --json > pack-manifest.json
+          npm pack --json --ignore-scripts > pack-manifest.json
           TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
           tar -xOf "$TARBALL" package/package.json > packed-package.json
           node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log(JSON.stringify({tarball:process.env.TARBALL,bin:p.bin}))"
@@ -153,7 +143,6 @@ jobs:
   publish:
     name: Publish verified Node 24.18.1 release
     needs: [prepare-release, node22-compatibility-gate, release-node24, approve-release]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -174,55 +163,67 @@ jobs:
           key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-publish-${{ hashFiles('package-lock.json') }}
       - name: Install clean publish dependencies
         run: npm ci
-      - run: npm run lint
-      - run: npm test
-      - run: npm run build
-      - name: Verify release source
-        shell: bash
-        env:
-          TAG: ${{ needs.prepare-release.outputs.tag }}
-          SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
-        run: |
-          TAG_SHA=$(git rev-list -n 1 "refs/tags/$TAG")
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$TAG_SHA" = "$SOURCE_SHA"
-      - name: Set package version
-        run: npm version "${{ needs.prepare-release.outputs.version }}" --no-git-tag-version --allow-same-version
+      - name: Build package contents from verified source
+        run: npm run build
+      - name: Set package version without lifecycle scripts
+        run: npm version "${{ needs.prepare-release.outputs.version }}" --no-git-tag-version --allow-same-version --ignore-scripts
       - name: Validate packed manifest before publish
         shell: bash
         env:
           EXPECTED_VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
-          npm pack --json > pack-manifest.json
+          npm pack --json --ignore-scripts > pack-manifest.json
           TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
           tar -xOf "$TARBALL" package/package.json > packed-package.json
-          node -e "const p=require('./packed-package.json'); if (p.version !== process.env.EXPECTED_VERSION) process.exit(1); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); console.log('packed manifest verified; publish is the only publishing step')"
-      - name: Verify remote tag immediately before npm publication
+          node -e "const p=require('./packed-package.json'); if (p.version !== process.env.EXPECTED_VERSION) process.exit(1); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log('packed manifest verified')"
+          rm -f "$TARBALL" pack-manifest.json packed-package.json
+      - name: Re-check source and remote tag immediately before mutation
         env:
           TAG: ${{ needs.prepare-release.outputs.tag }}
-          SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
-        run: node .github/scripts/release-policy.mjs verify-remote-tag "$TAG" "$SOURCE_SHA"
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          node .github/scripts/release-policy.mjs assert-remote-tag-absent "$TAG"
+      - name: Create and push annotated release tag
+        id: push_tag
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "$TAG" "$EXPECTED_SOURCE_SHA" --message "Release $TAG"
+          git push origin "refs/tags/$TAG:refs/tags/$TAG"
+      - name: Verify pushed tag source
+        id: verify_tag
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
+        run: node .github/scripts/release-policy.mjs verify-remote-tag "$TAG" "$EXPECTED_SOURCE_SHA"
       - name: Publish to npm
+        id: publish_npm
         run: npm publish --provenance --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Verify remote tag immediately before GitHub release handling
+      - name: Re-verify pushed tag source before GitHub release
         env:
           TAG: ${{ needs.prepare-release.outputs.tag }}
-          SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
-        run: node .github/scripts/release-policy.mjs verify-remote-tag "$TAG" "$SOURCE_SHA"
-      - name: Create GitHub release
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
+        run: node .github/scripts/release-policy.mjs verify-remote-tag "$TAG" "$EXPECTED_SOURCE_SHA"
+      - name: Create GitHub release for verified tag
+        id: create_release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
-          SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
+        run: gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+      - name: Report partial release state
+        if: failure() && steps.push_tag.outcome != 'skipped'
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          EXPECTED_SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
         run: |
-          RELEASE_STATE=$(node .github/scripts/release-policy.mjs lookup-github-release "$TAG")
-          if [ "$RELEASE_STATE" = "exists" ]; then
-            echo "GitHub release already exists: $TAG"
-          elif [ "$RELEASE_STATE" = "missing" ]; then
-            gh release create "$TAG" --verify-tag --target "$SOURCE_SHA" --title "$TAG" --generate-notes
-          else
-            echo "Unexpected GitHub release lookup state: $RELEASE_STATE" >&2
-            exit 1
-          fi
+          echo "Release mutation failed or could not be verified; do not rerun this new-tag workflow blindly." >&2
+          echo "Reconcile manually: verify refs/tags/$TAG peels to $EXPECTED_SOURCE_SHA, inspect npm view forgespec-mcp@$VERSION, and inspect gh release view $TAG." >&2
+          echo "Complete only the missing external operation after proving the existing tag/package/release state matches this source and version." >&2
+          exit 1
