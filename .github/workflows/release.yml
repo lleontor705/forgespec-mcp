@@ -193,7 +193,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag --annotate "$TAG" "$EXPECTED_SOURCE_SHA" --message "Release $TAG"
-          git push origin "refs/tags/$TAG:refs/tags/$TAG"
+          git push --no-verify origin "refs/tags/$TAG:refs/tags/$TAG"
       - name: Verify pushed tag source
         id: verify_tag
         env:

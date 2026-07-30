@@ -79,7 +79,7 @@ describe("release workflow policy", () => {
     const publish = job("publish");
     const headCheck = publish.indexOf('test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"');
     const absenceCheck = publish.indexOf("assert-remote-tag-absent");
-    const tagPush = publish.indexOf("git push origin");
+    const tagPush = publish.indexOf("git push --no-verify origin");
     expect(Math.min(headCheck, absenceCheck, tagPush)).toBeGreaterThanOrEqual(0);
     expect(headCheck).toBeLessThan(absenceCheck);
     expect(absenceCheck).toBeLessThan(tagPush);
@@ -99,7 +99,7 @@ describe("release workflow policy", () => {
   it("creates and verifies the tag before npm and GitHub release mutations", () => {
     const publish = job("publish");
     const recheck = publish.indexOf("assert-remote-tag-absent");
-    const push = publish.indexOf("git push origin");
+    const push = publish.indexOf("git push --no-verify origin");
     const verifications = [...publish.matchAll(/verify-remote-tag "\$TAG" "\$EXPECTED_SOURCE_SHA"/g)].map((match) => match.index);
     const npm = publish.indexOf("npm publish");
     const github = publish.indexOf("gh release create");
@@ -114,6 +114,16 @@ describe("release workflow policy", () => {
     expect(publish).toMatch(/git tag --annotate "\$TAG" "\$EXPECTED_SOURCE_SHA"/);
     expect(publish).toMatch(/gh release create "\$TAG" --verify-tag/);
     expect(publish).not.toMatch(/gh release create[^\n]*\|\| true/);
+  });
+
+  it("bypasses hooks only for the non-force release tag push", () => {
+    const publish = job("publish");
+    const tagPush = publish
+      .split("\n")
+      .find((line) => line.includes('git push') && line.includes('"refs/tags/$TAG:refs/tags/$TAG"'));
+    expect(tagPush?.trim()).toBe('git push --no-verify origin "refs/tags/$TAG:refs/tags/$TAG"');
+    expect(tagPush).not.toMatch(/(?:^|\s)(?:--force(?:-with-lease)?|-f)(?:\s|$)/);
+    expect(tagPush).not.toMatch(/\|\||;|\|\s*true/);
   });
 
   it("keeps approval, runtime, permissions, and partial-state safeguards", () => {
