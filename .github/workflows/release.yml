@@ -9,13 +9,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag (e.g. v1.3.0)"
+        description: "Version tag (e.g. v1.4.1)"
         required: true
         type: string
 
 permissions:
   contents: write
   id-token: write
+
+env:
+  RELEASE_NODE_VERSION: "24.x"
 
 jobs:
   node22-compatibility-gate:
@@ -51,7 +54,7 @@ jobs:
         run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi 127
 
   release-node24:
-    name: Verify release on Node 24.18.1
+    name: Verify release on Node 24
     runs-on: ubuntu-latest
     needs: node22-compatibility-gate
     steps:
@@ -60,36 +63,42 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
-          node-version: "24.18.1"
+          node-version: ${{ env.RELEASE_NODE_VERSION }}
       - name: Cache npm downloads only
         uses: actions/cache@v5
         with:
           path: ~/.npm
-          key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-${{ hashFiles('package-lock.json') }}
-      - name: Install clean Node 24.18.1 dependencies
+          key: npm-${{ runner.os }}-${{ runner.arch }}-${{ env.RELEASE_NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
+      - name: Install clean Node 24 dependencies
         run: npm ci
-      - name: Record exact Node 24 native runtime evidence
+      - name: Record Node 24 native runtime evidence
         shell: bash
         run: |
           node --version
           npm --version
-          node -e "const b=require('better-sqlite3'); const db=new b(':memory:'); const sqlite=db.prepare('select sqlite_version() as version').get().version; console.log(JSON.stringify({node:process.version,npm:process.env.npm_config_user_agent,modules:process.versions.modules,napi:process.versions.napi,sqlite,betterSqlite3Loaded:true})); if (process.version !== 'v24.18.1' || process.versions.modules !== '137') process.exit(1); db.close()"
+          node -e "const b=require('better-sqlite3'); const db=new b(':memory:'); const sqlite=db.prepare('select sqlite_version() as version').get().version; const major=Number(process.versions.node.split('.')[0]); console.log(JSON.stringify({node:process.version,npm:process.env.npm_config_user_agent,modules:process.versions.modules,napi:process.versions.napi,sqlite,betterSqlite3Loaded:true})); if (major !== 24) process.exit(1); db.close()"
       - run: npm run lint
       - run: npm test
       - run: npm run build
       - name: Run migrations and temporary MCP handshake
         run: npm test -- --run tests/migrations.test.ts
-      - name: Run exact Node 24 runtime smoke CLI
-        run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi 137
+      - name: Run Node 24 runtime smoke CLI
+        shell: bash
+        run: |
+          EXPECTED_ABI="$(node -p 'process.versions.modules')"
+          node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi "$EXPECTED_ABI"
       - name: Run built runtime smoke CLI
-        run: node build/runtime/runtime-smoke.js --mode build --entrypoint build/index.js --expected-abi 137
+        shell: bash
+        run: |
+          EXPECTED_ABI="$(node -p 'process.versions.modules')"
+          node build/runtime/runtime-smoke.js --mode build --entrypoint build/index.js --expected-abi "$EXPECTED_ABI"
       - name: Validate packed manifest without publishing
         shell: bash
         run: |
           npm pack --json > pack-manifest.json
           TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
           tar -xOf "$TARBALL" package/package.json > packed-package.json
-          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log(JSON.stringify({tarball:process.env.TARBALL,bin:p.bin}))"
+          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log(JSON.stringify({bin:p.bin,files:p.files}))"
           rm -f "$TARBALL" pack-manifest.json packed-package.json
 
   approve-release:
@@ -98,12 +107,12 @@ jobs:
     needs: [node22-compatibility-gate, release-node24]
     environment: production
     steps:
-      - run: echo "Release approved after Node22 compatibility and Node24.18.1 verification."
+      - run: echo "Release approved after Node 22 compatibility and Node 24 verification."
 
   publish:
-    name: Publish verified Node 24.18.1 release
+    name: Publish verified Node 24 release
     needs: [node22-compatibility-gate, release-node24, approve-release]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -111,22 +120,23 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
-          node-version: "24.18.1"
+          node-version: ${{ env.RELEASE_NODE_VERSION }}
           registry-url: https://registry.npmjs.org
-      - name: Cache npm downloads only
-        uses: actions/cache@v5
-        with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-publish-${{ hashFiles('package-lock.json') }}
+          cache: npm
       - name: Install clean publish dependencies
         run: npm ci
-      - name: Determine version
+      - name: Determine and validate version
         id: version
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
           else
             TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           npm version "${TAG#v}" --no-git-tag-version --allow-same-version
@@ -139,7 +149,12 @@ jobs:
           npm pack --json > pack-manifest.json
           TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
           tar -xOf "$TARBALL" package/package.json > packed-package.json
-          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); console.log('packed manifest verified; publish is the only publishing step')"
+          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log('packed manifest verified; publish is the only publishing step')"
+          rm -f "$TARBALL" pack-manifest.json packed-package.json
+      - name: Verify npm authentication
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
       - name: Publish to npm
         run: npm publish --provenance --access public
         env:
@@ -149,4 +164,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.version.outputs.tag }}"
-          gh release create "$TAG" --title "$TAG" --generate-notes || echo "Release exists"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
