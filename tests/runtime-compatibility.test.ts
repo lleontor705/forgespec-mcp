@@ -106,9 +106,17 @@ describe("Node runtime compatibility policy", () => {
     expect(`${ci}\n${release}`).toMatch(/runner[^\n]*(?:>=|at least|minimum)[^\n]*2\.327\.1/i);
   });
 
+  it("does not override the real runtime ABI with the Node 24 value", () => {
+    const source = fs.readFileSync(__filename, "utf8");
+    expect(source).not.toMatch(/collectRuntimeEvidence\(\{[^}]*expectedAbi:\s*["']137["']/s);
+  });
+
   it("collects native, migration, and JSON-RPC evidence through the production seam", async () => {
-    const evidence = await collectRuntimeEvidence({ mode: "source", entrypoint: path.join(PROJECT_ROOT, "src", "index.ts"), expectedAbi: "137" });
-    assertSupportedRuntime(evidence, "137");
+    const nodeMajor = Number(/^v(\d+)/.exec(process.version)?.[1]);
+    const expectedAbi = expectedAbiForNodeMajor(nodeMajor);
+    const evidence = await collectRuntimeEvidence({ mode: "source", entrypoint: path.join(PROJECT_ROOT, "src", "index.ts") });
+    assertSupportedRuntime(evidence);
+    expect(evidence.modules_abi).toBe(expectedAbi);
     expect(evidence.better_sqlite3_loaded).toBe(true);
     expect(evidence.sqlite_features).toEqual({ strict: true, json1: true, wal: true });
     expect(evidence.migration_ok).toBe(true);
