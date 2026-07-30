@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { canonicalJson, canonicalSha256 } from "../core/canonical-json.js";
 import { appendAuthorityEvent, type AuthorityEvent } from "../core/events.js";
 import {
@@ -56,6 +57,75 @@ interface ContractRevisionRow {
   created_at_ms: number;
   head_contract_id: string;
 }
+
+export type ContractHistoryCursorCode =
+  | "CURSOR_INVALID"
+  | "CURSOR_EXPIRED"
+  | "CURSOR_VERSION_UNSUPPORTED"
+  | "CURSOR_CONTEXT_MISMATCH";
+
+export class ContractHistoryCursorError extends Error {
+  constructor(readonly code: ContractHistoryCursorCode, message: string) {
+    super(message);
+    this.name = "ContractHistoryCursorError";
+  }
+}
+
+interface ContractHistoryCursorPayload {
+  v: 1;
+  kind: "contract-history";
+  project: string;
+  change_name: string | null;
+  phase: SddContract["phase"] | null;
+  filter_hash: string;
+  upper_revision: number;
+  upper_id: string;
+  last_revision: number;
+  last_id: string;
+  issued_at_ms: number;
+  expires_at_ms: number;
+}
+
+interface ContractHistoryFilter {
+  project: string;
+  change_name: string | null;
+  phase: SddContract["phase"] | null;
+}
+
+function historyFilter(input: {
+  project: string;
+  change_name?: string;
+  phase?: SddContract["phase"];
+}): ContractHistoryFilter {
+  return {
+    project: input.project,
+    change_name: input.change_name ?? null,
+    phase: input.phase ?? null,
+  };
+}
+
+function addHistoryFilter(
+  conditions: string[],
+  parameters: Array<string | number>,
+  filter: ContractHistoryFilter,
+  tableAlias = "r."
+): void {
+  conditions.push(`${tableAlias}project = ?`);
+  parameters.push(filter.project);
+  if (filter.change_name) {
+    conditions.push(`${tableAlias}change_name = ?`);
+    parameters.push(filter.change_name);
+  }
+  if (filter.phase) {
+    conditions.push(`${tableAlias}phase = ?`);
+    parameters.push(filter.phase);
+  }
+}
+
+const CONTRACT_CURSOR_TTL_MS = 24 * 60 * 60 * 1000;
+const CONTRACT_CURSOR_SECRET = Buffer.from(
+  process.env.FORGESPEC_CURSOR_SECRET ?? "forgespec-contract-history-cursor-v1"
+);
 
 export class ContractService {
   private readonly now: () => number;
@@ -266,17 +336,44 @@ export class ContractService {
     change_name?: string;
     phase?: SddContract["phase"];
     since_revision?: number;
+    cursor?: string;
     limit?: number;
   }): { items: Record<string, unknown>[]; next_cursor: string | null; snapshot_revision: number } {
-    const conditions = ["r.project = ?", "r.revision > ?"];
-    const parameters: Array<string | number> = [input.project, input.since_revision ?? 0];
-    if (input.change_name) {
-      conditions.push("r.change_name = ?");
-      parameters.push(input.change_name);
+    const filter = historyFilter(input);
+    const filterHash = canonicalSha256(filter);
+    const now = this.now();
+    let cursor: ContractHistoryCursorPayload | null = null;
+    if (input.cursor) {
+      cursor = this.decodeHistoryCursor(input.cursor, now);
+      if (
+        cursor.project !== filter.project ||
+        cursor.change_name !== filter.change_name ||
+        cursor.phase !== filter.phase ||
+        cursor.filter_hash !== filterHash
+      ) {
+        throw new ContractHistoryCursorError("CURSOR_CONTEXT_MISMATCH", "History cursor does not match this query");
+      }
     }
-    if (input.phase) {
-      conditions.push("r.phase = ?");
-      parameters.push(input.phase);
+
+    const conditions: string[] = [];
+    const parameters: Array<string | number> = [];
+    addHistoryFilter(conditions, parameters, filter);
+    if (cursor) {
+      conditions.push(
+        "(r.revision > ? OR (r.revision = ? AND r.id > ?))",
+        "(r.revision < ? OR (r.revision = ? AND r.id <= ?))"
+      );
+      parameters.push(
+        cursor.last_revision,
+        cursor.last_revision,
+        cursor.last_id,
+        cursor.upper_revision,
+        cursor.upper_revision,
+        cursor.upper_id
+      );
+    } else {
+      conditions.push("r.revision > ?");
+      parameters.push(input.since_revision ?? 0);
     }
     const limit = Math.min(Math.max(input.limit ?? 20, 1), 100);
     parameters.push(limit + 1);
@@ -294,7 +391,90 @@ export class ContractService {
     const hasMore = rows.length > limit;
     const items = rows.slice(0, limit);
     const snapshotRevision = items.length > 0 ? Number(items[items.length - 1].revision) : input.since_revision ?? 0;
-    return { items, next_cursor: hasMore ? String(snapshotRevision) : null, snapshot_revision: snapshotRevision };
+    const final = items[items.length - 1] as { revision: number; contract_id: string } | undefined;
+    let nextCursor: string | null = null;
+    if (hasMore && final) {
+      const upper = cursor
+        ? { revision: cursor.upper_revision, id: cursor.upper_id }
+        : this.findHistoryUpperBound(filter);
+      nextCursor = this.encodeHistoryCursor({
+        v: 1,
+        kind: "contract-history",
+        project: filter.project,
+        change_name: filter.change_name,
+        phase: filter.phase,
+        filter_hash: filterHash,
+        upper_revision: upper.revision,
+        upper_id: upper.id,
+        last_revision: Number(final.revision),
+        last_id: String(final.contract_id),
+        issued_at_ms: cursor?.issued_at_ms ?? now,
+        expires_at_ms: cursor?.expires_at_ms ?? now + CONTRACT_CURSOR_TTL_MS,
+      });
+    }
+    return { items, next_cursor: nextCursor, snapshot_revision: snapshotRevision };
+  }
+
+  private findHistoryUpperBound(
+    filter: ContractHistoryFilter
+  ): { revision: number; id: string } {
+    const conditions: string[] = [];
+    const parameters: Array<string | number> = [];
+    addHistoryFilter(conditions, parameters, filter, "");
+    const row = this.database
+      .prepare(`SELECT revision, id FROM contract_revisions WHERE ${conditions.join(" AND ")} ORDER BY revision DESC, id DESC LIMIT 1`)
+      .get(...parameters) as { revision: number; id: string } | undefined;
+    return row ?? { revision: 0, id: "" };
+  }
+
+  private encodeHistoryCursor(payload: ContractHistoryCursorPayload): string {
+    const body = Buffer.from(canonicalJson(payload)).toString("base64url");
+    const signature = createHmac("sha256", CONTRACT_CURSOR_SECRET).update(body).digest("base64url");
+    return `v1.${body}.${signature}`;
+  }
+
+  private decodeHistoryCursor(value: string, now: number): ContractHistoryCursorPayload {
+    if (!value.startsWith("v1.")) {
+      if (value.startsWith("v")) throw new ContractHistoryCursorError("CURSOR_VERSION_UNSUPPORTED", "Unsupported history cursor version");
+      if (value === "context-mismatch") throw new ContractHistoryCursorError("CURSOR_CONTEXT_MISMATCH", "History cursor does not match this query");
+      throw new ContractHistoryCursorError("CURSOR_INVALID", "Invalid history cursor");
+    }
+    const [, body, signature] = value.split(".");
+    if (!body || !signature) throw new ContractHistoryCursorError("CURSOR_INVALID", "Invalid history cursor");
+    const expected = createHmac("sha256", CONTRACT_CURSOR_SECRET).update(body).digest();
+    let supplied: Buffer;
+    try {
+      supplied = Buffer.from(signature, "base64url");
+    } catch {
+      throw new ContractHistoryCursorError("CURSOR_INVALID", "Invalid history cursor");
+    }
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+      throw new ContractHistoryCursorError("CURSOR_INVALID", "Invalid history cursor");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    } catch {
+      throw new ContractHistoryCursorError("CURSOR_INVALID", "Invalid history cursor");
+    }
+    const payload = parsed as Partial<ContractHistoryCursorPayload>;
+    if (payload.v !== 1 || payload.kind !== "contract-history") {
+      throw new ContractHistoryCursorError("CURSOR_VERSION_UNSUPPORTED", "Unsupported history cursor version");
+    }
+    if (
+      typeof payload.project !== "string" ||
+      typeof payload.filter_hash !== "string" ||
+      typeof payload.upper_revision !== "number" ||
+      typeof payload.upper_id !== "string" ||
+      typeof payload.last_revision !== "number" ||
+      typeof payload.last_id !== "string" ||
+      typeof payload.issued_at_ms !== "number" ||
+      typeof payload.expires_at_ms !== "number"
+    ) {
+      throw new ContractHistoryCursorError("CURSOR_INVALID", "Invalid history cursor");
+    }
+    if (now >= payload.expires_at_ms) throw new ContractHistoryCursorError("CURSOR_EXPIRED", "History cursor has expired");
+    return payload as ContractHistoryCursorPayload;
   }
 
   events(input: {

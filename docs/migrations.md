@@ -1,106 +1,48 @@
-# ForgeSpec Database Migrations — Versioning, Rollback, and Interruption Recovery
+# ForgeSpec migrations and rollback
 
-**Applies to:** ForgeSpec 1.3.0+ | **Schema versions:** 1.0.0 (legacy), 2 (P0 direct core), 3 (P1 evidence/approval/file)
+**Package:** `forgespec-mcp@1.4.0` | **Current schema:** 3 | **Primary Node:** 24.18.1 | **Supported Node:** >=22
 
----
+## Schema versions
 
-## Migration Path
+| user_version | Meaning |
+|---:|---|
+| 0 | Fresh database |
+| 1 | Legacy ForgeSpec 1.2.2 tables and migration control |
+| 2 | direct-v1 P0 core |
+| 3 | Append-only `direct_task_versions` history and indexes |
 
-ForgeSpec uses SQLite `user_version` to track schema state:
+Migration 3 creates one historical base row per existing direct task when its unique `task_created` authority event supplies a valid board revision. It preserves visible values, records logical deletion, and does not fabricate rows for legacy-only tasks. A future or ambiguous revision aborts the transaction.
 
-| user_version | Description |
-|-------------|-------------|
-| 0 | Fresh/uninitialized database |
-| 1 | ForgeSpec 1.2.2 baseline (legacy contracts, boards, tasks, file_reservations) |
-| 2 | P0 direct core (direct_boards, direct_tasks, task_dependencies, task_attempts, contract_streams, contract_revisions, authority_events, idempotency_records, schema_migrations, migration_findings) |
-| 3 | P1 additions (evidence_objects, task_evidence_links, approval_gates, approval_decisions, file_leases, file_lease_scopes) |
+Every visible direct-task change writes the projection and exactly one history row in the same transaction. No-op and idempotent replays do not add versions. History is append-only: this change does **not** prune or TTL-delete it.
 
----
+## Startup preflight
 
-## Startup Procedure
+Runtime qualification is isolated per supported line: six jobs cover Node 22.x and 24.x on Ubuntu, Windows, and macOS. Node 22 uses ABI 127 and Node 24.18.1 uses ABI 137. Each CI job starts from a clean checkout, runs `npm ci`, loads `better-sqlite3`, and exercises migration and temporary-DB MCP handshake paths. Only npm download caches are permitted; native bindings and `node_modules` are not shared. The lockfile is consumed as-is: runtime changes must not regenerate dependency entries or introduce lockfile churn.
 
-On startup, ForgeSpec:
+Before MCP `initialize`, startup:
 
-1. **Acquires an exclusive lock** (`BEGIN EXCLUSIVE`) to prevent concurrent migration.
-2. **Detects database state:** fresh vs. legacy vs. already-migrated.
-3. **Runs integrity checks:** `quick_check` and `foreign_key_check`.
-4. **Creates a verified backup** before modifying an existing database.
-5. **Applies checksum-pinned migrations** atomically — each migration is a single transaction.
-6. **Records the migration** in `schema_migrations` with version, name, checksum, and timestamp.
-7. **Stamps `user_version`** to the new version.
-8. **Reconciles projections** — ensures legacy tables mirror direct authority state.
+1. Verifies every applied migration's immutable name and SHA-256 checksum against the in-code definition.
+2. Applies pending migrations atomically and records their checksum.
+3. Probes `STRICT`, JSON1 (`json_valid`), and effective WAL; WAL is requested and read back.
+4. Emits human diagnostics only on stderr and accepts no MCP traffic on failure.
 
----
+`MIGRATION_CHECKSUM_MISMATCH` and `SQLITE_CAPABILITY_MISSING` are safe startup failures. They include the actionable version/capability facts without silently rewriting migration history or schema.
 
-## Interruption Recovery
+## Rollout
 
-If startup is interrupted before migration completes:
+1. Stop competing writers and keep a verified pre-migration backup.
+2. Run the server once so checksum and SQLite preflight complete.
+3. Verify `tools/list` and a temporary-DB `initialize` handshake before enabling clients.
+4. Roll out P0 consumers, then P1 snapshot/history/lease consumers.
 
-- SQLite transactions are atomic: the database is in either the **complete old state** or the **complete new state**.
-- No partially upgraded writable state is ever exposed.
-- On restart, the server detects the current `user_version` and resumes from there.
-- If the backup was created but the migration transaction did not commit, the backup is retained and the database remains at the previous version.
+For the runtime rollout, record the current Volta pin/default, Node/npm versions, and direct global ForgeSpec wrapper path before selecting the exact Node 24.18.1 project pin. Do not reinstall the working wrapper or change the direct OpenCode command. The exact Node 24.18.1 release lane is eligible only after the independent Node 22 compatibility gate passes; both lanes use `npm ci`.
 
-**Safe restart:** simply restart the server. It will detect the current state and complete any remaining migration steps or refuse writable startup if the database is corrupt.
+The runtime inventory is **25 MCP tools**. The benchmark fixture is 10,000 tasks × 20 versions, page 100, and 30 warmed pages; reference targets are median `<250 ms` and p95 `<500 ms`.
 
----
+## Rollback and interruption recovery
 
-## Rollback and Restore
-
-### Pre-upgrade Backup
-
-Before modifying an existing database, ForgeSpec creates a verified SQLite backup. The backup is a consistent snapshot of the pre-migration state.
-
-### Restoration
-
-- **Before direct writes:** backup restoration is safe and returns the database to its pre-migration state.
-- **After direct writes:** no down-conversion or deletion is permitted. Direct history is retained. A server lacking direct-v1 authority can still read supported legacy data but treats direct-v1 resources as read-only or explicitly unsupported.
-
-### Disabling direct-v1
-
-Disabling direct-v1 (e.g., rolling back to ForgeSpec 1.2.2):
-
-1. Legacy data remains fully usable through legacy tools.
-2. Direct-v1 tables are retained (not deleted or rewritten).
-3. Direct-v1 history is preserved for future re-enablement.
-4. A 1.2.2 binary opening the database ignores unknown tables and operates on legacy data only.
-
----
-
-## Legacy Coexistence
-
-- Legacy and direct-v1 resources coexist throughout 1.x.
-- Legacy boards/tasks remain usable through legacy tool calls (no `coordination_mode` field).
-- Direct-v1 boards/tasks require `coordination_mode: "direct-v1"` and enforce CAS/idempotency/audit.
-- A legacy-shaped mutation against a direct-v1 board is rejected with `category: "compatibility"`.
-- Projection reconciliation on startup ensures legacy tables mirror direct authority state.
-
----
-
-## Invalid Legacy Data
-
-Migration never silently promotes legacy boards. If legacy data contains invalid dependencies (missing, duplicate, self, cross-board, or cyclic):
-
-- The board remains readable.
-- A structured finding is recorded in `migration_findings`.
-- The invalid edge is NOT reported as a satisfied direct-v1 dependency.
-- No attempts, evidence, or approvals are invented.
-
----
-
-## Checksum Verification
-
-Each migration script is checksum-pinned. The `schema_migrations` table records the applied checksum. On startup, if a migration's checksum does not match the expected value, the server refuses to start and reports a structured error.
-
----
-
-## SQLite Feature Qualification
-
-Startup qualifies SQLite features before proceeding:
-
-- `STRICT` table mode availability.
-- JSON1 extension availability (`json_valid`).
-- `foreign_key_check` enforcement.
-- WAL mode support.
-
-If required features are unavailable, the server reports a structured startup error and does not open for writable operations.
+- Migration transactions are atomic: interruption leaves the complete old or new state.
+- **Schema rollback is backup-only:** with the **server stopped**, restore the verified pre-migration SQLite backup, and restart. Never delete the active history table, decrement `user_version`, or edit a recorded checksum.
+- Keep the backup and diagnostics until post-restore checks pass.
+- For OpenCode activation, restore the byte-for-byte configuration backup and previous global package version/path, then perform another full restart. A changed configuration without restart is not a completed rollout.
+- If Node 24.18.1, its native ABI, or the handshake fails, restore the prior Volta pin/default and rebuild the affected isolated dependency tree with `npm ci`; never reuse bindings from another runtime.

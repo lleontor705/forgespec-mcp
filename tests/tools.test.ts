@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import Database from "better-sqlite3";
+import type Database from "better-sqlite3";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
@@ -12,6 +12,18 @@ import { registerTaskBoardTools } from "../src/tools/task-board.js";
 import { createServer } from "../src/server.js";
 import { createTestDatabase, removeTestDatabases } from "./helpers/database.js";
 
+let DatabaseConstructor: typeof Database | undefined;
+try {
+  DatabaseConstructor = (await import("better-sqlite3")).default;
+  const probe = new DatabaseConstructor(":memory:");
+  probe.close();
+} catch {
+  // Native compatibility tests report unavailable runtimes honestly below.
+  DatabaseConstructor = undefined;
+}
+const databaseAvailable = DatabaseConstructor !== undefined;
+const nativeDescribe = databaseAvailable ? describe : describe.skip;
+
 // Use a temporary database for testing
 const TEST_DB_DIR = path.join(os.tmpdir(), `forgespec-test-${Date.now()}`);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "test.db");
@@ -20,7 +32,7 @@ let db: Database.Database;
 
 function initTestDb(): Database.Database {
   fs.mkdirSync(TEST_DB_DIR, { recursive: true });
-  const database = new Database(TEST_DB_PATH);
+  const database = new DatabaseConstructor!(TEST_DB_PATH);
   database.pragma("journal_mode = WAL");
   database.pragma("foreign_keys = ON");
 
@@ -78,17 +90,18 @@ function initTestDb(): Database.Database {
 }
 
 beforeAll(() => {
+  if (!DatabaseConstructor) return;
   db = initTestDb();
 });
 
 afterAll(() => {
-  db.close();
+  if (db) db.close();
   fs.rmSync(TEST_DB_DIR, { recursive: true, force: true });
 });
 
 // ── sdd_get tests ──────────────────────────────────────
 
-describe("sdd_get", () => {
+nativeDescribe("sdd_get", () => {
   it("returns a contract by valid ID", () => {
     const id = generateId("sdd");
     db.prepare(
@@ -118,7 +131,7 @@ describe("sdd_get", () => {
 
 // ── sdd_list tests ─────────────────────────────────────
 
-describe("sdd_list", () => {
+nativeDescribe("sdd_list", () => {
   beforeAll(() => {
     const insert = db.prepare(
       `INSERT INTO contracts (id, phase, change_name, project, status, confidence, executive_summary, data)
@@ -176,7 +189,7 @@ describe("sdd_list", () => {
 
 // ── tb_create_board with inline tasks tests ───────────
 
-describe("tb_create_board with tasks", () => {
+nativeDescribe("tb_create_board with tasks", () => {
   it("creates board without tasks (backward compatible)", () => {
     const boardId = generateId("board");
     db.prepare(`INSERT INTO boards (id, project, name) VALUES (?, ?, ?)`).run(
@@ -238,12 +251,12 @@ describe("tb_create_board with tasks", () => {
   });
 });
 
-describe("direct-v1 task-board handlers", () => {
+nativeDescribe("direct-v1 task-board handlers", () => {
   it("returns structured CAS errors, exact replay, and rejects legacy bypass", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgespec-handler-"));
     const databasePath = path.join(directory, "handler.db");
     migrateDatabase(databasePath);
-    const database = new Database(databasePath);
+    const database = new DatabaseConstructor!(databasePath);
     database.pragma("foreign_keys = ON");
     const server = new McpServer({ name: "task-handler-test", version: "1.0.0" });
     registerTaskBoardTools(server, () => database);
@@ -318,7 +331,7 @@ describe("direct-v1 task-board handlers", () => {
 
 // ── tb_update with notes tests ────────────────────────
 
-describe("tb_update with notes", () => {
+nativeDescribe("tb_update with notes", () => {
   let boardId: string;
 
   beforeAll(() => {
@@ -419,7 +432,7 @@ describe("tb_update with notes", () => {
 
 // ── file_reserve with check_only tests ──��─────────────
 
-describe("file_reserve check_only", () => {
+nativeDescribe("file_reserve check_only", () => {
   it("check_only returns no conflicts when nothing reserved", () => {
     // Clean slate
     db.prepare(`DELETE FROM file_reservations`).run();
@@ -471,7 +484,7 @@ function range1x(): { min_inclusive: string; max_exclusive: string } {
   return { min_inclusive: "1.0.0", max_exclusive: "2.0.0" };
 }
 
-describe("release integration — composed server registration", () => {
+nativeDescribe("release integration — composed server registration", () => {
   it("registers forgespec_capabilities alongside all direct-v1 tools", async () => {
     const server = createServer();
     const client = new Client({ name: "release-test", version: "1.0.0" });
@@ -498,7 +511,7 @@ describe("release integration — composed server registration", () => {
   });
 });
 
-describe("release integration — capability manifest for cortex-ia", () => {
+nativeDescribe("release integration — capability manifest for cortex-ia", () => {
   it("advertises qualified P0 and P1 intervals with local-trusted-client and version >= 1.3.0", async () => {
     const server = createServer();
     const client = new Client({ name: "cortex-ia-probe", version: "1.0.0" });
@@ -633,7 +646,7 @@ describe("release integration — capability manifest for cortex-ia", () => {
   });
 });
 
-describe("release integration — excluded boundary inventory", () => {
+nativeDescribe("release integration — excluded boundary inventory", () => {
   it("exposes no messaging, DLQ, A2A, remote, or non-file external-lease tools", async () => {
     const server = createServer();
     const client = new Client({ name: "boundary-audit", version: "1.0.0" });
@@ -652,7 +665,7 @@ describe("release integration — excluded boundary inventory", () => {
   });
 });
 
-describe("release integration — docs and version contract", () => {
+nativeDescribe("release integration — docs and version contract", () => {
   it("ships docs/direct-v1.md documenting capabilities, security boundary, and cortex-ia contract", () => {
     const docPath = path.join(PROJECT_ROOT, "docs", "direct-v1.md");
     expect(fs.existsSync(docPath)).toBe(true);
@@ -686,7 +699,108 @@ describe("release integration — docs and version contract", () => {
   });
 });
 
-describe("release integration — E2E direct-v1 lifecycle through composed server", () => {
+nativeDescribe("compatibility and error boundaries", () => {
+  it("keeps strong history as the default and marks legacy opt-in errors", async () => {
+    const testDb = createTestDatabase("forgespec-tools-compat-");
+    const server = createServer({ database: () => testDb.database });
+    const client = new Client({ name: "compat-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const empty = await client.callTool({ name: "sdd_history", arguments: { project: "empty-project" } });
+    expect(empty.structuredContent).toMatchObject({
+      items: [],
+      next_cursor: null,
+      snapshot_revision: 0,
+    });
+
+    testDb.database.prepare(
+      `INSERT INTO contracts (id, phase, change_name, project, status, confidence, executive_summary, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("legacy-contract", "explore", "legacy-change", "legacy-project", "success", 1, "legacy", "{}");
+    const legacy = await client.callTool({ name: "sdd_history", arguments: { project: "legacy-project" } });
+    expect(legacy.structuredContent).toMatchObject({
+      ok: false,
+      error: { code: "LEGACY_OPT_IN_REQUIRED", data: { code: "LEGACY_OPT_IN_REQUIRED" } },
+    });
+
+    await client.close();
+    await server.close();
+    testDb.database.close();
+  });
+
+  it("exposes stable data codes for direct contract failures", async () => {
+    const testDb = createTestDatabase("forgespec-tools-errors-");
+    const server = createServer({ database: () => testDb.database });
+    const client = new Client({ name: "error-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const response = await client.callTool({
+      name: "sdd_save",
+      arguments: {
+        contract: "not-json",
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        actor: "error-owner",
+        idempotency_key: "error-contract",
+        expected_head_revision: 0,
+      },
+    });
+    expect(response.structuredContent).toMatchObject({
+      ok: false,
+      error: { code: "contract_validation_conflict", data: { code: "contract_validation_conflict" } },
+    });
+
+    await client.close();
+    await server.close();
+    testDb.database.close();
+  });
+});
+
+describe("runtime compatibility facts", () => {
+  const runtimeTest = process.version === "v24.18.1" || /^v22\./.test(process.version) ? it : it.skip;
+
+  runtimeTest("requires complete supported-runtime evidence before compatibility is accepted", () => {
+    if (process.version === "v24.18.1") expect(process.versions.modules).toBe("137");
+    else expect(process.versions.modules).toBe("127");
+    expect(process.versions.napi).toBeDefined();
+  });
+
+  runtimeTest("exposes the bounded snapshot/query tool inventory used by the benchmark", async () => {
+    const server = createServer();
+    const client = new Client({ name: "runtime-facts", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const tools = await client.listTools();
+    const names = tools.tools.map((tool) => tool.name);
+    expect(names).toContain("tb_query");
+    expect(names).toContain("tb_batch_status");
+    expect(names).toContain("tb_events");
+    expect(tools.tools.find((tool) => tool.name === "tb_query")?.description).toMatch(/snapshot/i);
+
+    await client.close();
+    await server.close();
+  });
+
+  runtimeTest("reports schema v3 as the runtime migration boundary", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgespec-runtime-facts-"));
+    const databasePath = path.join(directory, "runtime.db");
+    migrateDatabase(databasePath);
+    const runtimeDb = new DatabaseConstructor!(databasePath, { readonly: true });
+    try {
+      expect(runtimeDb.pragma("user_version", { simple: true })).toBe(3);
+      expect(runtimeDb.prepare("SELECT 1 FROM sqlite_master WHERE name = 'direct_task_versions'").get()).toBeDefined();
+    } finally {
+      runtimeDb.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+nativeDescribe("release integration — E2E direct-v1 lifecycle through composed server", () => {
   let testDb: { path: string; database: Database.Database };
   let sharedBoardId: string;
 

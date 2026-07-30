@@ -65,6 +65,70 @@ function heartbeatInput(
 afterEach(removeTestDatabases);
 
 describe("direct-v1 attempt leases", () => {
+  describe.each([
+    { label: "E-1", offset: 14_999, ordinary: true, heartbeat: true, recovery: false },
+    { label: "E", offset: 15_000, ordinary: false, heartbeat: true, recovery: false },
+    { label: "E+4999", offset: 19_999, ordinary: false, heartbeat: true, recovery: false },
+    { label: "E+5000", offset: 20_000, ordinary: false, heartbeat: false, recovery: true },
+  ])("enforces the temporal authority matrix at $label", ({ offset, ordinary, heartbeat, recovery }) => {
+    it("applies one decision to ordinary claim, heartbeat, and recovery", () => {
+      const created = createTestDatabase(`forgespec-authority-${offset}-`);
+      const clock = new FakeClock(1_800_000_000_000);
+      const service = new TaskService(created.database, { clock });
+      const board = service.createDirectBoard(boardInput());
+      const taskId = board.task_ids[0];
+
+      clock.advance(offset);
+
+      // A ready task has no active attempt yet, so claim authority is not
+      // bounded by the lease created by a later claim. The temporal matrix
+      // applies to the active-attempt operations below.
+      expect(service.claimDirectTask(claimInput(taskId))).toMatchObject({ task_id: taskId });
+
+      const claimCreated = createTestDatabase(`forgespec-authority-heartbeat-${offset}-`);
+      const heartbeatClock = new FakeClock(1_800_000_000_000);
+      const heartbeatService = new TaskService(claimCreated.database, { clock: heartbeatClock });
+      const heartbeatBoard = heartbeatService.createDirectBoard(boardInput());
+      const claim = heartbeatService.claimDirectTask(claimInput(heartbeatBoard.task_ids[0], { lease_seconds: 15 }));
+      heartbeatClock.advance(offset);
+      if (heartbeat) {
+        expect(heartbeatService.heartbeatDirectTask(heartbeatInput(claim))).toMatchObject({ task_id: claim.task_id });
+      } else {
+        expect(() => heartbeatService.heartbeatDirectTask(heartbeatInput(claim))).toThrowError(
+          expect.objectContaining({ code: "attempt_expired" })
+        );
+      }
+
+      const recoveryCreated = createTestDatabase(`forgespec-authority-recovery-${offset}-`);
+      const recoveryClock = new FakeClock(1_800_000_000_000);
+      const recoveryService = new TaskService(recoveryCreated.database, { clock: recoveryClock });
+      const recoveryBoard = recoveryService.createDirectBoard(boardInput());
+      const recoveryClaim = recoveryService.claimDirectTask(claimInput(recoveryBoard.task_ids[0], { lease_seconds: 15 }));
+      recoveryClock.advance(offset);
+      const recoveryInput: DirectRecoverClaimsInput = {
+        ...context,
+        board_id: recoveryBoard.board_id,
+        actor: "owner",
+        idempotency_key: `recover-${offset}`,
+        expected_board_revision: recoveryClaim.board_revision,
+        attempt_ids: [recoveryClaim.attempt_id],
+      };
+      try {
+        if (recovery) {
+          expect(recoveryService.recoverDirectClaims(recoveryInput).recovered).toHaveLength(1);
+        } else {
+          expect(() => recoveryService.recoverDirectClaims(recoveryInput)).toThrowError(
+            expect.objectContaining({ code: "recovery_premature" })
+          );
+        }
+      } finally {
+        created.database.close();
+        claimCreated.database.close();
+        recoveryCreated.database.close();
+      }
+    });
+  });
+
   it("allows exactly one independent connection to claim a ready revision", () => {
     const created = createTestDatabase("forgespec-claim-race-");
     const other = openTestDatabase(created.path);

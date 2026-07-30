@@ -9,9 +9,22 @@ import {
 } from "../types/index.js";
 import {
   ContractConflictError,
+  ContractHistoryCursorError,
   ContractService,
   type DirectContractSaveInput,
 } from "../services/contract-service.js";
+import { directErrorResponse } from "../core/errors.js";
+
+function directContractFailure(error: unknown) {
+  const conflict = error instanceof ContractConflictError ? error : null;
+  const safe = Object.assign(new Error(conflict?.message ?? "The request could not be processed"), {
+    category: conflict?.category ?? "validation",
+    code: conflict ? `contract_${conflict.category}_conflict` : "contract_invalid",
+    retryable: conflict?.category === "cas",
+    ...(conflict?.currentRevision === undefined ? {} : { currentRevision: conflict.currentRevision }),
+  });
+  return directErrorResponse(safe);
+}
 
 export function registerSddTools(server: McpServer, databaseProvider = getDb): void {
   // ── Validate SDD Contract ───────────────────────────
@@ -118,18 +131,8 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
           structuredContent: response as unknown as Record<string, unknown>,
         };
       } catch (e) {
-        const conflict = e instanceof ContractConflictError ? e : null;
         const response = input.coordination_mode === "direct-v1"
-          ? {
-              ok: false as const,
-              error: {
-                category: conflict?.category ?? "validation",
-                code: conflict ? `contract_${conflict.category}_conflict` : "contract_invalid",
-                message: `${e instanceof Error ? e.message : e}`,
-                retryable: conflict?.category === "cas",
-                ...(conflict?.currentRevision === undefined ? {} : { current_revision: conflict.currentRevision }),
-              },
-            }
+          ? directContractFailure(e)
           : { saved: false as const, error: `${e}` };
         return {
           content: [
@@ -154,55 +157,94 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
       change_name: z.string().max(256).optional(),
       phase: z.enum(SDD_PHASES).optional(),
       since_revision: z.number().int().min(0).optional(),
-      cursor: z.string().max(256).optional(),
-      limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
+      cursor: z.string().max(4096).optional(),
+      consistency: z.enum(["best_effort"]).optional(),
+      limit: z.number().int().min(1).max(100).default(20).describe("Max entries to return"),
     },
-    async ({ project, change_name, phase, since_revision, cursor, limit }) => {
+    async ({ project, change_name, phase, since_revision, cursor, consistency, limit }) => {
       const db = databaseProvider();
       const hasDirectHistory = Boolean(
         db.prepare("SELECT 1 FROM contract_revisions WHERE project = ? LIMIT 1").get(project)
       );
-      if (hasDirectHistory || change_name || phase || since_revision !== undefined || cursor) {
-        let cursorRevision: number | undefined;
-        if (cursor !== undefined) {
-          const parsedCursor = Number.parseInt(cursor, 10);
-          if (!Number.isSafeInteger(parsedCursor) || parsedCursor < 0) {
-            const response = { ok: false, error: { category: "cursor", code: "invalid_cursor", message: "Invalid history cursor", retryable: false } };
-            return {
-              content: [{ type: "text" as const, text: JSON.stringify(response) }],
-              structuredContent: response,
-              isError: true,
-            };
-          }
-          cursorRevision = parsedCursor;
-        }
-        const response = new ContractService(db).history({
-          project,
-          change_name,
-          phase,
-          since_revision: cursorRevision ?? since_revision,
-          limit,
-        });
+      const hasLegacyHistory = Boolean(db.prepare("SELECT 1 FROM contracts WHERE project = ? LIMIT 1").get(project));
+      if (!hasDirectHistory && hasLegacyHistory && !consistency) {
+        const response = {
+          ok: false,
+          error: {
+            category: "compatibility",
+            code: "LEGACY_OPT_IN_REQUIRED",
+            message: "Legacy history requires explicit best-effort opt-in",
+            data: { code: "LEGACY_OPT_IN_REQUIRED" },
+            retryable: false,
+          },
+        };
         return {
           content: [{ type: "text" as const, text: JSON.stringify(response) }],
-          structuredContent: response as unknown as Record<string, unknown>,
+          structuredContent: response,
+          isError: true,
         };
       }
-      const rows = db
-        .prepare(
-          `SELECT id, phase, change_name, status, confidence, executive_summary, created_at
-           FROM contracts WHERE project = ? ORDER BY created_at DESC LIMIT ?`
-        )
-        .all(project, limit);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ project, history: rows }),
-          },
-        ],
-      };
+      if (!hasDirectHistory && consistency === "best_effort") {
+        if (cursor) {
+          const response = {
+            ok: false,
+            error: {
+              category: "cursor",
+              code: "CURSOR_VERSION_UNSUPPORTED",
+              message: "Legacy history does not support strong cursors",
+              data: { code: "CURSOR_VERSION_UNSUPPORTED" },
+              retryable: false,
+            },
+          };
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(response) }],
+            structuredContent: response,
+            isError: true,
+          };
+        }
+        const rows = db
+          .prepare(
+            `SELECT id, phase, change_name, status, confidence, executive_summary, created_at
+             FROM contracts WHERE project = ? ORDER BY created_at DESC LIMIT ?`
+          )
+          .all(project, limit);
+        const response = { project, history: rows, consistency: "best_effort" as const };
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(response) }],
+          structuredContent: response,
+        };
+      }
+      try {
+          const response = new ContractService(db).history({
+            project,
+            change_name,
+            phase,
+            since_revision,
+            cursor,
+            limit,
+          });
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(response) }],
+            structuredContent: response as unknown as Record<string, unknown>,
+          };
+        } catch (error) {
+          if (!(error instanceof ContractHistoryCursorError)) throw error;
+          const response = {
+            ok: false,
+            error: {
+              category: "cursor",
+              code: error.code,
+              message: error.message,
+              data: { code: error.code },
+              retryable: false,
+            },
+          };
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(response) }],
+            structuredContent: response,
+            isError: true,
+          };
+        }
     }
   );
 
@@ -240,7 +282,7 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
     {
       project: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).optional().describe("Filter by project identifier"),
       phase: z.enum(SDD_PHASES).optional().describe("Filter by SDD phase"),
-      limit: z.number().min(1).max(100).default(20).describe("Max entries to return"),
+      limit: z.number().int().min(1).max(100).default(20).describe("Max entries to return"),
     },
     async ({ project, phase, limit }) => {
       const db = databaseProvider();

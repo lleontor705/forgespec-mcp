@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { observeServerTime, SystemClock, type Clock } from "../core/clock.js";
 import { appendAuthorityEvent } from "../core/events.js";
+import { hasOrdinaryAuthority } from "../core/attempt-authority.js";
 import {
   normalizeFileScopes,
   scopesOverlap,
@@ -98,6 +99,24 @@ interface FileLeaseRow {
   created_at_ms: number;
   updated_at_ms: number;
   released_at_ms: number | null;
+  board_id?: string | null;
+}
+
+function leaseExpiryEvent(lease: FileLeaseRow, revision: number, now: number) {
+  return {
+    eventId: `file-lease-expired:${lease.id}:${revision}`,
+    boardId: lease.board_id ?? null,
+    attemptId: lease.attempt_id,
+    details: {
+      lease_id: lease.id,
+      workspace_id: lease.workspace_id,
+      task_id: lease.task_id,
+      attempt_id: lease.attempt_id,
+      owner: lease.actor,
+      expired_at_ms: now,
+      reason: "lease_expired",
+    },
+  };
 }
 
 interface AttemptAuthorityRow {
@@ -298,7 +317,7 @@ export class FileLeaseService {
     now: number
   ): FileLeaseRow {
     const lease = this.database.prepare("SELECT * FROM file_leases WHERE id = ?").get(input.lease_id) as FileLeaseRow | undefined;
-    if (!lease || lease.state !== "active" || now >= lease.expires_at_ms) {
+    if (!lease || lease.state !== "active" || !hasOrdinaryAuthority({ expiresAtMs: lease.expires_at_ms, nowMs: now })) {
       this.authorityDenied("File lease is expired or not active");
     }
     if (lease.revision !== input.expected_revision) this.stale(lease.revision);
@@ -335,17 +354,42 @@ export class FileLeaseService {
       || authority.attempt_id !== attemptId
       || authority.actor !== actor
       || authority.state !== "active"
-      || now >= authority.expires_at_ms + 5_000
+      || !hasOrdinaryAuthority({ expiresAtMs: authority.expires_at_ms, nowMs: now })
       || !authorityTokenMatches(claimToken, authority.token_hash)
     ) this.authorityDenied("Task attempt authority is invalid");
     return authority;
   }
 
   private expireStaleLeases(now: number): void {
-    this.database.prepare(
+    const expired = this.database.prepare(
+      `SELECT l.*, t.board_id
+         FROM file_leases l
+         JOIN direct_tasks t ON t.task_id = l.task_id
+        WHERE l.state = 'active' AND l.expires_at_ms <= ?
+        ORDER BY l.expires_at_ms, l.id`
+    ).all(now) as FileLeaseRow[];
+    const update = this.database.prepare(
       `UPDATE file_leases SET state = 'expired', revision = revision + 1, updated_at_ms = ?
-        WHERE state = 'active' AND expires_at_ms <= ?`
-    ).run(now, now);
+         WHERE id = ? AND state = 'active' AND expires_at_ms <= ? AND revision = ?`
+    );
+    for (const lease of expired) {
+      const updated = update.run(now, lease.id, now, lease.revision);
+      if (updated.changes !== 1) continue;
+      const revision = lease.revision + 1;
+      const event = leaseExpiryEvent(lease, revision, now);
+      this.appendEvent(
+        lease.id,
+        revision,
+        'file_lease_expired',
+        lease.actor,
+        null,
+        event.details,
+        now,
+        event.eventId,
+        event.boardId,
+        event.attemptId,
+      );
+    }
   }
 
   private effectiveNow(): number {
@@ -403,21 +447,32 @@ export class FileLeaseService {
     revision: number,
     eventType: string,
     actor: string,
-    correlationHash: string,
+    correlationHash: string | null,
     details: Record<string, unknown>,
-    now: number
+    now: number,
+    eventId?: string,
+    boardId?: string | null,
+    attemptId?: string | null,
   ): void {
-    appendAuthorityEvent(this.database, {
-      resource_type: "file_lease",
-      resource_id: leaseId,
-      resource_revision: revision,
-      event_type: eventType,
-      actor,
-      outcome: "success",
-      correlation_hash: correlationHash,
-      details,
-      created_at_ms: now,
-    });
+    try {
+      appendAuthorityEvent(this.database, {
+        event_id: eventId,
+        resource_type: "file_lease",
+        resource_id: leaseId,
+        resource_revision: revision,
+        event_type: eventType,
+        actor,
+        outcome: "success",
+        correlation_hash: correlationHash,
+        details,
+        created_at_ms: now,
+        board_id: boardId,
+        attempt_id: attemptId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "File lease audit failed";
+      throw new FileLeaseConflictError(message, "lease", "audit_write_failed");
+    }
   }
 
   private runMutation<T>(operation: () => T): T {
@@ -430,6 +485,9 @@ export class FileLeaseService {
         const busy = new FileLeaseConflictError("File lease database is busy", "lease", "busy");
         (busy as FileLeaseConflictError & { retryable: boolean }).retryable = true;
         throw busy;
+      }
+      if (/database connection is not open|connection is closed/i.test(message)) {
+        throw new FileLeaseConflictError("File lease database connection is closed", "lease", "connection_closed");
       }
       throw error;
     }

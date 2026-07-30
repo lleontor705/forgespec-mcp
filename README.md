@@ -28,14 +28,17 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 | **Lost progress** | If an agent fails mid-task, there's no way to resume from where it left off | SQLite-backed task board persists state; any agent can pick up where another stopped |
 | **No quality gates** | Code ships without validation against original requirements | Confidence thresholds block phase transitions until quality criteria are met |
 
-### Key Advantages
+### Verified runtime facts
 
 - **Zero infrastructure** -- Embedded SQLite database, no external services required
 - **Universal compatibility** -- Works with any MCP client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more
-- **Instant setup** -- One command to start: `npx -y forgespec-mcp`
-- **Battle-tested pipeline** -- 9 phases with confidence thresholds prevent premature phase transitions
-- **Audit trail** -- Every contract, task transition, and file reservation is logged with timestamps
-- **Cross-platform** -- Tested on Ubuntu, Windows, and macOS with Node 18, 20, and 22
+- **Package:** `forgespec-mcp@1.4.0`; runtime schema 3; Node `24.18.1` is the primary runtime and Node `>=22` is supported.
+- **Runtime policy:** CI runs six isolated jobs for Node `22.x` and `24.x` on Ubuntu, Windows, and macOS. Node 22 uses native ABI 127; Node 24 uses ABI 137.
+- **Entrypoint:** the package bin is `build/index.js`, exposed as `forgespec-mcp`.
+- **Runtime inventory:** **25 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
+- **SQLite preflight:** startup verifies immutable migration checksums and effective `STRICT`, JSON1, and WAL capabilities before MCP traffic.
+- **Performance fixture:** 10,000 tasks × 20 versions, page 100, 30 warmed pages; reference targets are median `<250 ms` and p95 `<500 ms`.
+- **Retention:** task history is append-only and is not pruned by this release.
 - **Cortex-ready** -- Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph across sessions
 - **direct-v1 mode** -- Additive transactional coordination with CAS, idempotency, immutable audit, attempt leases, and capability negotiation for race-safe multi-agent work
 
@@ -43,9 +46,9 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 ## direct-v1 Coordination Mode
 
-ForgeSpec 1.3.0+ introduces **direct-v1**, an additive coordination mode that provides transactional CAS, scoped idempotency, immutable audit history, exclusive attempt-based claim leases, normalized dependency DAGs, structured evidence references, approval gates, bounded cursor queries, and atomic file reservation leases.
+ForgeSpec 1.4.0 provides **direct-v1**, an additive coordination mode that provides transactional CAS, scoped idempotency, immutable audit history, exclusive attempt-based claim leases, normalized dependency DAGs, structured evidence references, approval gates, bounded snapshot queries, compound cursors, and atomic file reservation leases.
 
-Legacy 1.2.2 behavior remains fully available. Clients negotiate via `forgespec_capabilities` before using direct-v1 tools. See [docs/direct-v1.md](docs/direct-v1.md) for the full capability manifest, cortex-ia contract, and security boundary. See [docs/migrations.md](docs/migrations.md) for migration, rollback, and interruption recovery details.
+Clients negotiate via `forgespec_capabilities` before using direct-v1 tools. See [docs/direct-v1.md](docs/direct-v1.md) for authority, snapshots, errors, rollout, and the complete inventory. See [docs/migrations.md](docs/migrations.md) for checksum preflight, migration, rollback, and interruption recovery.
 
 ---
 
@@ -95,14 +98,27 @@ npx -y forgespec-mcp
 ### Install globally
 
 ```bash
-npm install -g forgespec-mcp
+npm install -g forgespec-mcp@1.4.0
 ```
 
 ### Verify installation
 
 ```bash
 forgespec-mcp --help
+forgespec-mcp --version
 ```
+
+The verified package bin/entrypoint is `build/index.js`. For OpenCode, preserve the existing direct global `forgespec-mcp` wrapper: verify its resolved executable and a temporary-DB `initialize`/`tools/list` handshake before editing configuration, and restart OpenCode completely after activation. Do not replace this direct wrapper with `npx`.
+
+### P0/P1 rollout and rollback
+
+Deploy P0 direct-v1 consumers first, then P1 snapshot/history/lease consumers after migration preflight and handshake checks pass. Keep a verified configuration/database backup. On failure, restore the byte-for-byte backup, restore the previous package version, and restart the client; a configuration edit without restart is not a completed rollout.
+
+### Runtime rollout policy
+
+Node `24.18.1` is the primary runtime; Node `>=22` is supported through six isolated Node `22.x`/`24.x` jobs on Ubuntu, Windows, and macOS. Node 22 uses ABI 127 and Node 24 uses ABI 137. Each job starts from a clean checkout and runs `npm ci`; only segmented npm download caches are permitted, and runtime changes must not regenerate or churn the lockfile. The release lane uses exact Node `24.18.1` and is blocked by the independent Node 22 compatibility gate.
+
+For local activation, record `volta list`, `volta which node`, and `volta which forgespec-mcp`, then pin the project with `volta pin node@24.18.1` and verify the temporary-DB handshake. If activation fails, restore the prior Volta pin/default and rebuild dependencies with `npm ci`. Rollback preserves the existing direct global ForgeSpec wrapper and direct OpenCode command; restore the byte-for-byte configuration backup and restart the client before rechecking `initialize` and `tools/list`.
 
 ---
 
@@ -173,7 +189,13 @@ Each phase has a **confidence threshold** that must be met before transitioning 
 
 ## Tools Reference
 
-ForgeSpec exposes **15 MCP tools** organized in three categories.
+ForgeSpec exposes **25 MCP tools**. The authoritative runtime inventory is maintained in [docs/direct-v1.md](docs/direct-v1.md) and tested against `tools/list`.
+
+### Capability Tool (1)
+
+| Tool | Description |
+|------|-------------|
+| `forgespec_capabilities` | Negotiate API/schema versions, capabilities, limits, and mode |
 
 ### SDD Contract Tools (5)
 
@@ -187,7 +209,7 @@ Manage the development lifecycle with typed, validated contracts.
 | `sdd_list` | List contracts with optional project/phase filters |
 | `sdd_history` | Get phase transition history for a project |
 
-### Task Board Tools (8)
+### Task Board Tools (16)
 
 SQLite-backed task management with dependency tracking and auto-unblocking.
 
@@ -201,8 +223,16 @@ SQLite-backed task management with dependency tracking and auto-unblocking.
 | `tb_unblocked` | List tasks ready to work on (all dependencies resolved) |
 | `tb_get` | Get full task details by ID |
 | `tb_list_boards` | List all boards (for discovery after context loss) |
+| `tb_set_dependencies` | Set normalized dependency edges |
+| `tb_heartbeat` | Renew an active attempt |
+| `tb_recover_claims` | Recover expired claims |
+| `tb_requeue` | Requeue a task |
+| `tb_approve` | Record an approval decision |
+| `tb_query` | Query snapshot task pages |
+| `tb_batch_status` | Read bounded board/work-unit status |
+| `tb_events` | Read authority-event deltas |
 
-### File Reservation Tools (2)
+### File Reservation Tools (3)
 
 Advisory file locking to prevent multi-agent edit conflicts.
 
@@ -210,6 +240,7 @@ Advisory file locking to prevent multi-agent edit conflicts.
 |------|-------------|
 | `file_reserve` | Reserve files/globs with TTL. Use `check_only: true` to check conflicts without reserving |
 | `file_release` | Release reservations (specific patterns or all) |
+| `file_renew` | Renew a file lease |
 
 ---
 
@@ -406,8 +437,8 @@ forgespec-mcp
 git clone https://github.com/lleontor705/forgespec-mcp.git
 cd forgespec-mcp
 
-# Install dependencies
-npm install
+# Install the locked dependency tree
+npm ci
 
 # Run in development mode (hot reload)
 npm run dev
@@ -450,10 +481,14 @@ git push --follow-tags origin master
 ```
 
 The CI/CD pipeline then:
-1. Runs tests across Ubuntu/Windows/macOS with Node 18, 20, 22
-2. Waits for production environment approval
-3. Publishes to npm with provenance
-4. Creates a GitHub release with auto-generated notes
+1. Runs six isolated compatibility jobs across Ubuntu/Windows/macOS for Node 22.x and 24.x
+2. Runs the primary quality and release lane on exact Node 24.18.1
+3. Requires the Node 22 compatibility gate before release packaging or publish
+4. Waits for production environment approval
+5. Publishes to npm with provenance
+6. Creates a GitHub release with auto-generated notes
+
+Each job starts from a clean checkout and runs `npm ci`. Only npm download caches are used; `node_modules` and native bindings are never shared. The lockfile is not regenerated or upgraded as part of a runtime change.
 
 ---
 

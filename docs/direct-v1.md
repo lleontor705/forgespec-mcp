@@ -1,137 +1,56 @@
-# ForgeSpec direct-v1 — Coordination Mode, Capabilities, and cortex-ia Contract
+# ForgeSpec direct-v1
 
-**Version:** 1.3.0 | **API version:** 1.0.0 | **Schema versions:** 1.0.0
+**Version:** 1.4.0 | **API version:** 1.0.0 | **Schema:** 3 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** >=22
 
-direct-v1 is an additive, backward-compatible coordination mode that introduces transactional CAS, idempotency, immutable audit, attempt-based claim leases, normalized dependency DAGs, structured evidence references, approval gates, bounded queries, and normalized file reservation leases. Legacy 1.2.2 behavior remains fully available throughout 1.x.
+direct-v1 is the transactional coordination mode for boards, tasks, contracts, and file leases. The runtime currently exposes **25 MCP tools**; the inventory below is generated from `tools/list` and is the compatibility checklist.
 
----
+## Runtime inventory
 
-## Capability Negotiation
+`forgespec_capabilities`, `sdd_validate`, `sdd_save`, `sdd_history`, `sdd_get`, `sdd_list`, `tb_create_board`, `tb_add_task`, `tb_status`, `tb_claim`, `tb_set_dependencies`, `tb_heartbeat`, `tb_recover_claims`, `tb_requeue`, `tb_approve`, `tb_query`, `tb_batch_status`, `tb_events`, `tb_update`, `tb_unblocked`, `tb_get`, `tb_list_boards`, `file_reserve`, `file_release`, `file_renew`.
 
-Clients probe the server via `forgespec_capabilities` before using direct-v1 tools. The response reports:
+Clients should call `forgespec_capabilities` before using direct-v1. The server reports package version, API/schema versions, limits, capabilities, and the `local-trusted-client` boundary.
 
-- **Server identity:** `name: "forgespec-mcp"`, `version` (package semver), `api_version: "1.0.0"`.
-- **Security model:** `identity_model: "local-trusted-client"`.
-- **Modes:** `["legacy", "direct-v1"]`.
-- **Schemas:** independently versioned intervals for `sdd_envelope`, `task_metadata`, and `evidence_ref` (all `[1.0.0, 2.0.0)`).
-- **Capabilities:** independently versioned feature IDs with supported intervals and selected versions.
-- **Limits:** page/batch/dependency/lease/clock/scope/idempotency bounds.
-- **Compatibility:** `compatible`, `selected_mode`, `missing`, `incompatible`, and `unavailable_optional`.
+The `cortex-ia` orchestration layer should persist the selected manifest and re-check it after restart; ForgeSpec owns persisted coordination state while cortex-ia owns scheduling and runtime context.
 
-### P0 Capabilities (required)
+## Guarantees
 
-| ID | Description |
-|----|-------------|
-| `forgespec.capabilities` | Capability advertisement and negotiation |
-| `task-cas` | Atomic task/board CAS transitions |
-| `idempotency` | Scoped durable idempotency for all writes |
-| `task-attempt-lease` | Exclusive renewable numbered attempt leases |
-| `claim-recovery` | Expiry classification, audited recovery, explicit requeue |
-| `dependency-transitions` | Normalized same-board DAG and all-of readiness |
-| `audit-events` | Immutable ordered queryable authority events |
-| `sdd-contract-revisions` | Canonical full-contract revisions with CAS |
+- **Runtime:** CI has six isolated jobs for Node 22.x and 24.x on Ubuntu, Windows, and macOS. Native `better-sqlite3` uses ABI 127 on Node 22 and ABI 137 on Node 24. Each job starts clean and runs `npm ci`; only npm download caches are allowed.
+- **Lockfile:** Runtime changes consume the existing lockfile with `npm ci`; dependency versions, URLs, integrity hashes, and transitive entries are not regenerated or changed.
 
-All P0 capabilities are versioned `[1.0.0, 2.0.0)` with `selected: "1.0.0"`.
+- **Authority:** ordinary task, query, and lease mutations require `now < expires_at_ms`. Heartbeats are allowed only before `expires_at_ms + 5,000 ms`; recovery starts at that boundary. The grace interval never authorizes ordinary reads or writes.
+- **Snapshots:** strong task pages use one `snapshot_revision`; membership and visible values are resolved from that revision. Strong cursors are signed, context-bound, and expire at `expires_at_ms` (default TTL: 24 hours; equality is expired).
+- **Errors:** stable normative codes are returned in `error.data.code`, including `ATTEMPT_EXPIRED`, `BOARD_QUERY_FORBIDDEN`, `CURSOR_INVALID`, `CURSOR_EXPIRED`, `CURSOR_VERSION_UNSUPPORTED`, `CURSOR_CONTEXT_MISMATCH`, `SNAPSHOT_INTEGRITY_ERROR`, `MIGRATION_CHECKSUM_MISMATCH`, and `SQLITE_CAPABILITY_MISSING`.
+- **History:** task history is append-only and is not pruned. The indexed benchmark fixture is 10,000 tasks × 20 versions, page 100, with 30 warmed pages; acceptance targets are median `<250 ms` and p95 `<500 ms` in the reference CI run.
+- **Compatibility:** strong mode is the default. Legacy/best-effort behavior requires explicit opt-in and cannot continue into a strong cursor.
 
-### P1 Capabilities (additive)
+## Security boundary
 
-| ID | Description |
-|----|-------------|
-| `structured-evidence-links` | Provider-neutral typed digest references (no payload) |
-| `approval-gates` | Immutable deterministic allow/deny gate decisions |
-| `batch-status` | Bounded board/work-unit status snapshots |
-| `query-cursors` | Signed snapshot/delta cursor pagination |
-| `file-lease` | Normalized atomic renewable file reservation leases |
+The process uses `local-trusted-client`: local process and database access are trusted; actor strings are policy identity, not remote authentication. Tokens are returned once and stored as SHA-256 hashes. Cursors are HMAC-signed. Errors do not expose SQL, secrets, signatures, or hidden board existence.
 
-P1 capabilities follow the same version interval. Missing optional P1 blocks a specific feature rather than weakening direct-v1.
+## P0/P1 rollout
 
-### Negotiation Rules
+- **P0:** capability negotiation, CAS task/board transitions, idempotency, attempts, recovery, dependencies, audit events, and contract revisions.
+- **P1:** evidence and approvals, bounded snapshot queries, event history cursors, and normalized file leases.
 
-- Direct mode is never inferred: omitted negotiation remains legacy only on legacy resources.
-- A legacy-shaped write against a direct-v1 board is rejected with `category: "compatibility"`.
-- Unsupported required major returns `compatible: false` and direct-v1 is not selected.
-- Unavailable optional capabilities are listed in `unavailable_optional` without breaking compatibility.
+Deploy P0 first, then enable P1 consumers after `tools/list`, migration preflight, and temporary-DB handshake pass. The process accepts MCP traffic only after migration checksums and SQLite capabilities are qualified.
 
----
+## Startup and operational checks
 
-## Security Boundary
+Before `initialize`, startup verifies applied migration checksums, then qualifies `STRICT`, JSON1 (`json_valid`), and effective WAL. Human diagnostics go to stderr; stdout remains protocol-only. A checksum or capability failure exits non-zero without accepting MCP traffic.
 
-**`local-trusted-client`** — ForgeSpec operates under stdio and assumes the local process and database file are trusted. Tokens provide bounded authority for task/lease mutations; actor strings provide policy identity, not cryptographic authentication. ForgeSpec prevents races and stale authority between concurrent agents, not malicious local DB or process access.
+Use the package bin directly after installing the exact package version:
 
-- Tokens (claim, file lease) are 256-bit random, returned once, stored as SHA-256 hashes.
-- Errors, audit events, and logs never store raw tokens, secrets, credentials, or evidence payloads.
-- SQL is bounded; Zod schemas are strict; cursors are HMAC-signed and reauthorize each page.
+```bash
+npm install -g forgespec-mcp@1.4.0
+forgespec-mcp --version
+```
 
----
+For OpenCode, preserve and invoke the existing direct global `forgespec-mcp` wrapper. Verify its resolved executable, temporary-DB `initialize`/`tools/list` handshake, clean close, and a full client restart before declaring rollout complete; do not substitute `npx`. If validation fails, restore the byte-for-byte configuration backup and previous runtime/package state, then restart again.
 
-## cortex-ia Contract
+## Release and runtime procedure
 
-cortex-ia (the orchestration layer) MUST:
+The release workflow builds, tests, and packages only on exact Node 24.18.1. Its independent Node 22 compatibility gate must pass before packaging or publish can proceed. Volta must pin the project to `24.18.1`; record `volta list`, `volta which node`, and the direct wrapper path before activation. If activation or the handshake fails, restore the prior Volta pin/default and wrapper/configuration state, rebuild dependencies with `npm ci`, and repeat the temporary-DB handshake. Do not regenerate or churn the lockfile during this procedure.
 
-1. **Probe capabilities** before using direct-v1 — require every P0 interval, optionally require P1.
-2. **Create direct boards** with work units, file scopes, strict-TDD metadata, and gate declarations.
-3. **Query ready work** via `tb_query` or `tb_batch_status`, then **claim exactly one task** per active attempt.
-4. **Retain attempt tokens** only in runtime secret context; pass `claim_token` + `expected_revision` on every mutation.
-5. **Heartbeat** active claims within the lease TTL.
-6. **Own evidence payload and provenance** — only typed digest references go to ForgeSpec via `evidence_links`.
-7. **Recover via deltas** — use `tb_events` or `tb_batch_status` with `since_revision` after restart. No broadcasts or messaging are used.
-8. **Missing required P1 blocks** instead of weakening guarantees.
+### Rollback
 
-### Ownership Boundary
-
-| ForgeSpec owns | cortex-ia owns |
-|----------------|----------------|
-| Persisted task/board/attempt/readiness/history | Orchestration, invocation, prompts |
-| Contract revisions, idempotency, immutable events | Runtime context, Git/worktrees |
-| File lease authority, capability negotiation | External CI/deploy coordination |
-| Migration, schema, backup/restore | Agent lifecycle, scheduling |
-
-### Generated Manifest
-
-cortex-ia should record the selected versions, capabilities, schemas, and `local-trusted-client` boundary from the `forgespec_capabilities` response. A doctor/diagnostic check can compare the recorded manifest against the live server to detect version drift.
-
----
-
-## MCP Tool Inventory (direct-v1 additions)
-
-All tools preserve legacy behavior when `coordination_mode` is omitted. Direct-v1 responses include `structuredContent` identical to JSON text.
-
-| Tool | P0/P1 | Purpose |
-|------|-------|---------|
-| `forgespec_capabilities` | P0 | Negotiate mode, capabilities, limits |
-| `sdd_save` | P0 | Canonical full-contract revision with CAS |
-| `sdd_get` | P0 | Retrieve contract by ID |
-| `sdd_history` | P0 | Paged contract history with deltas |
-| `tb_create_board` | P0 | Atomic board creation with inline tasks |
-| `tb_add_task` | P0 | Add task with CAS |
-| `tb_set_dependencies` | P0 | Normalized DAG edges with readiness recomputation |
-| `tb_claim` | P0 | Exclusive numbered attempt lease |
-| `tb_heartbeat` | P0 | Renew claim within TTL |
-| `tb_update` | P0 | CAS task transition with evidence |
-| `tb_recover_claims` | P0 | Audited expiry/abandonment recovery |
-| `tb_requeue` | P0 | Explicit requeue with readiness recomputation |
-| `tb_approve` | P1 | Immutable gate decision |
-| `tb_query` | P1 | Bounded filtered cursor query |
-| `tb_batch_status` | P1 | Board/work-unit snapshot with counts |
-| `tb_events` | P1 | Authority event delta query |
-| `file_reserve` | P1 | Normalized atomic file lease |
-| `file_renew` | P1 | Renew file lease |
-| `file_release` | P1 | Release file lease |
-
----
-
-## Explicitly Excluded Features
-
-direct-v1 does NOT include: messaging, inbox/thread/search/broadcast, notifications, dead-letter queue, debate, Agent Cards, A2A task delegation, remote invocation, or deploy/CI/API/database/infrastructure/general external-resource leases. File leases are the only external-resource lease type.
-
----
-
-## Versioning
-
-Versioning is additive throughout 1.x. The rollout sequence:
-
-- **1.3.x:** migrations v2, capabilities, errors, hashing, idempotency, full contract revisions.
-- **1.4.x:** P0 direct boards/tasks/CAS/events/DAG/attempts/recovery/deltas.
-- **1.5.x:** schema v3 evidence/approvals/cursors/file leases.
-
-Disabling direct-v1 makes direct resources read-only and retains all history. No down-conversion or deletion is permitted after direct writes.
+Rollback preserves the existing direct global ForgeSpec wrapper and direct OpenCode command. Restore the byte-for-byte configuration backup and prior runtime state, restart the client, and repeat the direct temporary-DB handshake; do not substitute `npx`.

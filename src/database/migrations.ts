@@ -6,9 +6,10 @@ import {
   DIRECT_CORE_SCHEMA_SQL,
   LEGACY_SCHEMA_SQL,
   MIGRATION_CONTROL_SCHEMA_SQL,
+  DIRECT_TASK_HISTORY_SCHEMA_SQL,
 } from "./schema.js";
 
-export const LATEST_SCHEMA_VERSION = 2;
+export const LATEST_SCHEMA_VERSION = 3;
 
 interface MigrationHookContext {
   version: number;
@@ -27,6 +28,16 @@ export interface MigrationResult {
   backupPath: string | null;
   findingCount: number;
 }
+
+export interface DatabaseQualification {
+  sqliteVersion: string;
+  strictTables: true;
+  json1: true;
+  journalMode: string;
+  wal: boolean;
+}
+
+const CAPABILITY_REMEDY = "Use a supported SQLite build or restore the runtime before retrying.";
 
 interface LegacyTaskRow {
   id: string;
@@ -52,6 +63,11 @@ const migrations = [
     name: "direct-v1-p0-core",
     sql: DIRECT_CORE_SCHEMA_SQL,
   },
+  {
+    version: 3,
+    name: "direct-v1-p1-task-history",
+    sql: DIRECT_TASK_HISTORY_SCHEMA_SQL,
+  },
 ] as const;
 
 export function migrateDatabase(databasePath: string, options: MigrationOptions = {}): MigrationResult {
@@ -67,6 +83,12 @@ export function migrateDatabase(databasePath: string, options: MigrationOptions 
     if (fromVersion > LATEST_SCHEMA_VERSION) {
       throw new Error(`Unsupported database user_version ${fromVersion}`);
     }
+    verifyAppliedMigrationChecksums(database, fromVersion);
+
+    // Set WAL only after checksum verification. A tampered database must not
+    // be modified before the startup gate reports the mismatch.
+    database.pragma("journal_mode = WAL");
+    qualifyDatabase(database, { requireWal: true });
 
     if (fromVersion === LATEST_SCHEMA_VERSION) {
       return {
@@ -86,8 +108,11 @@ export function migrateDatabase(databasePath: string, options: MigrationOptions 
       for (const migration of migrations) {
         if (migration.version <= fromVersion) continue;
         database.exec(migration.sql);
-        if (migration.version === LATEST_SCHEMA_VERSION) {
-          recordLegacyDependencyFindings(database, now());
+        if (migration.version === 2) {
+          recordLegacyDependencyFindings(database, now(), migration.version);
+        }
+        if (migration.version === 3) {
+          backfillDirectTaskVersions(database);
         }
         database
           .prepare(
@@ -102,7 +127,7 @@ export function migrateDatabase(databasePath: string, options: MigrationOptions 
     });
 
     apply.exclusive();
-    qualifyDatabase(database);
+    qualifyDatabase(database, { requireWal: true });
     return {
       fromVersion,
       toVersion: LATEST_SCHEMA_VERSION,
@@ -139,13 +164,47 @@ function createVerifiedBackup(database: Database.Database, databasePath: string)
   return backupPath;
 }
 
-function qualifyDatabase(database: Database.Database): void {
+export function qualifyDatabase(
+  database: Database.Database,
+  options: { requireWal?: boolean } = {}
+): DatabaseQualification {
   const quickCheck = database.pragma("quick_check", { simple: true });
   if (quickCheck !== "ok") throw new Error(`SQLite quick_check failed: ${String(quickCheck)}`);
   const foreignKeyErrors = database.pragma("foreign_key_check") as unknown[];
   if (foreignKeyErrors.length > 0) {
     throw new Error(`SQLite foreign_key_check failed with ${foreignKeyErrors.length} finding(s)`);
   }
+
+  const sqliteVersion = String(
+    (database.prepare("SELECT sqlite_version() AS version").get() as { version: string }).version
+  );
+  try {
+    database.exec("CREATE TEMP TABLE __forgespec_strict_probe (value TEXT) STRICT");
+    database.exec("DROP TABLE __forgespec_strict_probe");
+  } catch {
+      throw new Error(
+        `SQLITE_CAPABILITY_MISSING: STRICT tables are required (SQLite ${sqliteVersion}). ${CAPABILITY_REMEDY}`
+      );
+  }
+
+  try {
+    const jsonValid = database.prepare("SELECT json_valid(?) AS valid").get('{"forgespec":true}') as { valid: number };
+    if (jsonValid.valid !== 1) throw new Error("json_valid returned false");
+  } catch {
+      throw new Error(
+        `SQLITE_CAPABILITY_MISSING: JSON1/json_valid is required (SQLite ${sqliteVersion}). ${CAPABILITY_REMEDY}`
+      );
+  }
+
+  const journalMode = String(database.pragma("journal_mode", { simple: true })).toLowerCase();
+  const wal = journalMode === "wal";
+  if (options.requireWal && !wal) {
+    throw new Error(
+      `SQLITE_CAPABILITY_MISSING: effective WAL is required (journal_mode=${journalMode}). ${CAPABILITY_REMEDY}`
+    );
+  }
+
+  return { sqliteVersion, strictTables: true, json1: true, journalMode, wal };
 }
 
 function checksum(sql: string): string {
@@ -160,7 +219,94 @@ function countFindings(database: Database.Database): number {
   return (database.prepare("SELECT COUNT(*) AS count FROM migration_findings").get() as { count: number }).count;
 }
 
-function recordLegacyDependencyFindings(database: Database.Database, createdAtMs: number): void {
+function verifyAppliedMigrationChecksums(database: Database.Database, fromVersion: number): void {
+  const table = database
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+    .get();
+  if (!table) return;
+
+  const applied = database
+    .prepare("SELECT version, name, checksum FROM schema_migrations WHERE version <= ? ORDER BY version")
+    .all(fromVersion) as Array<{ version: number; name: string; checksum: string }>;
+  for (const migration of migrations) {
+    if (migration.version > fromVersion) break;
+    const row = applied.find(({ version }) => version === migration.version);
+    if (!row || row.name !== migration.name || row.checksum !== checksum(migration.sql)) {
+      const observed = row?.checksum ?? "missing";
+      throw new Error(
+        `MIGRATION_CHECKSUM_MISMATCH: version ${migration.version} (${migration.name}); ` +
+          `expected ${checksum(migration.sql)}; observed ${observed}. ` +
+          "Restore the last verified backup or repair the migration history before retrying."
+      );
+    }
+  }
+}
+
+interface DirectTaskBackfillRow {
+  task_id: string;
+  board_id: string;
+  revision: number;
+  status: string;
+  current_attempt_id: string | null;
+  blocked_reason: string | null;
+  metadata_json: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+interface TaskCreatedEventRow {
+  board_revision: number;
+  created_at_ms: number;
+}
+
+function backfillDirectTaskVersions(database: Database.Database): void {
+  const tasks = database
+    .prepare("SELECT task_id, board_id, revision, status, current_attempt_id, blocked_reason, metadata_json, created_at_ms, updated_at_ms FROM direct_tasks ORDER BY task_id")
+    .all() as DirectTaskBackfillRow[];
+  const events = database.prepare(
+    `SELECT board_revision, created_at_ms
+       FROM authority_events
+      WHERE resource_type = 'task' AND resource_id = ? AND event_type = 'task_created'
+      ORDER BY board_revision, event_ordinal, event_id`
+  );
+  const insert = database.prepare(
+    `INSERT INTO direct_task_versions
+       (version_id, board_id, task_id, board_revision, task_revision, status, current_attempt_id,
+        blocked_reason, metadata_json, created_at_ms, updated_at_ms, is_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  for (const task of tasks) {
+    const createdEvents = events.all(task.task_id) as TaskCreatedEventRow[];
+    if (createdEvents.length === 0) continue;
+    if (createdEvents.length !== 1) {
+      throw new Error(`Cannot backfill task history: task ${task.task_id} has multiple task_created events`);
+    }
+    const [created] = createdEvents;
+    if (created.board_revision > task.revision) {
+      throw new Error(`Cannot backfill task history: task ${task.task_id} points into the future`);
+    }
+    const versionId = `task-version:${task.board_id}:${task.task_id}:${created.board_revision}`;
+    const metadata = JSON.parse(task.metadata_json) as Record<string, unknown>;
+    const isDeleted = task.status === "deleted" || metadata.is_deleted === true ? 1 : 0;
+    insert.run(
+      versionId,
+      task.board_id,
+      task.task_id,
+      created.board_revision,
+      task.revision,
+      task.status,
+      task.current_attempt_id,
+      task.blocked_reason,
+      task.metadata_json,
+      created.created_at_ms,
+      task.updated_at_ms,
+      isDeleted
+    );
+  }
+}
+
+function recordLegacyDependencyFindings(database: Database.Database, createdAtMs: number, migrationVersion: number): void {
   const tasks = database.prepare("SELECT id, board_id, dependencies FROM tasks ORDER BY id").all() as LegacyTaskRow[];
   const tasksById = new Map(tasks.map((task) => [task.id, task]));
   const validEdges = new Map<string, string[]>();
@@ -215,7 +361,7 @@ function recordLegacyDependencyFindings(database: Database.Database, createdAtMs
   );
   for (const item of findings) {
     insert.run(
-      LATEST_SCHEMA_VERSION,
+      migrationVersion,
       item.boardId,
       item.taskId,
       item.category,
