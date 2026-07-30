@@ -27,16 +27,36 @@ describe("package-lock runtime policy", () => {
     expect(lock.packages?.[""]?.engines?.node).toBe(">=22 <23 || >=24 <25");
   });
 
-  it("rejects dependency-tree churn and permits only the root engines metadata diff", () => {
+  it("rejects dependency-tree churn outside the approved native dependency upgrade", () => {
     const current = readLockfile();
     const baseline = JSON.parse(
       execFileSync("git", ["show", "HEAD:package-lock.json"], { cwd: PROJECT_ROOT, encoding: "utf8" })
     ) as Record<string, any>;
 
+    expect(current.packages?.[""]?.dependencies?.["better-sqlite3"]).toBe("12.11.1");
+    expect(current.packages?.["node_modules/better-sqlite3"]).toEqual({
+      version: "12.11.1",
+      resolved: "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-12.11.1.tgz",
+      integrity: "sha512-dq9AtApgg5PGFtBzPFSBl3HZQjHok5gaQCM6zh2Yk0aSmDCs1CbnVI8/HgASQkNKsWFpseIO9beg5xxpYhbIfA==",
+      hasInstallScript: true,
+      license: "MIT",
+      dependencies: {
+        bindings: "^1.5.0",
+        "prebuild-install": "^7.1.1",
+      },
+      engines: {
+        node: "20.x || 22.x || 23.x || 24.x || 25.x || 26.x",
+      },
+    });
+
     const currentWithoutRootEngine = structuredClone(current);
     const baselineWithoutRootEngine = structuredClone(baseline);
     delete currentWithoutRootEngine.packages?.[""]?.engines?.node;
     delete baselineWithoutRootEngine.packages?.[""]?.engines?.node;
+    delete currentWithoutRootEngine.packages?.[""]?.dependencies?.["better-sqlite3"];
+    delete baselineWithoutRootEngine.packages?.[""]?.dependencies?.["better-sqlite3"];
+    delete currentWithoutRootEngine.packages?.["node_modules/better-sqlite3"];
+    delete baselineWithoutRootEngine.packages?.["node_modules/better-sqlite3"];
 
     expect(currentWithoutRootEngine).toEqual(baselineWithoutRootEngine);
     expect(Object.keys(current.packages?.[""]?.engines ?? {})).toEqual(["node"]);
