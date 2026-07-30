@@ -32,7 +32,7 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 - **Zero infrastructure** -- Embedded SQLite database, no external services required
 - **Universal compatibility** -- Works with any MCP client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more
-- **Package:** `forgespec-mcp@1.4.0`; runtime schema 3; Node `24.18.1` is the primary runtime and Node `>=22` is supported.
+- **Package:** `forgespec-mcp@1.4.0`; runtime schema 3; Node `24.18.1` is the primary runtime and Node `22.x` and `24.x` are supported.
 - **Runtime policy:** CI runs six isolated jobs for Node `22.x` and `24.x` on Ubuntu, Windows, and macOS. Node 22 uses native ABI 127; Node 24 uses ABI 137.
 - **Entrypoint:** the package bin is `build/index.js`, exposed as `forgespec-mcp`.
 - **Runtime inventory:** **25 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
@@ -116,7 +116,7 @@ Deploy P0 direct-v1 consumers first, then P1 snapshot/history/lease consumers af
 
 ### Runtime rollout policy
 
-Node `24.18.1` is the primary runtime; Node `>=22` is supported through six isolated Node `22.x`/`24.x` jobs on Ubuntu, Windows, and macOS. Node 22 uses ABI 127 and Node 24 uses ABI 137. Each job starts from a clean checkout and runs `npm ci`; only segmented npm download caches are permitted, and runtime changes must not regenerate or churn the lockfile. The release lane uses exact Node `24.18.1` and is blocked by the independent Node 22 compatibility gate.
+Node `24.18.1` is the primary runtime; Node `22.x` and `24.x` are supported through six isolated jobs on Ubuntu, Windows, and macOS. Node 22 uses ABI 127 and Node 24 uses ABI 137. Each job starts from a clean checkout and runs `npm ci`; only segmented npm download caches are permitted, and runtime changes must not regenerate or churn the lockfile. The release lane uses exact Node `24.18.1` and is blocked by the independent Node 22 compatibility gate.
 
 For local activation, record `volta list`, `volta which node`, and `volta which forgespec-mcp`, then pin the project with `volta pin node@24.18.1` and verify the temporary-DB handshake. If activation fails, restore the prior Volta pin/default and rebuild dependencies with `npm ci`. Rollback preserves the existing direct global ForgeSpec wrapper and direct OpenCode command; restore the byte-for-byte configuration backup and restart the client before rechecking `initialize` and `tools/list`.
 

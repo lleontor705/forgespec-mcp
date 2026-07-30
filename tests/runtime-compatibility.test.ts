@@ -64,9 +64,9 @@ describe("Node runtime compatibility policy", () => {
     expect(() => validateRuntimeEvidence({ node_version: "v23.0.0", modules_abi: "999" })).toThrow();
   });
 
-  it("pins the primary project runtime exactly and keeps Node 22 as the minimum", () => {
+  it("pins the primary project runtime and advertises only supported Node majors", () => {
     expect(packageJson.volta?.node).toBe("24.18.1");
-    expect(packageJson.engines?.node).toBe(">=22");
+    expect(packageJson.engines?.node).toBe(">=22 <23 || >=24 <25");
   });
 
   it("does not advertise EOL runtimes or floating primary pins", () => {

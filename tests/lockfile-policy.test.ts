@@ -24,7 +24,7 @@ function readLockfile(): Record<string, any> {
 describe("package-lock runtime policy", () => {
   it("contains only the supported root engines metadata", () => {
     const lock = readLockfile();
-    expect(lock.packages?.[""]?.engines?.node).toBe(">=22");
+    expect(lock.packages?.[""]?.engines?.node).toBe(">=22 <23 || >=24 <25");
   });
 
   it("rejects dependency-tree churn and permits only the root engines metadata diff", () => {

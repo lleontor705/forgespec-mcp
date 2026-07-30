@@ -139,10 +139,10 @@ describe("documentation truth checks", () => {
     expect(migrations).toMatch(/server stopped/i);
   });
 
-  it("documents the exact Node 24 primary and Node 22 minimum policy", () => {
+  it("documents the exact Node 24 primary and supported major lines", () => {
     for (const document of [readme, directV1, migrations]) {
       expect(document).toContain(packageJson.volta.node);
-      expect(document).toMatch(new RegExp(`(?:Node|Supported Node)[^\\n]*>=${packageJson.engines.node.slice(2)}`));
+      expect(document).toMatch(/Node[^\n]*22\.x[^\n]*24\.x/i);
       expect(document).toMatch(/ABI\s*137/i);
       expect(document).toMatch(/ABI\s*127/i);
       expect(document).toMatch(/npm ci/i);
@@ -150,7 +150,7 @@ describe("documentation truth checks", () => {
   });
 
   it("keeps documentation tied to package metadata and the six-job runtime matrix", () => {
-    expect(packageJson.engines.node).toBe(">=22");
+    expect(packageJson.engines.node).toBe(">=22 <23 || >=24 <25");
     expect(packageJson.volta.node).toBe(PRIMARY_NODE24);
     expect(ci.match(/node-line:/g)).toHaveLength(6);
     for (const document of [readme, directV1, migrations]) {
@@ -166,7 +166,7 @@ describe("documentation truth checks", () => {
   it("documents the complete runtime rollout and rollback policy", () => {
     for (const document of [readme, directV1, migrations]) {
       expect(document).toMatch(/primary[^\n]*24\.18\.1/i);
-      expect(document).toMatch(/(?:supported[\s\S]{0,30}>=22|>=22[\s\S]{0,30}supported)/i);
+      expect(document).toMatch(/(?:supported[^\n]*22\.x[^\n]*24\.x|22\.x[^\n]*24\.x[^\n]*supported)/i);
       expect(document).toMatch(/lockfile[\s\S]*npm ci|npm ci[\s\S]*lockfile/i);
       expect(document).toMatch(/Node 22[\s\S]*gate|gate[\s\S]*Node 22/i);
       expect(document).toMatch(/rollback[\s\S]*(?:Volta|wrapper|runtime)/i);
