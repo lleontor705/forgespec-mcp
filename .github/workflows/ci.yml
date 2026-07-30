@@ -1,5 +1,7 @@
 name: CI
 
+# Actions v5 requires GitHub Actions runner >=2.327.1 (observed runner: 2.336.0).
+
 on:
   push:
     branches: [develop, main]
@@ -21,12 +23,12 @@ jobs:
     name: Primary Node 24.18.1 quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "24.18.1"
       - name: Cache npm downloads only
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-${{ hashFiles('package-lock.json') }}
@@ -76,12 +78,12 @@ jobs:
             os: macos-latest
             expected-abi: "137"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node-version }}
       - name: Cache npm downloads only
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.node-line }}-${{ hashFiles('package-lock.json') }}

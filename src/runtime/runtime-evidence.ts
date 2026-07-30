@@ -21,7 +21,7 @@ export interface RuntimeEvidence {
 export interface RuntimeSmokeOptions {
   entrypoint: string;
   mode: "source" | "build";
-  expectedAbi: "127" | "137";
+  expectedAbi?: "127" | "137";
   tempRoot?: string;
   timeoutMs?: number;
 }
@@ -66,14 +66,34 @@ export async function collectRuntimeEvidence(options: RuntimeSmokeOptions): Prom
   }
 }
 
-export function assertSupportedRuntime(evidence: Pick<RuntimeEvidence, "node_version" | "modules_abi">, expectedAbi: "127" | "137"): void {
-  if (evidence.modules_abi !== expectedAbi) {
-    throw new Error(`Runtime ABI mismatch: expected ${expectedAbi}, observed ${evidence.modules_abi}`);
+export function expectedAbiForNodeMajor(nodeMajor: number): "127" | "137" {
+  if (nodeMajor === 22) return "127";
+  if (nodeMajor === 24) return "137";
+  throw new Error(`Unsupported observed Node major ${nodeMajor}; supported majors are 22 and 24`);
+}
+
+export function validateRuntimeEvidence(
+  evidence: Pick<RuntimeEvidence, "node_version" | "modules_abi">,
+  explicitAbi?: "127" | "137",
+): { nodeMajor: number; expectedAbi: "127" | "137"; observedAbi: string } {
+  const match = /^v(\d+)(?:\.|$)/.exec(evidence.node_version);
+  const nodeMajor = match ? Number(match[1]) : Number.NaN;
+  if (!Number.isInteger(nodeMajor)) throw new Error(`Unable to determine observed Node major from ${evidence.node_version}`);
+  const mappedAbi = expectedAbiForNodeMajor(nodeMajor);
+  if (evidence.modules_abi !== mappedAbi) {
+    throw new Error(`Node major ${nodeMajor} has expected ABI ${mappedAbi}, but observed ABI ${evidence.modules_abi}; verify the Node installation or selection`);
   }
-  const expectedMajor = expectedAbi === "137" ? "v24." : "v22.";
-  if (!evidence.node_version.startsWith(expectedMajor)) {
-    throw new Error(`Runtime version mismatch: expected ${expectedMajor}x, observed ${evidence.node_version}`);
+  if (explicitAbi !== undefined && explicitAbi !== mappedAbi) {
+    throw new Error(`Node major ${nodeMajor} has mapped ABI ${mappedAbi}, observed ABI ${evidence.modules_abi}, but explicit ABI ${explicitAbi}`);
   }
+  return { nodeMajor, expectedAbi: mappedAbi, observedAbi: evidence.modules_abi };
+}
+
+export function assertSupportedRuntime(
+  evidence: Pick<RuntimeEvidence, "node_version" | "modules_abi">,
+  expectedAbi?: "127" | "137",
+): void {
+  validateRuntimeEvidence(evidence, expectedAbi);
 }
 
 export function runMcpHandshake(options: RuntimeSmokeOptions): Promise<RuntimeEvidence["handshake"]> {

@@ -40,6 +40,13 @@ describe("runtime smoke CLI process contract", () => {
     expect(result.stderr).toMatch(/runtime-smoke:/);
   });
 
+  it("rejects an explicit ABI that disagrees with the current runtime", () => {
+    const wrongAbi = process.versions.modules === "137" ? "127" : "137";
+    const result = runSmoke(["--mode", "source", "--entrypoint", path.join(ROOT, "src", "index.ts"), "--expected-abi", wrongAbi]);
+    expect(result.status).toBe(3);
+    expect(result.stderr).toMatch(/runtime-smoke:.*ABI|runtime-smoke:.*major/i);
+  });
+
   it("specifies runtime/native, protocol, and unexpected exit classes", () => {
     const source = fs.readFileSync(CLI, "utf8");
     expect(source).toMatch(/EXIT_USAGE\s*=\s*2/);

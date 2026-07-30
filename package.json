@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "runtime:smoke": "node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi 137",
+    "runtime:smoke": "node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
