@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 const ROOT = path.resolve(__dirname, "..");
 const SCRIPT = path.join(ROOT, "scripts", "opencode-forgespec-repair.ps1");
+const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as { version: string };
 
 describe("stable OpenCode entrypoint policy", () => {
   it("provides a guarded repair procedure", () => {
@@ -11,7 +12,7 @@ describe("stable OpenCode entrypoint policy", () => {
     const source = fs.readFileSync(SCRIPT, "utf8");
     expect(source).toContain("$env:LOCALAPPDATA\\Volta\\bin\\forgespec-mcp.cmd");
     expect(source).toMatch(/tools[\\/]image/i);
-    expect(source).toMatch(/forgespec-mcp@1\.4\.0/);
+    expect(source).toMatch(new RegExp(`forgespec-mcp@${packageJson.version.replace(/\./g, "\\.")}`));
     expect(source).toMatch(/volta install/);
     expect(source).toMatch(/finally/i);
     expect(source).toMatch(/backup/i);

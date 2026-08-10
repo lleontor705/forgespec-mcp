@@ -1,6 +1,6 @@
 # ForgeSpec direct-v1
 
-**Version:** 1.4.0 | **API version:** 1.0.0 | **Schema:** 3 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x and 24.x
+**Version:** 1.5.0 | **API version:** 1.0.0 | **Schema:** 3 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x and 24.x
 
 direct-v1 is the transactional coordination mode for boards, tasks, contracts, and file leases. The runtime currently exposes **25 MCP tools**; the inventory below is generated from `tools/list` and is the compatibility checklist.
 
@@ -41,7 +41,7 @@ Before `initialize`, startup verifies applied migration checksums, then qualifie
 Use the package bin directly after installing the exact package version:
 
 ```bash
-npm install -g forgespec-mcp@1.4.0
+npm install -g forgespec-mcp@1.5.0
 forgespec-mcp --version
 ```
 

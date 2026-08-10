@@ -33,19 +33,17 @@ describe("package-lock runtime policy", () => {
       execFileSync("git", ["show", "HEAD:package-lock.json"], { cwd: PROJECT_ROOT, encoding: "utf8" })
     ) as Record<string, any>;
 
-    expect(current.packages?.[""]?.dependencies?.["better-sqlite3"]).toBe("12.11.1");
+    expect(current.packages?.[""]?.dependencies?.["better-sqlite3"]).toBe("^13.0.3");
     expect(current.packages?.["node_modules/better-sqlite3"]).toEqual({
-      version: "12.11.1",
-      resolved: "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-12.11.1.tgz",
-      integrity: "sha512-dq9AtApgg5PGFtBzPFSBl3HZQjHok5gaQCM6zh2Yk0aSmDCs1CbnVI8/HgASQkNKsWFpseIO9beg5xxpYhbIfA==",
-      hasInstallScript: true,
+      version: "13.0.3",
+      resolved: "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-13.0.3.tgz",
+      integrity: "sha512-RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdWVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==",
       license: "MIT",
       dependencies: {
-        bindings: "^1.5.0",
-        "prebuild-install": "^7.1.1",
+        "node-addon-api": "^8.0.0",
       },
       engines: {
-        node: "20.x || 22.x || 23.x || 24.x || 25.x || 26.x",
+        node: ">=22",
       },
     });
 

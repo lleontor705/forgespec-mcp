@@ -32,7 +32,7 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 - **Zero infrastructure** -- Embedded SQLite database, no external services required
 - **Universal compatibility** -- Works with any MCP client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more
-- **Package:** `forgespec-mcp@1.4.0`; runtime schema 3; Node `24.18.1` is the primary runtime and Node `22.x` and `24.x` are supported.
+- **Package:** `forgespec-mcp@1.5.0`; runtime schema 3; Node `24.18.1` is the primary runtime and Node `22.x` and `24.x` are supported.
 - **Runtime policy:** CI runs six isolated jobs for Node `22.x` and `24.x` on Ubuntu, Windows, and macOS. Node 22 uses native ABI 127; Node 24 uses ABI 137.
 - **Entrypoint:** the package bin is `build/index.js`, exposed as `forgespec-mcp`.
 - **Runtime inventory:** **25 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
@@ -46,7 +46,7 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 ## direct-v1 Coordination Mode
 
-ForgeSpec 1.4.0 provides **direct-v1**, an additive coordination mode that provides transactional CAS, scoped idempotency, immutable audit history, exclusive attempt-based claim leases, normalized dependency DAGs, structured evidence references, approval gates, bounded snapshot queries, compound cursors, and atomic file reservation leases.
+ForgeSpec 1.5.0 provides **direct-v1**, an additive coordination mode that provides transactional CAS, scoped idempotency, immutable audit history, exclusive attempt-based claim leases, normalized dependency DAGs, structured evidence references, approval gates, bounded snapshot queries, compound cursors, and atomic file reservation leases.
 
 Clients negotiate via `forgespec_capabilities` before using direct-v1 tools. See [docs/direct-v1.md](docs/direct-v1.md) for authority, snapshots, errors, rollout, and the complete inventory. See [docs/migrations.md](docs/migrations.md) for checksum preflight, migration, rollback, and interruption recovery.
 
@@ -98,7 +98,7 @@ npx -y forgespec-mcp
 ### Install globally
 
 ```bash
-npm install -g forgespec-mcp@1.4.0
+npm install -g forgespec-mcp@1.5.0
 ```
 
 ### Verify installation

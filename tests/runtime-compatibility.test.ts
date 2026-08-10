@@ -8,6 +8,8 @@ import {
   validateRuntimeEvidence,
 } from "../src/runtime/runtime-evidence.js";
 
+const CURRENT_NODE_MAJOR = Number(/^v(\d+)/.exec(process.version)?.[1]);
+const CURRENT_RUNTIME_SUPPORTED = CURRENT_NODE_MAJOR === 22 || CURRENT_NODE_MAJOR === 24;
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const packageJson = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8")) as {
   engines?: { node?: string };
@@ -111,7 +113,7 @@ describe("Node runtime compatibility policy", () => {
     expect(source).not.toMatch(/collectRuntimeEvidence\(\{[^}]*expectedAbi:\s*["']137["']/s);
   });
 
-  it("collects native, migration, and JSON-RPC evidence through the production seam", async () => {
+  it.skipIf(!CURRENT_RUNTIME_SUPPORTED)("collects native, migration, and JSON-RPC evidence through the production seam", async () => {
     const nodeMajor = Number(/^v(\d+)/.exec(process.version)?.[1]);
     const expectedAbi = expectedAbiForNodeMajor(nodeMajor);
     const evidence = await collectRuntimeEvidence({ mode: "source", entrypoint: path.join(PROJECT_ROOT, "src", "index.ts") });
