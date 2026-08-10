@@ -32,7 +32,7 @@ jobs:
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-${{ hashFiles('package-lock.json') }}
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - name: Print Node 24.18.1 runtime evidence
         shell: bash
         run: |
@@ -77,6 +77,18 @@ jobs:
             node-version: "24.x"
             os: macos-latest
             expected-abi: "137"
+          - node-line: "26.x"
+            node-version: "26.x"
+            os: ubuntu-latest
+            expected-abi: "147"
+          - node-line: "26.x"
+            node-version: "26.x"
+            os: windows-latest
+            expected-abi: "147"
+          - node-line: "26.x"
+            node-version: "26.x"
+            os: macos-latest
+            expected-abi: "147"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -88,7 +100,7 @@ jobs:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.node-line }}-${{ hashFiles('package-lock.json') }}
       - name: Install isolated dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Print runtime and native evidence
         shell: bash
         run: |

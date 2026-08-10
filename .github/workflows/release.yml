@@ -75,7 +75,7 @@ jobs:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ runner.arch }}-22.x-${{ hashFiles('package-lock.json') }}
       - name: Install clean Node 22 dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Record Node 22 native runtime evidence
         shell: bash
         run: |
@@ -107,7 +107,7 @@ jobs:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-${{ hashFiles('package-lock.json') }}
       - name: Install clean Node 24.18.1 dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Record exact Node 24 native runtime evidence
         shell: bash
         run: |
@@ -162,7 +162,7 @@ jobs:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ runner.arch }}-24.18.1-publish-${{ hashFiles('package-lock.json') }}
       - name: Install clean publish dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Build package contents from verified source
         run: npm run build
       - name: Set package version without lifecycle scripts

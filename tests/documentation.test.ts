@@ -23,6 +23,7 @@ const release = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", 
 const PRIMARY_NODE24 = "24.18.1";
 const COMPAT_NODE22 = "22.x";
 const COMPAT_NODE24 = "24.x";
+const COMPAT_NODE26 = "26.x";
 
 function workflowSection(workflow: string, start: string, end?: string): string {
   const startIndex = workflow.indexOf(start);
@@ -108,6 +109,7 @@ describe("documentation truth checks", () => {
     expect(ci).toMatch(new RegExp(`node-version:\\s*["']${PRIMARY_NODE24}["']`));
     expect(ci).toMatch(new RegExp(`node-version:\\s*["']${COMPAT_NODE22}["']`));
     expect(ci).toMatch(new RegExp(`node-version:\\s*["']${COMPAT_NODE24}["']`));
+    expect(ci).toMatch(new RegExp(`node-version:\\s*["']${COMPAT_NODE26}["']`));
     expect(ci).toMatch(/ubuntu-latest/);
     expect(ci).toMatch(/windows-latest/);
     expect(ci).toMatch(/macos-latest/);
@@ -141,21 +143,23 @@ describe("documentation truth checks", () => {
   it("documents the exact Node 24 primary and supported major lines", () => {
     for (const document of [readme, directV1, migrations]) {
       expect(document).toContain(packageJson.volta.node);
-      expect(document).toMatch(/Node[^\n]*22\.x[^\n]*24\.x/i);
+      expect(document).toMatch(/Node[^\n]*22\.x[^\n]*24\.x[^\n]*26\.x/i);
       expect(document).toMatch(/ABI\s*137/i);
       expect(document).toMatch(/ABI\s*127/i);
+      expect(document).toMatch(/ABI\s*147/i);
       expect(document).toMatch(/npm ci/i);
     }
   });
 
-  it("keeps documentation tied to package metadata and the six-job runtime matrix", () => {
-    expect(packageJson.engines.node).toBe(">=22 <23 || >=24 <25");
+  it("keeps documentation tied to package metadata and the nine-job runtime matrix", () => {
+    expect(packageJson.engines.node).toBe(">=22 <23 || >=24 <25 || >=26 <27");
     expect(packageJson.volta.node).toBe(PRIMARY_NODE24);
-    expect(ci.match(/node-line:/g)).toHaveLength(6);
+    expect(ci.match(/node-line:/g)).toHaveLength(9);
     for (const document of [readme, directV1, migrations]) {
-      expect(document).toMatch(/six isolated|six jobs|six-job|6-job/i);
+      expect(document).toMatch(/nine isolated|nine jobs|nine-job|9-job/i);
       expect(document).toMatch(/22\.x/);
       expect(document).toMatch(/24\.x/);
+      expect(document).toMatch(/26\.x/);
     }
     expect(readme).toMatch(/lockfile[\s\S]*npm ci|npm ci[\s\S]*lockfile/i);
     expect(directV1).toMatch(/direct global|direct executable|global wrapper/i);
@@ -165,7 +169,7 @@ describe("documentation truth checks", () => {
   it("documents the complete runtime rollout and rollback policy", () => {
     for (const document of [readme, directV1, migrations]) {
       expect(document).toMatch(/primary[^\n]*24\.18\.1/i);
-      expect(document).toMatch(/(?:supported[^\n]*22\.x[^\n]*24\.x|22\.x[^\n]*24\.x[^\n]*supported)/i);
+      expect(document).toMatch(/22\.x[^\n]*24\.x[^\n]*26\.x/i);
       expect(document).toMatch(/lockfile[\s\S]*npm ci|npm ci[\s\S]*lockfile/i);
       expect(document).toMatch(/Node 22[\s\S]*gate|gate[\s\S]*Node 22/i);
       expect(document).toMatch(/rollback[\s\S]*(?:Volta|wrapper|runtime)/i);

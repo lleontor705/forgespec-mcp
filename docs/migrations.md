@@ -1,6 +1,6 @@
 # ForgeSpec migrations and rollback
 
-**Package:** `forgespec-mcp@1.5.0` | **Current schema:** 3 | **Primary Node:** 24.18.1 | **Supported Node:** 22.x and 24.x
+**Package:** `forgespec-mcp@1.5.0` | **Current schema:** 3 | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
 
 ## Schema versions
 
@@ -17,7 +17,7 @@ Every visible direct-task change writes the projection and exactly one history r
 
 ## Startup preflight
 
-Runtime qualification is isolated per supported line: six jobs cover Node 22.x and 24.x on Ubuntu, Windows, and macOS. Node 22 uses ABI 127 and Node 24.18.1 uses ABI 137. Each CI job starts from a clean checkout, runs `npm ci`, loads `better-sqlite3`, and exercises migration and temporary-DB MCP handshake paths. Only npm download caches are permitted; native bindings and `node_modules` are not shared. The lockfile is consumed as-is: runtime changes must not regenerate dependency entries or introduce lockfile churn.
+Runtime qualification is isolated per supported line: nine jobs cover Node 22.x, 24.x, and 26.x on Ubuntu, Windows, and macOS. Node 22 uses ABI 127, Node 24.18.1 uses ABI 137, and Node 26 uses ABI 147. Each CI job starts from a clean checkout, runs `npm ci --ignore-scripts`, loads `better-sqlite3`, and exercises migration and temporary-DB MCP handshake paths. Only npm download caches are permitted; native bindings and `node_modules` are not shared. The lockfile is consumed as-is: runtime changes must not regenerate dependency entries or introduce lockfile churn.
 
 Before MCP `initialize`, startup:
 

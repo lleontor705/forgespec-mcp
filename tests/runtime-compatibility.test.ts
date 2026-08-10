@@ -9,7 +9,7 @@ import {
 } from "../src/runtime/runtime-evidence.js";
 
 const CURRENT_NODE_MAJOR = Number(/^v(\d+)/.exec(process.version)?.[1]);
-const CURRENT_RUNTIME_SUPPORTED = CURRENT_NODE_MAJOR === 22 || CURRENT_NODE_MAJOR === 24;
+const CURRENT_RUNTIME_SUPPORTED = CURRENT_NODE_MAJOR === 22 || CURRENT_NODE_MAJOR === 24 || CURRENT_NODE_MAJOR === 26;
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const packageJson = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8")) as {
   engines?: { node?: string };
@@ -22,6 +22,7 @@ describe("Node runtime compatibility policy", () => {
   it.each([
     [22, "127"],
     [24, "137"],
+    [26, "147"],
   ])("maps Node major %s to ABI %s without runtime inference", (major, abi) => {
     expect(expectedAbiForNodeMajor(major)).toBe(abi);
   });
@@ -29,6 +30,7 @@ describe("Node runtime compatibility policy", () => {
   it.each([
     [{ node_version: "v22.18.0", modules_abi: "127" }, undefined],
     [{ node_version: "v24.18.1", modules_abi: "137" }, undefined],
+    [{ node_version: "v26.7.0", modules_abi: "147" }, undefined],
   ])("accepts coherent observed runtime evidence", (evidence, expected) => {
     expect(validateRuntimeEvidence(evidence, expected)).toEqual({
       nodeMajor: Number(evidence.node_version.slice(1).split(".")[0]),
@@ -51,7 +53,7 @@ describe("Node runtime compatibility policy", () => {
 
   it.each([
     [18, "127"],
-    [26, "137"],
+    [25, "137"],
   ])("rejects unsupported major %s even when ABI looks familiar", (major, abi) => {
     expect(() => expectedAbiForNodeMajor(major)).toThrow(/unsupported.*Node major.*22.*24/i);
     expect(() => validateRuntimeEvidence({ node_version: `v${major}.0.0`, modules_abi: abi })).toThrow(
@@ -62,13 +64,14 @@ describe("Node runtime compatibility policy", () => {
   it("does not expose an inverse ABI policy or fallback for unknown values", () => {
     expect(expectedAbiForNodeMajor(22)).toBe("127");
     expect(expectedAbiForNodeMajor(24)).toBe("137");
+    expect(expectedAbiForNodeMajor(26)).toBe("147");
     expect(() => expectedAbiForNodeMajor(23)).toThrow();
     expect(() => validateRuntimeEvidence({ node_version: "v23.0.0", modules_abi: "999" })).toThrow();
   });
 
   it("pins the primary project runtime and advertises only supported Node majors", () => {
     expect(packageJson.volta?.node).toBe("24.18.1");
-    expect(packageJson.engines?.node).toBe(">=22 <23 || >=24 <25");
+    expect(packageJson.engines?.node).toBe(">=22 <23 || >=24 <25 || >=26 <27");
   });
 
   it("does not advertise EOL runtimes or floating primary pins", () => {
@@ -78,9 +81,10 @@ describe("Node runtime compatibility policy", () => {
     expect(packageJson.volta?.node).toBe("24.18.1");
   });
 
-  it("defines six isolated runtime and operating-system compatibility jobs", () => {
+  it("defines nine isolated runtime and operating-system compatibility jobs", () => {
     expect(ci).toMatch(/node-version(?:s)?:[\s\S]*22\.x/);
     expect(ci).toMatch(/node-version(?:s)?:[\s\S]*24\.x/);
+    expect(ci).toMatch(/node-version(?:s)?:[\s\S]*26\.x/);
     for (const os of ["ubuntu-latest", "windows-latest", "macos-latest"]) expect(ci).toContain(os);
     expect(ci.match(/npm ci/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
   });
@@ -94,6 +98,7 @@ describe("Node runtime compatibility policy", () => {
   it("requires ABI-specific native and temporary handshake evidence", () => {
     expect(`${ci}\n${release}`).toMatch(/127/);
     expect(`${ci}\n${release}`).toMatch(/137/);
+    expect(`${ci}\n${release}`).toMatch(/147/);
     expect(`${ci}\n${release}`).toMatch(/better-sqlite3/);
     expect(`${ci}\n${release}`).toMatch(/runtime-smoke/);
     expect(`${ci}\n${release}`).toMatch(/initialize/);

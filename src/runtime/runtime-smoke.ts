@@ -35,9 +35,9 @@ function parseArguments(argv: string[]): RuntimeSmokeOptions {
   const mode = values.get("mode");
   const entrypoint = values.get("entrypoint");
   const expectedAbi = values.get("expected-abi");
-  if ((mode !== "source" && mode !== "build") || !entrypoint || (expectedAbi !== undefined && expectedAbi !== "127" && expectedAbi !== "137")) throw new SmokeError(EXIT_USAGE, "Required arguments: --mode source|build --entrypoint path [--expected-abi 127|137]");
+  if ((mode !== "source" && mode !== "build") || !entrypoint || (expectedAbi !== undefined && expectedAbi !== "127" && expectedAbi !== "137" && expectedAbi !== "147")) throw new SmokeError(EXIT_USAGE, "Required arguments: --mode source|build --entrypoint path [--expected-abi 127|137|147]");
   const nodeMajor = Number(/^v(\d+)/.exec(process.version)?.[1]);
-  return { mode, entrypoint, expectedAbi: expectedAbi === undefined ? expectedAbiForNodeMajor(nodeMajor) : expectedAbi as "127" | "137" };
+  return { mode, entrypoint, expectedAbi: expectedAbi === undefined ? expectedAbiForNodeMajor(nodeMajor) : expectedAbi as "127" | "137" | "147" };
 }
 
 function classifyError(error: unknown): SmokeError {

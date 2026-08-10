@@ -53,7 +53,11 @@
     "url": "git+https://github.com/lleontor705/forgespec-mcp.git"
   },
   "engines": {
-    "node": ">=22 <23 || >=24 <25"
+    "node": ">=22 <23 || >=24 <25 || >=26 <27"
+  },
+  "overrides": {
+    "fast-uri": "^3.1.5",
+    "ip-address": "^10.3.1"
   },
   "volta": {
     "node": "24.18.1"

@@ -21,7 +21,7 @@ export interface RuntimeEvidence {
 export interface RuntimeSmokeOptions {
   entrypoint: string;
   mode: "source" | "build";
-  expectedAbi?: "127" | "137";
+  expectedAbi?: "127" | "137" | "147";
   tempRoot?: string;
   timeoutMs?: number;
 }
@@ -66,16 +66,17 @@ export async function collectRuntimeEvidence(options: RuntimeSmokeOptions): Prom
   }
 }
 
-export function expectedAbiForNodeMajor(nodeMajor: number): "127" | "137" {
+export function expectedAbiForNodeMajor(nodeMajor: number): "127" | "137" | "147" {
   if (nodeMajor === 22) return "127";
   if (nodeMajor === 24) return "137";
-  throw new Error(`Unsupported observed Node major ${nodeMajor}; supported majors are 22 and 24`);
+  if (nodeMajor === 26) return "147";
+  throw new Error(`Unsupported observed Node major ${nodeMajor}; supported majors are 22, 24, and 26`);
 }
 
 export function validateRuntimeEvidence(
   evidence: Pick<RuntimeEvidence, "node_version" | "modules_abi">,
-  explicitAbi?: "127" | "137",
-): { nodeMajor: number; expectedAbi: "127" | "137"; observedAbi: string } {
+  explicitAbi?: "127" | "137" | "147",
+): { nodeMajor: number; expectedAbi: "127" | "137" | "147"; observedAbi: string } {
   const match = /^v(\d+)(?:\.|$)/.exec(evidence.node_version);
   const nodeMajor = match ? Number(match[1]) : Number.NaN;
   if (!Number.isInteger(nodeMajor)) throw new Error(`Unable to determine observed Node major from ${evidence.node_version}`);
@@ -91,7 +92,7 @@ export function validateRuntimeEvidence(
 
 export function assertSupportedRuntime(
   evidence: Pick<RuntimeEvidence, "node_version" | "modules_abi">,
-  expectedAbi?: "127" | "137",
+  expectedAbi?: "127" | "137" | "147",
 ): void {
   validateRuntimeEvidence(evidence, expectedAbi);
 }

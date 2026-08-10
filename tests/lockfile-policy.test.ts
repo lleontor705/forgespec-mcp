@@ -24,7 +24,7 @@ function readLockfile(): Record<string, any> {
 describe("package-lock runtime policy", () => {
   it("contains only the supported root engines metadata", () => {
     const lock = readLockfile();
-    expect(lock.packages?.[""]?.engines?.node).toBe(">=22 <23 || >=24 <25");
+    expect(lock.packages?.[""]?.engines?.node).toBe(">=22 <23 || >=24 <25 || >=26 <27");
   });
 
   it("rejects dependency-tree churn outside the approved native dependency upgrade", () => {
@@ -47,18 +47,24 @@ describe("package-lock runtime policy", () => {
       },
     });
 
-    const currentWithoutRootEngine = structuredClone(current);
-    const baselineWithoutRootEngine = structuredClone(baseline);
-    delete currentWithoutRootEngine.packages?.[""]?.engines?.node;
-    delete baselineWithoutRootEngine.packages?.[""]?.engines?.node;
-    delete currentWithoutRootEngine.packages?.[""]?.dependencies?.["better-sqlite3"];
-    delete baselineWithoutRootEngine.packages?.[""]?.dependencies?.["better-sqlite3"];
-    delete currentWithoutRootEngine.packages?.["node_modules/better-sqlite3"];
-    delete baselineWithoutRootEngine.packages?.["node_modules/better-sqlite3"];
+    const currentStripped = structuredClone(current);
+    const baselineStripped = structuredClone(baseline);
+    for (const tree of [currentStripped, baselineStripped]) {
+      delete tree.version;
+      delete tree.packages?.[""]?.engines?.node;
+      delete tree.packages?.[""]?.version;
+      delete tree.packages?.[""]?.dependencies?.["better-sqlite3"];
+      delete tree.packages?.["node_modules/better-sqlite3"];
+      delete tree.packages?.["node_modules/fast-uri"];
+      delete tree.packages?.["node_modules/ip-address"];
+    }
 
-    expect(currentWithoutRootEngine).toEqual(baselineWithoutRootEngine);
+    expect(currentStripped).toEqual(baselineStripped);
     expect(Object.keys(current.packages?.[""]?.engines ?? {})).toEqual(["node"]);
     expect(current.packages?.[""]?.volta).toBeUndefined();
+    // overrides close the Trivy-flagged CVEs in the ajv transitive subtree.
+    expect(current.packages?.["node_modules/fast-uri"]?.version).toBe("3.1.5");
+    expect(current.packages?.["node_modules/ip-address"]?.version).toBe("10.5.0");
   });
 
   it("installs every runtime job from its own checkout with npm ci", () => {

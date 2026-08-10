@@ -1,6 +1,6 @@
 # ForgeSpec direct-v1
 
-**Version:** 1.5.0 | **API version:** 1.0.0 | **Schema:** 3 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x and 24.x
+**Version:** 1.5.0 | **API version:** 1.0.0 | **Schema:** 3 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
 
 direct-v1 is the transactional coordination mode for boards, tasks, contracts, and file leases. The runtime currently exposes **25 MCP tools**; the inventory below is generated from `tools/list` and is the compatibility checklist.
 
@@ -14,7 +14,7 @@ The `cortex-ia` orchestration layer should persist the selected manifest and re-
 
 ## Guarantees
 
-- **Runtime:** CI has six isolated jobs for Node 22.x and 24.x on Ubuntu, Windows, and macOS. Native `better-sqlite3` uses ABI 127 on Node 22 and ABI 137 on Node 24. Each job starts clean and runs `npm ci`; only npm download caches are allowed.
+- **Runtime:** CI has nine isolated jobs for Node 22.x, 24.x, and 26.x on Ubuntu, Windows, and macOS. Native `better-sqlite3` uses ABI 127 on Node 22, ABI 137 on Node 24, and ABI 147 on Node 26. Each job starts clean and runs `npm ci --ignore-scripts`; only npm download caches are allowed.
 - **Lockfile:** Runtime changes consume the existing lockfile with `npm ci`; dependency versions, URLs, integrity hashes, and transitive entries are not regenerated or changed.
 
 - **Authority:** ordinary task, query, and lease mutations require `now < expires_at_ms`. Heartbeats are allowed only before `expires_at_ms + 5,000 ms`; recovery starts at that boundary. The grace interval never authorizes ordinary reads or writes.
