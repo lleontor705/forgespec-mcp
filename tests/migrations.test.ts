@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,11 @@ import {
   migrateDatabase,
   restoreDatabaseBackup,
 } from "../src/database/migrations.js";
+import {
+  DIRECT_AUTHORITY_LINEAGE_SCHEMA_SQL,
+  DIRECT_AUTHORITY_PERSISTENCE_SCHEMA_SQL,
+  DIRECT_TASK_HISTORY_SCHEMA_SQL,
+} from "../src/database/schema.js";
 import {
   createV2Database,
   removeTestDatabases,
@@ -33,11 +39,516 @@ function open(databasePath: string): Database.Database {
   return database;
 }
 
+function advanceToSchemaV4(database: Database.Database): void {
+  database.exec("PRAGMA foreign_keys = OFF");
+  for (const table of [...authorityTables].reverse()) database.exec(`DROP TABLE IF EXISTS ${table}`);
+  database.prepare("DELETE FROM schema_migrations WHERE version >= 3").run();
+  database.exec(DIRECT_TASK_HISTORY_SCHEMA_SQL);
+  database.exec(DIRECT_AUTHORITY_PERSISTENCE_SCHEMA_SQL);
+  const insert = database.prepare(
+    "INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (?, ?, ?, ?)"
+  );
+  insert.run(3, "direct-v1-p1-task-history", digestSql(DIRECT_TASK_HISTORY_SCHEMA_SQL), 3000);
+  insert.run(4, "direct-v1-additive-authority-persistence", digestSql(DIRECT_AUTHORITY_PERSISTENCE_SCHEMA_SQL), 4000);
+  database.pragma("user_version = 4");
+  database.exec("PRAGMA foreign_keys = ON");
+}
+
+function digestSql(sql: string): string {
+  return `sha256:${createHash("sha256").update(sql).digest("hex")}`;
+}
+
+function advanceToSchemaV5(database: Database.Database): void {
+  advanceToSchemaV4(database);
+  database.exec(DIRECT_AUTHORITY_LINEAGE_SCHEMA_SQL);
+  database
+    .prepare("INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (?, ?, ?, ?)")
+    .run(5, "direct-v1-grant-ancestry-storage-hardening", digestSql(DIRECT_AUTHORITY_LINEAGE_SCHEMA_SQL), 5000);
+  database.pragma("user_version = 5");
+}
+
+const authorityTables = [
+  "task_approval_provenance",
+  "task_authority_grants",
+  "task_authority_handoff_refs",
+  "task_authority_handoffs",
+  "task_authority_idempotency",
+  "task_authority_revocations",
+] as const;
+
+function seedAuthorityRows(database: Database.Database): void {
+  seedDirectBoard(database, "board-authority", 8);
+  seedDirectTask(database, "task-authority", "board-authority", 1);
+  for (const [ordinal, eventId] of ["event-handoff", "event-grant", "event-revoke", "event-approval"].entries()) {
+    database
+      .prepare(
+        `INSERT INTO authority_events
+           (event_id, resource_type, resource_id, board_id, board_revision, resource_revision,
+            event_ordinal, event_type, actor, outcome, details_json, created_at_ms)
+         VALUES (?, 'board', 'board-authority', 'board-authority', ?, 1, 0, ?, 'alice', 'success', '{}', ?)`
+      )
+      .run(eventId, ordinal + 1, eventId.replace("event-", "authority_"), 2000 + ordinal);
+  }
+  database
+    .prepare(
+      `INSERT INTO task_authority_handoffs
+         (handoff_id, board_id, from_actor, to_actor, resource_kind, resource_id,
+          expires_at_ms, created_at_ms, created_event_id)
+       VALUES ('handoff-1', 'board-authority', 'alice', 'bob', 'task', 'task-authority',
+               9000, 2000, 'event-handoff')`
+    )
+    .run();
+  database
+    .prepare(
+      `INSERT INTO task_authority_handoff_refs
+         (handoff_id, ordinal, provider, kind, external_id, digest)
+       VALUES ('handoff-1', 0, 'forgespec', 'task', 'task-authority', ?)`
+    )
+    .run(`sha256:${"1".repeat(64)}`);
+  database
+    .prepare(
+      `INSERT INTO task_authority_grants
+         (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation,
+          granted_by_actor, expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id)
+       VALUES ('grant-1', 'board-authority', 'task', 'task-authority', 'bob', 'update',
+               'alice', 9000, 'handoff', 'handoff-1', 2001, 'event-grant')`
+    )
+    .run();
+  database
+    .prepare(
+      `INSERT INTO task_authority_revocations
+         (revoke_id, grant_id, board_id, revoked_by_actor, reason, created_at_ms, created_event_id)
+       VALUES ('revoke-1', 'grant-1', 'board-authority', 'alice', 'complete', 2002, 'event-revoke')`
+    )
+    .run();
+  database
+    .prepare(
+      `INSERT INTO task_authority_idempotency
+         (command_kind, board_id, idempotency_key, request_hash, result_kind, result_id,
+          canonical_response_json, created_at_ms)
+       VALUES ('handoff', 'board-authority', 'key-1', ?, 'handoff', 'handoff-1', '{"ok":true}', 2000)`
+    )
+    .run(`sha256:${"2".repeat(64)}`);
+  database
+    .prepare(
+      `INSERT INTO task_approval_provenance
+         (board_id, task_id, gate_id, decision_event_id, asserted_actor, boundary, mode,
+          ref_provider, ref_kind, ref_external_id, ref_digest, created_at_ms)
+       VALUES ('board-authority', 'task-authority', 'apply-approved', 'event-approval', 'alice',
+               'local-trusted-client', 'direct-v1', 'forgespec', 'approval', 'approval-1', ?, 2003)`
+    )
+    .run(`sha256:${"3".repeat(64)}`);
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }
   removeTestDatabases();
+});
+
+describe("schema v6 delegated grant identity hardening", () => {
+  it("migrates schema 5 additively without changing the applied schema-5 migration", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-v6-");
+    advanceToSchemaV5(database);
+    seedAuthorityRows(database);
+    const schema5 = database.prepare("SELECT name, checksum FROM schema_migrations WHERE version = 5").get();
+    database.close();
+
+    expect(migrateDatabase(databasePath)).toMatchObject({ fromVersion: 5, toVersion: 6, appliedVersions: [6] });
+    const migrated = open(databasePath);
+    try {
+      expect(migrated.prepare("SELECT name, checksum FROM schema_migrations WHERE version = 5").get()).toEqual(schema5);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(6);
+    } finally {
+      migrated.close();
+    }
+
+    expect(migrateDatabase(databasePath)).toMatchObject({ fromVersion: 6, toVersion: 6, appliedVersions: [] });
+  });
+
+  it("atomically rejects SQL operation and grantor mismatches without durable side effects", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-v6-negative-");
+    database.close();
+    migrateDatabase(databasePath);
+    const migrated = open(databasePath);
+    try {
+      seedAuthorityRows(migrated);
+      const before = {
+        grants: migrated.prepare("SELECT COUNT(*) AS count FROM task_authority_grants").get(),
+        events: migrated.prepare("SELECT COUNT(*) AS count FROM authority_events").get(),
+        idempotency: migrated.prepare("SELECT COUNT(*) AS count FROM task_authority_idempotency").get(),
+      };
+      const insert = migrated.transaction(
+        (grantId: string, operation: string, grantedByActor: string, eventId: string, keyHash: string) => {
+          migrated
+            .prepare(
+              `INSERT INTO authority_events
+                 (event_id, resource_type, resource_id, board_id, board_revision, resource_revision,
+                  event_ordinal, event_type, actor, outcome, details_json, created_at_ms)
+               VALUES (?, 'board', 'board-authority', 'board-authority', 9, 1, 0,
+                       'authority_grant_created', ?, 'success', '{}', 3000)`
+            )
+            .run(eventId, grantedByActor);
+          migrated
+            .prepare(
+              `INSERT INTO task_authority_grants
+                 (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation, granted_by_actor,
+                  expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id,
+                  parent_grant_id, lineage_kind)
+               VALUES (?, 'board-authority', 'task', 'task-authority', 'carol', ?, ?,
+                       8000, 'grant', NULL, 3000, ?, 'grant-1', 'delegated')`
+            )
+            .run(grantId, operation, grantedByActor, eventId);
+          migrated
+            .prepare(
+              `INSERT INTO task_authority_idempotency
+                 (command_kind, board_id, idempotency_key, idempotency_key_hash, request_hash,
+                  result_kind, result_id, canonical_response_json, created_at_ms)
+               VALUES ('grant', 'board-authority', ?, ?, ?, 'grant', ?, '{}', 3000)`
+            )
+            .run(keyHash, keyHash, `sha256:${"9".repeat(64)}`, grantId);
+        }
+      );
+
+      expect(() =>
+        insert("grant-operation-mismatch", "read_task", "bob", "event-operation-mismatch", `sha256:${"7".repeat(64)}`)
+      ).toThrow(/invalid parent grant lineage/);
+      expect(() =>
+        insert("grant-grantor-mismatch", "update", "mallory", "event-grantor-mismatch", `sha256:${"8".repeat(64)}`)
+      ).toThrow(/invalid parent grant lineage/);
+      expect({
+        grants: migrated.prepare("SELECT COUNT(*) AS count FROM task_authority_grants").get(),
+        events: migrated.prepare("SELECT COUNT(*) AS count FROM authority_events").get(),
+        idempotency: migrated.prepare("SELECT COUNT(*) AS count FROM task_authority_idempotency").get(),
+      }).toEqual(before);
+
+      insert("grant-valid-chain", "update", "bob", "event-valid-chain", `sha256:${"a".repeat(64)}`);
+      expect(migrated.prepare("SELECT operation, granted_by_actor FROM task_authority_grants WHERE grant_id = ?").get(
+        "grant-valid-chain"
+      )).toEqual({ operation: "update", granted_by_actor: "bob" });
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("keeps delegated identity constraints active after restart and repeated initialization", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-v6-restart-");
+    database.close();
+    migrateDatabase(databasePath);
+    const seeded = open(databasePath);
+    seedAuthorityRows(seeded);
+    seeded.close();
+
+    expect(migrateDatabase(databasePath)).toMatchObject({ fromVersion: 6, toVersion: 6, appliedVersions: [] });
+    const restarted = open(databasePath);
+    try {
+      expect(() =>
+        restarted
+          .prepare(
+            `INSERT INTO task_authority_grants
+               (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation, granted_by_actor,
+                expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id,
+                parent_grant_id, lineage_kind)
+             VALUES ('grant-restart-mismatch', 'board-authority', 'task', 'task-authority', 'carol',
+                     'read_task', 'bob', 8000, 'grant', NULL, 3000, 'event-approval', 'grant-1', 'delegated')`
+          )
+          .run()
+      ).toThrow(/invalid parent grant lineage/);
+    } finally {
+      restarted.close();
+    }
+  });
+});
+
+describe("schema v5 grant ancestry and storage hardening", () => {
+  it("migrates schema 4 additively without changing the applied schema-4 migration", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-v5-");
+    advanceToSchemaV4(database);
+    seedAuthorityRows(database);
+    const schema4 = database
+      .prepare("SELECT name, checksum FROM schema_migrations WHERE version = 4")
+      .get();
+    database.close();
+
+    expect(migrateDatabase(databasePath)).toMatchObject({ fromVersion: 4, toVersion: 6, appliedVersions: [5, 6] });
+    const migrated = open(databasePath);
+    try {
+      expect(migrated.prepare("SELECT name, checksum FROM schema_migrations WHERE version = 4").get()).toEqual(schema4);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(6);
+      expect(
+        migrated.prepare("SELECT name FROM pragma_table_info('task_authority_grants') WHERE name = 'parent_grant_id'").get()
+      ).toEqual({ name: "parent_grant_id" });
+      expect(
+        migrated.prepare("SELECT name FROM pragma_table_info('task_authority_idempotency') WHERE name = 'idempotency_key_hash'").get()
+      ).toEqual({ name: "idempotency_key_hash" });
+      expect(migrated.prepare("SELECT parent_grant_id FROM task_authority_grants WHERE grant_id = 'grant-1'").get()).toEqual({
+        parent_grant_id: null,
+      });
+      expect(migrated.prepare("SELECT lineage_kind FROM task_authority_grants WHERE grant_id = 'grant-1'").get()).toEqual({
+        lineage_kind: "legacy_unknown",
+      });
+      expect(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?").get(
+        "idx_task_authority_grants_parent"
+      )).toEqual({ name: "idx_task_authority_grants_parent" });
+    } finally {
+      migrated.close();
+    }
+
+    expect(migrateDatabase(databasePath)).toMatchObject({ fromVersion: 6, toVersion: 6, appliedVersions: [] });
+  });
+
+  it("enforces parent grant foreign keys, resource ancestry, canonical digests, and hashed idempotency storage", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-v5-constraints-");
+    database.close();
+    migrateDatabase(databasePath);
+    const migrated = open(databasePath);
+    try {
+      seedAuthorityRows(migrated);
+      migrated
+        .prepare(
+          `INSERT INTO task_authority_grants
+             (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation, granted_by_actor,
+              expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id, parent_grant_id, lineage_kind)
+           VALUES ('grant-child', 'board-authority', 'task', 'task-authority', 'carol', 'update', 'bob',
+                   8000, 'grant', NULL, 2002, 'event-approval', 'grant-1', 'delegated')`
+        )
+        .run();
+      expect(migrated.prepare("SELECT parent_grant_id FROM task_authority_grants WHERE grant_id = 'grant-child'").get()).toEqual({
+        parent_grant_id: "grant-1",
+      });
+      expect(() =>
+        migrated
+          .prepare(
+            `INSERT INTO task_authority_grants
+               (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation, granted_by_actor,
+                expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id, parent_grant_id, lineage_kind)
+             VALUES ('grant-missing', 'board-authority', 'task', 'task-authority', 'dave', 'update', 'bob',
+                     8000, 'grant', NULL, 2002, 'event-handoff', 'grant-absent', 'delegated')`
+          )
+          .run()
+      ).toThrow();
+
+      const malformedDigest = `sha256:${"a".repeat(63)}z`;
+      expect(() =>
+        migrated
+          .prepare(
+            `INSERT INTO task_authority_handoff_refs
+               (handoff_id, ordinal, provider, kind, external_id, digest)
+             VALUES ('handoff-1', 1, 'forgespec', 'task', 'bad-ref', ?)`
+          )
+          .run(malformedDigest)
+      ).toThrow(/canonical sha256 digest/);
+      expect(migrated.prepare("SELECT COUNT(*) AS count FROM task_authority_handoff_refs").get()).toEqual({ count: 1 });
+
+      const keyHash = `sha256:${"4".repeat(64)}`;
+      migrated
+        .prepare(
+          `INSERT INTO task_authority_idempotency
+             (command_kind, board_id, idempotency_key, idempotency_key_hash, request_hash,
+              result_kind, result_id, canonical_response_json, created_at_ms)
+           VALUES ('grant', 'board-authority', ?, ?, ?, 'grant', 'grant-child', '{}', 2004)`
+        )
+        .run(keyHash, keyHash, `sha256:${"5".repeat(64)}`);
+      expect(
+        migrated.prepare("SELECT idempotency_key, idempotency_key_hash FROM task_authority_idempotency WHERE command_kind = 'grant'").get()
+      ).toEqual({ idempotency_key: keyHash, idempotency_key_hash: keyHash });
+      expect(() =>
+        migrated
+          .prepare(
+            `INSERT INTO task_authority_idempotency
+               (command_kind, board_id, idempotency_key, idempotency_key_hash, request_hash,
+                result_kind, result_id, canonical_response_json, created_at_ms)
+             VALUES ('revoke', 'board-authority', 'raw-secret-key', ?, ?, 'revoke', 'revoke-2', '{}', 2005)`
+          )
+          .run(keyHash, `sha256:${"6".repeat(64)}`)
+      ).toThrow(/idempotency key hash/);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("fails closed after restart when persisted parent lineage is corrupt", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-v5-corrupt-");
+    database.close();
+    migrateDatabase(databasePath);
+    const damaged = open(databasePath);
+    try {
+      seedAuthorityRows(damaged);
+      damaged
+        .prepare(
+          `INSERT INTO task_authority_grants
+             (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation, granted_by_actor,
+              expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id, parent_grant_id, lineage_kind)
+           VALUES ('grant-child', 'board-authority', 'task', 'task-authority', 'carol', 'update', 'bob',
+                   8000, 'grant', NULL, 2002, 'event-approval', 'grant-1', 'delegated')`
+        )
+        .run();
+      damaged.exec("DROP TRIGGER immutable_task_authority_grants_update");
+      damaged
+        .prepare(
+          "UPDATE task_authority_grants SET parent_grant_id = 'grant-child', lineage_kind = 'delegated' WHERE grant_id = 'grant-1'"
+        )
+        .run();
+    } finally {
+      damaged.close();
+    }
+
+    expect(() => migrateDatabase(databasePath)).toThrow(/AUTH_STATE_UNAVAILABLE.*grant lineage/);
+  });
+});
+
+describe("schema v4 additive authority persistence", () => {
+  it("applies the ordered migration with six strict tables, lookup indexes, foreign keys, and immutable triggers", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-schema-");
+    database.close();
+
+    const result = migrateDatabase(databasePath);
+    const migrated = open(databasePath);
+    try {
+      expect(result.toVersion).toBe(6);
+      expect(result.appliedVersions).toEqual([3, 4, 5, 6]);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(6);
+      expect(
+        migrated
+          .prepare(
+            `SELECT name FROM sqlite_master
+              WHERE type = 'table'
+                AND (name LIKE 'task_authority_%' OR name = 'task_approval_provenance')
+              ORDER BY name`
+          )
+          .all()
+      ).toEqual(authorityTables.map((name) => ({ name })));
+      expect(
+        migrated
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_task_authority_%' ORDER BY name")
+          .all()
+      ).toEqual([
+        { name: "idx_task_authority_grants_effective" },
+        { name: "idx_task_authority_grants_parent" },
+        { name: "idx_task_authority_handoffs_resource" },
+        { name: "idx_task_authority_idempotency_key_hash" },
+        { name: "idx_task_authority_revocations_board" },
+      ]);
+      for (const table of authorityTables) {
+        expect(migrated.prepare(`PRAGMA foreign_key_list(${table})`).all().length).toBeGreaterThan(0);
+        const triggerCount = migrated
+          .prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?")
+          .get(table) as { count: number };
+        expect(triggerCount.count).toBeGreaterThanOrEqual(2);
+      }
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("preserves authority provenance, references, expiry, revocation, idempotency response, and event order across restart", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-restart-");
+    database.close();
+    migrateDatabase(databasePath);
+    const seeded = open(databasePath);
+    seedAuthorityRows(seeded);
+    seeded.close();
+
+    expect(migrateDatabase(databasePath)).toMatchObject({ fromVersion: 6, toVersion: 6, appliedVersions: [] });
+    const restarted = open(databasePath);
+    try {
+      expect(restarted.prepare("SELECT asserted_actor, boundary, mode, ref_external_id FROM task_approval_provenance").get()).toEqual({
+        asserted_actor: "alice",
+        boundary: "local-trusted-client",
+        mode: "direct-v1",
+        ref_external_id: "approval-1",
+      });
+      expect(restarted.prepare("SELECT expires_at_ms, origin_kind, origin_id FROM task_authority_grants").get()).toEqual({
+        expires_at_ms: 9000,
+        origin_kind: "handoff",
+        origin_id: "handoff-1",
+      });
+      expect(restarted.prepare("SELECT provider, external_id FROM task_authority_handoff_refs").get()).toEqual({
+        provider: "forgespec",
+        external_id: "task-authority",
+      });
+      expect(restarted.prepare("SELECT revoke_id, reason FROM task_authority_revocations").get()).toEqual({
+        revoke_id: "revoke-1",
+        reason: "complete",
+      });
+      expect(restarted.prepare("SELECT canonical_response_json FROM task_authority_idempotency").get()).toEqual({
+        canonical_response_json: '{"ok":true}',
+      });
+      expect(
+        restarted
+          .prepare("SELECT event_id FROM authority_events WHERE event_id LIKE 'event-%' ORDER BY board_revision, event_ordinal")
+          .all()
+      ).toEqual([
+        { event_id: "event-handoff" },
+        { event_id: "event-grant" },
+        { event_id: "event-revoke" },
+        { event_id: "event-approval" },
+      ]);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("rejects update and delete for every additive authority table", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-immutable-");
+    database.close();
+    migrateDatabase(databasePath);
+    const migrated = open(databasePath);
+    try {
+      seedAuthorityRows(migrated);
+      expect(() =>
+        migrated
+          .prepare(
+            `INSERT INTO task_authority_revocations
+               (revoke_id, grant_id, board_id, revoked_by_actor, created_at_ms, created_event_id)
+             VALUES ('revoke-duplicate', 'grant-1', 'board-authority', 'alice', 2004, 'event-approval')`
+          )
+          .run()
+      ).toThrow();
+      expect(() =>
+        migrated
+          .prepare(
+            `INSERT INTO task_authority_idempotency
+               (command_kind, board_id, idempotency_key, request_hash, result_kind, result_id,
+                canonical_response_json, created_at_ms)
+             SELECT command_kind, board_id, idempotency_key, request_hash, result_kind, result_id,
+                    canonical_response_json, created_at_ms
+               FROM task_authority_idempotency`
+          )
+          .run()
+      ).toThrow();
+      expect(() =>
+        migrated
+          .prepare(
+            `INSERT INTO task_approval_provenance
+               (board_id, task_id, gate_id, decision_event_id, asserted_actor, boundary, mode,
+                ref_provider, ref_kind, ref_external_id, ref_digest, created_at_ms)
+             SELECT board_id, task_id, 'other-gate', decision_event_id, asserted_actor, boundary, mode,
+                    ref_provider, ref_kind, ref_external_id, ref_digest, created_at_ms
+               FROM task_approval_provenance`
+          )
+          .run()
+      ).toThrow();
+      for (const table of authorityTables) {
+        expect(() => migrated.prepare(`UPDATE ${table} SET rowid = rowid`).run()).toThrow(/immutable/);
+        expect(() => migrated.prepare(`DELETE FROM ${table}`).run()).toThrow(/immutable/);
+      }
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("fails closed at startup when a required durable authority table is unavailable", () => {
+    const { path: databasePath, database } = createV2Database("forgespec-authority-missing-");
+    database.close();
+    migrateDatabase(databasePath);
+    const damaged = open(databasePath);
+    damaged.exec("DROP TABLE task_authority_revocations");
+    damaged.close();
+
+    expect(() => migrateDatabase(databasePath)).toThrow(/AUTH_STATE_UNAVAILABLE.*task_authority_revocations/);
+  });
 });
 
 describe("schema v3 migration and historical task contract", () => {
@@ -60,8 +571,8 @@ describe("schema v3 migration and historical task contract", () => {
         )
         .all() as Array<{ name: string }>;
 
-      expect(result.toVersion).toBe(3);
-      expect(migrated.pragma("user_version", { simple: true })).toBe(3);
+      expect(result.toVersion).toBe(6);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(6);
       expect(columns.map(({ name }) => name)).toEqual([
         "version_id",
         "board_id",
@@ -133,7 +644,7 @@ describe("schema v3 migration and historical task contract", () => {
     try {
       expect(unchanged.pragma("user_version", { simple: true })).toBe(2);
       expect(unchanged.prepare("SELECT name FROM sqlite_master WHERE name = 'direct_task_versions'").get()).toBeUndefined();
-      expect(unchanged.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({ count: 2 });
+      expect(unchanged.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({ count: 5 });
     } finally {
       unchanged.close();
     }
@@ -252,7 +763,7 @@ describe("ForgeSpec 1.2.2 migration", () => {
       notes: '[{"text":"kept","timestamp":"2026-01-01T00:00:00.000Z"}]',
     });
     expect(database.prepare("SELECT COUNT(*) AS count FROM file_reservations").get()).toEqual({ count: 1 });
-    expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({ count: 3 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({ count: 6 });
     database.close();
   });
 
@@ -362,11 +873,14 @@ describe("startup migration preflight", () => {
     expect(result.appliedVersions).toContain(3);
     const migrated = open(databasePath);
     try {
-      expect(migrated.pragma("user_version", { simple: true })).toBe(3);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(6);
       expect(migrated.prepare("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
         { version: 1 },
         { version: 2 },
         { version: 3 },
+        { version: 4 },
+        { version: 5 },
+        { version: 6 },
       ]);
     } finally {
       migrated.close();

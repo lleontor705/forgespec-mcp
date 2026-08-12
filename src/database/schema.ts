@@ -353,3 +353,214 @@ export const DIRECT_TASK_HISTORY_SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_task_versions_task_history
     ON direct_task_versions(task_id, board_revision, task_revision);
 `;
+
+export const DIRECT_AUTHORITY_PERSISTENCE_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS task_authority_handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    board_id TEXT NOT NULL REFERENCES direct_boards(board_id) ON DELETE RESTRICT,
+    from_actor TEXT NOT NULL,
+    to_actor TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('board', 'task')),
+    resource_id TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    created_event_id TEXT NOT NULL UNIQUE REFERENCES authority_events(event_id) ON DELETE RESTRICT,
+    CHECK (expires_at_ms > created_at_ms)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS task_authority_handoff_refs (
+    handoff_id TEXT NOT NULL REFERENCES task_authority_handoffs(handoff_id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    provider TEXT NOT NULL CHECK (provider IN ('forgespec', 'cortex')),
+    kind TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    digest TEXT NOT NULL CHECK (digest GLOB 'sha256:[0-9a-f]*' AND length(digest) = 71),
+    PRIMARY KEY (handoff_id, ordinal)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS task_authority_grants (
+    grant_id TEXT PRIMARY KEY,
+    board_id TEXT NOT NULL REFERENCES direct_boards(board_id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('board', 'task')),
+    resource_id TEXT NOT NULL,
+    grantee_actor TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('read_board', 'read_task', 'add', 'update', 'approve', 'recover', 'grant', 'handoff', 'revoke')),
+    granted_by_actor TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    origin_kind TEXT NOT NULL CHECK (origin_kind IN ('grant', 'handoff')),
+    origin_id TEXT REFERENCES task_authority_handoffs(handoff_id) ON DELETE RESTRICT,
+    created_at_ms INTEGER NOT NULL,
+    created_event_id TEXT NOT NULL UNIQUE REFERENCES authority_events(event_id) ON DELETE RESTRICT,
+    CHECK (expires_at_ms > created_at_ms),
+    CHECK ((origin_kind = 'grant' AND origin_id IS NULL) OR (origin_kind = 'handoff' AND origin_id IS NOT NULL))
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS task_authority_revocations (
+    revoke_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL UNIQUE REFERENCES task_authority_grants(grant_id) ON DELETE RESTRICT,
+    board_id TEXT NOT NULL REFERENCES direct_boards(board_id) ON DELETE RESTRICT,
+    revoked_by_actor TEXT NOT NULL,
+    reason TEXT,
+    created_at_ms INTEGER NOT NULL,
+    created_event_id TEXT NOT NULL UNIQUE REFERENCES authority_events(event_id) ON DELETE RESTRICT
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS task_authority_idempotency (
+    command_kind TEXT NOT NULL CHECK (command_kind IN ('grant', 'handoff', 'revoke')),
+    board_id TEXT NOT NULL REFERENCES direct_boards(board_id) ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL CHECK (request_hash GLOB 'sha256:[0-9a-f]*' AND length(request_hash) = 71),
+    result_kind TEXT NOT NULL,
+    result_id TEXT NOT NULL,
+    canonical_response_json TEXT NOT NULL CHECK (json_valid(canonical_response_json)),
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (command_kind, board_id, idempotency_key)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS task_approval_provenance (
+    board_id TEXT NOT NULL REFERENCES direct_boards(board_id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL REFERENCES direct_tasks(task_id) ON DELETE RESTRICT,
+    gate_id TEXT NOT NULL,
+    decision_event_id TEXT NOT NULL UNIQUE REFERENCES authority_events(event_id) ON DELETE RESTRICT,
+    asserted_actor TEXT NOT NULL,
+    boundary TEXT NOT NULL CHECK (boundary = 'local-trusted-client'),
+    mode TEXT NOT NULL CHECK (mode = 'direct-v1'),
+    ref_provider TEXT NOT NULL,
+    ref_kind TEXT NOT NULL,
+    ref_external_id TEXT NOT NULL,
+    ref_digest TEXT NOT NULL CHECK (ref_digest GLOB 'sha256:[0-9a-f]*' AND length(ref_digest) = 71),
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (board_id, task_id, gate_id, decision_event_id)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_task_authority_grants_effective
+    ON task_authority_grants(grantee_actor, operation, resource_kind, resource_id, expires_at_ms, grant_id);
+  CREATE INDEX IF NOT EXISTS idx_task_authority_handoffs_resource
+    ON task_authority_handoffs(board_id, resource_kind, resource_id, expires_at_ms, handoff_id);
+  CREATE INDEX IF NOT EXISTS idx_task_authority_revocations_board
+    ON task_authority_revocations(board_id, grant_id, created_at_ms);
+
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_grants_update
+    BEFORE UPDATE ON task_authority_grants BEGIN SELECT RAISE(ABORT, 'task authority grants are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_grants_delete
+    BEFORE DELETE ON task_authority_grants BEGIN SELECT RAISE(ABORT, 'task authority grants are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_revocations_update
+    BEFORE UPDATE ON task_authority_revocations BEGIN SELECT RAISE(ABORT, 'task authority revocations are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_revocations_delete
+    BEFORE DELETE ON task_authority_revocations BEGIN SELECT RAISE(ABORT, 'task authority revocations are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_handoffs_update
+    BEFORE UPDATE ON task_authority_handoffs BEGIN SELECT RAISE(ABORT, 'task authority handoffs are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_handoffs_delete
+    BEFORE DELETE ON task_authority_handoffs BEGIN SELECT RAISE(ABORT, 'task authority handoffs are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_handoff_refs_update
+    BEFORE UPDATE ON task_authority_handoff_refs BEGIN SELECT RAISE(ABORT, 'task authority handoff refs are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_handoff_refs_delete
+    BEFORE DELETE ON task_authority_handoff_refs BEGIN SELECT RAISE(ABORT, 'task authority handoff refs are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_idempotency_update
+    BEFORE UPDATE ON task_authority_idempotency BEGIN SELECT RAISE(ABORT, 'task authority idempotency is immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_authority_idempotency_delete
+    BEFORE DELETE ON task_authority_idempotency BEGIN SELECT RAISE(ABORT, 'task authority idempotency is immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_approval_provenance_update
+    BEFORE UPDATE ON task_approval_provenance BEGIN SELECT RAISE(ABORT, 'task approval provenance is immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS immutable_task_approval_provenance_delete
+    BEFORE DELETE ON task_approval_provenance BEGIN SELECT RAISE(ABORT, 'task approval provenance is immutable'); END;
+`;
+
+// Schema v5 is intentionally separate from the applied v4 definition above.
+// Existing authority rows remain explicit legacy/unknown roots until a later
+// authority operation can establish a parent without inventing ancestry.
+export const DIRECT_AUTHORITY_LINEAGE_PARENT_COLUMN_SQL = `
+  ALTER TABLE task_authority_grants
+    ADD COLUMN parent_grant_id TEXT
+      REFERENCES task_authority_grants(grant_id) ON DELETE RESTRICT
+      CHECK (parent_grant_id IS NULL OR parent_grant_id <> grant_id);
+`;
+
+export const DIRECT_AUTHORITY_LINEAGE_KIND_COLUMN_SQL = `
+  ALTER TABLE task_authority_grants
+    ADD COLUMN lineage_kind TEXT NOT NULL DEFAULT 'legacy_unknown'
+      CHECK (lineage_kind IN ('owner_root', 'delegated', 'legacy_unknown'));
+`;
+
+export const DIRECT_AUTHORITY_IDEMPOTENCY_HASH_COLUMN_SQL = `
+  ALTER TABLE task_authority_idempotency
+    ADD COLUMN idempotency_key_hash TEXT
+      CHECK (
+        idempotency_key_hash IS NULL OR (
+          length(idempotency_key_hash) = 71
+          AND substr(idempotency_key_hash, 1, 7) = 'sha256:'
+          AND substr(idempotency_key_hash, 8) NOT GLOB '*[^0-9a-f]*'
+        )
+      );
+`;
+
+export const DIRECT_AUTHORITY_LINEAGE_CONSTRAINTS_SQL = `
+  CREATE INDEX IF NOT EXISTS idx_task_authority_grants_parent
+    ON task_authority_grants(parent_grant_id, grant_id)
+    WHERE parent_grant_id IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_task_authority_idempotency_key_hash
+    ON task_authority_idempotency(command_kind, board_id, idempotency_key_hash)
+    WHERE idempotency_key_hash IS NOT NULL;
+
+  CREATE TRIGGER IF NOT EXISTS task_authority_grants_lineage_insert
+    BEFORE INSERT ON task_authority_grants
+    WHEN
+      (NEW.lineage_kind = 'delegated' AND NEW.parent_grant_id IS NULL)
+      OR (NEW.lineage_kind <> 'delegated' AND NEW.parent_grant_id IS NOT NULL)
+      OR (
+        NEW.parent_grant_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+            FROM task_authority_grants AS parent
+           WHERE parent.grant_id = NEW.parent_grant_id
+             AND parent.board_id = NEW.board_id
+             AND parent.resource_kind = NEW.resource_kind
+             AND parent.resource_id = NEW.resource_id
+             AND parent.expires_at_ms >= NEW.expires_at_ms
+        )
+      )
+    BEGIN SELECT RAISE(ABORT, 'invalid parent grant lineage'); END;
+
+  CREATE TRIGGER IF NOT EXISTS task_authority_handoff_refs_digest_insert
+    BEFORE INSERT ON task_authority_handoff_refs
+    WHEN length(NEW.digest) <> 71
+      OR substr(NEW.digest, 1, 7) <> 'sha256:'
+      OR substr(NEW.digest, 8) GLOB '*[^0-9a-f]*'
+    BEGIN SELECT RAISE(ABORT, 'reference requires canonical sha256 digest'); END;
+  CREATE TRIGGER IF NOT EXISTS task_approval_provenance_digest_insert
+    BEFORE INSERT ON task_approval_provenance
+    WHEN length(NEW.ref_digest) <> 71
+      OR substr(NEW.ref_digest, 1, 7) <> 'sha256:'
+      OR substr(NEW.ref_digest, 8) GLOB '*[^0-9a-f]*'
+    BEGIN SELECT RAISE(ABORT, 'provenance requires canonical sha256 digest'); END;
+
+  CREATE TRIGGER IF NOT EXISTS task_authority_idempotency_hash_insert
+    BEFORE INSERT ON task_authority_idempotency
+    WHEN NEW.idempotency_key_hash IS NOT NULL
+      AND NEW.idempotency_key <> NEW.idempotency_key_hash
+    BEGIN SELECT RAISE(ABORT, 'idempotency key hash must replace raw key storage'); END;
+`;
+
+export const DIRECT_AUTHORITY_LINEAGE_SCHEMA_SQL = [
+  DIRECT_AUTHORITY_LINEAGE_PARENT_COLUMN_SQL,
+  DIRECT_AUTHORITY_LINEAGE_KIND_COLUMN_SQL,
+  DIRECT_AUTHORITY_IDEMPOTENCY_HASH_COLUMN_SQL,
+  DIRECT_AUTHORITY_LINEAGE_CONSTRAINTS_SQL,
+].join("\n");
+
+// Schema v6 is additive because schema v5 has already been applied. The
+// original v5 trigger remains unchanged and this trigger narrows delegated
+// inserts to the exact operation and actor identity held by their parent.
+export const DIRECT_AUTHORITY_LINEAGE_IDENTITY_SCHEMA_SQL = `
+  CREATE TRIGGER IF NOT EXISTS task_authority_grants_lineage_identity_insert
+    BEFORE INSERT ON task_authority_grants
+    WHEN NEW.parent_grant_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+          FROM task_authority_grants AS parent
+         WHERE parent.grant_id = NEW.parent_grant_id
+           AND parent.operation = NEW.operation
+           AND parent.grantee_actor = NEW.granted_by_actor
+      )
+    BEGIN SELECT RAISE(ABORT, 'invalid parent grant lineage identity'); END;
+`;

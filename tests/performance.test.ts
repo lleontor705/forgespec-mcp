@@ -15,7 +15,10 @@ beforeAll(() => {
   database = new Database(databasePath);
   database.pragma("foreign_keys = ON");
 
-  if (LATEST_SCHEMA_VERSION !== 3 || !database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'direct_task_versions'").get()) {
+  if (
+    database.pragma("user_version", { simple: true }) !== LATEST_SCHEMA_VERSION
+    || !database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'direct_task_versions'").get()
+  ) {
     return;
   }
 
@@ -60,8 +63,8 @@ describe("historical task query performance contract", () => {
     expect(source).toMatch(/beforeAll\([\s\S]*?\},\s*30_000\);/);
   });
 
-  it("qualifies schema v3 and the snapshot selection indexes", () => {
-    expect(LATEST_SCHEMA_VERSION).toBe(3);
+  it("qualifies the latest schema and the snapshot selection indexes", () => {
+    expect(database.pragma("user_version", { simple: true })).toBe(LATEST_SCHEMA_VERSION);
 
     const table = database
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'direct_task_versions'")

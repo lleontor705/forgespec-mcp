@@ -43,6 +43,15 @@ export const ALL_DIRECT_V1_CAPABILITIES = [
   ...DIRECT_V1_P1_CAPABILITIES,
 ] as const;
 
+export const TASK_AUTHORITY_CAPABILITY_ID = "task-authority" as const;
+export const TASK_AUTHORITY_CAPABILITY_VERSION = "1.0.0" as const;
+export const TASK_AUTHORITY_CAPABILITY = "task-authority@1.0.0" as const;
+
+const DEFAULT_ADVERTISED_CAPABILITIES = [
+  ...ALL_DIRECT_V1_CAPABILITIES,
+  TASK_AUTHORITY_CAPABILITY_ID,
+] as const;
+
 export interface CapabilityNegotiationOptions {
   serverVersion?: string;
   availableCapabilities?: readonly string[];
@@ -52,10 +61,21 @@ export function negotiateCapabilities(
   input: CapabilitiesInput,
   options: CapabilityNegotiationOptions = {}
 ) {
-  const available = new Set(options.availableCapabilities ?? ALL_DIRECT_V1_CAPABILITIES);
+  const available = new Set(options.availableCapabilities ?? DEFAULT_ADVERTISED_CAPABILITIES);
+  const taskAuthoritySelected = (input.required ?? []).some(
+    ({ id, range }) => id === TASK_AUTHORITY_CAPABILITY_ID
+      && available.has(id)
+      && rangeContains(range, TASK_AUTHORITY_CAPABILITY_VERSION)
+  );
   const capabilities = [...available]
     .sort()
-    .map((id) => ({ id, supported: { ...DIRECT_RANGE }, selected: "1.0.0" }));
+    .map((id) => ({
+      id,
+      supported: { ...DIRECT_RANGE },
+      ...(id !== TASK_AUTHORITY_CAPABILITY_ID || taskAuthoritySelected
+        ? { selected: TASK_AUTHORITY_CAPABILITY_VERSION }
+        : {}),
+    }));
   const missing: CapabilityRequirement[] = [];
   const unavailableOptional: CapabilityRequirement[] = [];
   const incompatible: Array<{

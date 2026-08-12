@@ -3,7 +3,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { migrateDatabase, qualifyDatabase } from "../database/migrations.js";
+import { LATEST_SCHEMA_VERSION, migrateDatabase, qualifyDatabase } from "../database/migrations.js";
 
 export interface RuntimeEvidence {
   schema_version: 1;
@@ -55,7 +55,7 @@ export async function collectRuntimeEvidence(options: RuntimeSmokeOptions): Prom
         json1: qualification.json1,
         wal: qualification.wal,
       };
-      evidence.migration_ok = database.pragma("user_version", { simple: true }) === 3;
+      evidence.migration_ok = database.pragma("user_version", { simple: true }) === LATEST_SCHEMA_VERSION;
     } finally {
       database.close();
     }

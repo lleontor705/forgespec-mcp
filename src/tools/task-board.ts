@@ -4,9 +4,11 @@ import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { directErrorResponse } from "../core/errors.js";
 import { getDb } from "../database/index.js";
-import { TASK_STATUSES, TASK_PRIORITIES } from "../types/index.js";
+import { TASK_OPERATIONS, TASK_STATUSES, TASK_PRIORITIES } from "../types/index.js";
+import type { GrantCommand, HandoffCommand, RevokeCommand } from "../types/index.js";
 import { generateId } from "../utils/id.js";
 import {
+  TaskConflictError,
   TaskService,
   type DirectBoardCreateInput,
   type DirectTaskAddInput,
@@ -19,6 +21,8 @@ import {
   type DirectApproveInput,
 } from "../services/task-service.js";
 import { QueryService } from "../services/query-service.js";
+import { TaskAuthorityService } from "../services/task-authority-service.js";
+import { observeServerTime, SystemClock } from "../core/clock.js";
 
 type ToolResponse = Record<string, unknown>;
 
@@ -50,10 +54,42 @@ export function registerTaskBoardTools(
     external_id: z.string().min(1).max(1024),
     digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
   }).strict();
+  const ApprovalAssertedProvenanceSchema = z.object({
+    kind: z.literal("asserted"),
+    source: z.literal("explicit").optional(),
+    asserted_actor: z.string().min(1).max(256),
+    boundary: z.literal("local-trusted-client"),
+    mode: z.literal("direct-v1"),
+    approval_ref: EvidenceRefSchema,
+  }).strict();
   const ApprovalGateSchema = z.object({
     gate_id: z.string().min(1).max(128),
     required_for: z.array(z.enum(TASK_STATUSES)).min(1).max(TASK_STATUSES.length),
     allowed_actors: z.array(z.string().min(1).max(256)).min(1).max(100),
+  }).strict();
+  const TaskAuthorityCapabilitySchema = z.object({
+    coordinationMode: z.literal("direct-v1"),
+    apiVersion: z.literal("1.0.0"),
+    schemaVersion: z.literal("1.0.0"),
+    negotiated: z.array(z.string().min(1).max(128)).min(1).max(100).refine(
+      (items) => items.filter((item) => item.startsWith("task-authority@")).length === 1
+        && items.includes("task-authority@1.0.0"),
+      "Exact task-authority@1.0.0 negotiation is required"
+    ),
+  }).strict();
+  const AuthorityResourceSchema = z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("board"), boardId: z.string().min(1).max(256) }).strict(),
+    z.object({
+      kind: z.literal("task"),
+      boardId: z.string().min(1).max(256),
+      taskId: z.string().min(1).max(256),
+    }).strict(),
+  ]);
+  const AuthorityReferenceSchema = z.object({
+    provider: z.enum(["forgespec", "cortex"]),
+    kind: z.string().min(1).max(128),
+    externalId: z.string().min(1).max(1024),
+    digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
   }).strict();
   // ── Create Board ───────────────────────────────────
   const TaskInputSchema = z.object({
@@ -191,6 +227,7 @@ export function registerTaskBoardTools(
       schema_version: z.string().max(32).optional(),
       actor: z.string().min(1).max(256).optional(),
       idempotency_key: z.string().min(1).max(256).optional(),
+      capability: TaskAuthorityCapabilitySchema.optional(),
     },
     async (input) => {
       const { board_id, title, description, priority, spec_ref, acceptance_criteria, dependencies } = input;
@@ -244,10 +281,10 @@ export function registerTaskBoardTools(
       const db = databaseProvider();
       let snapshot: { board: Record<string, unknown>; tasks: Record<string, unknown>[] };
       try {
-        snapshot = new TaskService(db).getBoard(board_id);
+        snapshot = await new TaskService(db).readLegacyBoard(board_id);
       } catch {
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ error: `Board ${board_id} not found` }) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ error: "Board not found" }) }],
         };
       }
       const { board, tasks } = snapshot;
@@ -413,6 +450,7 @@ export function registerTaskBoardTools(
       attempt_ids: z.array(z.string().max(256)).max(100).optional(),
       actor: z.string().min(1).max(256),
       idempotency_key: z.string().min(1).max(256),
+      capability: TaskAuthorityCapabilitySchema.optional(),
       coordination_mode: z.literal("direct-v1"),
       api_version: z.literal("1.0.0"),
       schema_version: z.literal("1.0.0"),
@@ -440,6 +478,7 @@ export function registerTaskBoardTools(
       })).max(100).optional(),
       actor: z.string().min(1).max(256),
       idempotency_key: z.string().min(1).max(256),
+      capability: TaskAuthorityCapabilitySchema.optional(),
       coordination_mode: z.literal("direct-v1"),
       api_version: z.literal("1.0.0"),
       schema_version: z.literal("1.0.0"),
@@ -455,16 +494,18 @@ export function registerTaskBoardTools(
 
   server.tool(
     "tb_approve",
-    "Record an immutable direct-v1 approval decision for a declared task gate.",
+    "Record an immutable direct-v1 approval decision with asserted provenance for a declared task gate. Asserted provenance is not authentication.",
     {
       task_id: z.string().max(256),
       gate_id: z.string().min(1).max(128),
       decision: z.enum(["allow", "deny"]),
       expected_revision: z.number().int().min(1),
+      asserted_provenance: ApprovalAssertedProvenanceSchema.optional(),
       evidence_links: z.array(EvidenceRefSchema).max(100).optional(),
       reason: z.string().max(4096).optional(),
       actor: z.string().min(1).max(256),
       idempotency_key: z.string().min(1).max(256),
+      capability: TaskAuthorityCapabilitySchema.optional(),
       coordination_mode: z.literal("direct-v1"),
       api_version: z.literal("1.0.0"),
       schema_version: z.literal("1.0.0"),
@@ -478,9 +519,78 @@ export function registerTaskBoardTools(
     }
   );
 
+  server.tool(
+    "tb_grant",
+    "Create an attenuated, expiring task-authority grant. Requires exact task-authority@1.0.0 negotiation.",
+    {
+      actor: z.string().min(1).max(256),
+      resource: AuthorityResourceSchema,
+      granteeActor: z.string().min(1).max(256),
+      operation: z.enum(TASK_OPERATIONS),
+      expiresAtMs: z.number().int().nonnegative(),
+      idempotencyKey: z.string().min(1).max(256),
+      expectedBoardRevision: z.number().int().min(1),
+      capability: TaskAuthorityCapabilitySchema,
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).grantAuthority(input as GrantCommand) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_handoff",
+    "Create a reference-only attenuated handoff. Requires exact task-authority@1.0.0 negotiation.",
+    {
+      actor: z.string().min(1).max(256),
+      toActor: z.string().min(1).max(256),
+      resource: AuthorityResourceSchema,
+      operations: z.array(z.enum(TASK_OPERATIONS)).min(1).max(TASK_OPERATIONS.length),
+      expiresAtMs: z.number().int().nonnegative(),
+      refs: z.array(AuthorityReferenceSchema).min(1).max(100),
+      idempotencyKey: z.string().min(1).max(256),
+      expectedBoardRevision: z.number().int().min(1),
+      capability: TaskAuthorityCapabilitySchema,
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).handoffAuthority(input as HandoffCommand) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
+  server.tool(
+    "tb_revoke",
+    "Append an authority revocation without changing board ownership. Requires exact task-authority@1.0.0 negotiation.",
+    {
+      actor: z.string().min(1).max(256),
+      grantId: z.string().min(1).max(256),
+      reason: z.string().max(4096).optional(),
+      idempotencyKey: z.string().min(1).max(256),
+      expectedBoardRevision: z.number().int().min(1),
+      capability: TaskAuthorityCapabilitySchema,
+    },
+    async (input) => {
+      try {
+        return success(new TaskService(databaseProvider()).revokeAuthority(input as RevokeCommand) as unknown as ToolResponse);
+      } catch (error) {
+        return directFailure(error);
+      }
+    }
+  );
+
   const TaskQuerySchema = {
     board_id: z.string().max(256),
     actor: z.string().min(1).max(256),
+    coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+    api_version: z.string().max(32).optional(),
+    schema_version: z.string().max(32).optional(),
+    capability: TaskAuthorityCapabilitySchema.optional(),
     status: z.array(z.enum(TASK_STATUSES)).max(TASK_STATUSES.length).optional(),
     ready: z.boolean().optional(),
     work_unit: z.string().min(1).max(128).optional(),
@@ -496,7 +606,7 @@ export function registerTaskBoardTools(
     TaskQuerySchema,
     async (input) => {
       try {
-        return success(new QueryService(databaseProvider(), { cursorSecret }).queryTasks(input) as unknown as ToolResponse);
+        return success(await new QueryService(databaseProvider(), { cursorSecret }).queryTasks(input) as unknown as ToolResponse);
       } catch (error) {
         return directFailure(error);
       }
@@ -509,7 +619,7 @@ export function registerTaskBoardTools(
     TaskQuerySchema,
     async (input) => {
       try {
-        return success(new QueryService(databaseProvider(), { cursorSecret }).batchStatus(input) as unknown as ToolResponse);
+        return success(await new QueryService(databaseProvider(), { cursorSecret }).batchStatus(input) as unknown as ToolResponse);
       } catch (error) {
         return directFailure(error);
       }
@@ -522,6 +632,10 @@ export function registerTaskBoardTools(
     {
       board_id: z.string().max(256),
       actor: z.string().min(1).max(256),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
+      capability: TaskAuthorityCapabilitySchema.optional(),
       task_id: z.string().max(256).optional(),
       since_revision: z.number().int().min(0).optional(),
       event_type: z.array(z.string().min(1).max(128)).max(100).optional(),
@@ -530,7 +644,7 @@ export function registerTaskBoardTools(
     },
     async (input) => {
       try {
-        return success(new QueryService(databaseProvider(), { cursorSecret }).queryEvents(input) as unknown as ToolResponse);
+        return success(await new QueryService(databaseProvider(), { cursorSecret }).queryEvents(input) as unknown as ToolResponse);
       } catch (error) {
         return directFailure(error);
       }
@@ -554,6 +668,7 @@ export function registerTaskBoardTools(
       attempt_id: z.string().max(256).optional(),
       claim_token: z.string().min(1).max(512).optional(),
       evidence_links: z.array(EvidenceRefSchema).max(100).optional(),
+      capability: TaskAuthorityCapabilitySchema.optional(),
     },
     async (input) => {
       const { task_id, status, notes } = input;
@@ -677,31 +792,69 @@ export function registerTaskBoardTools(
     "List all tasks that are ready to be worked on (no unresolved dependencies).",
     {
       board_id: z.string().describe("Board ID"),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
+      actor: z.string().min(1).max(256).optional(),
+      capability: TaskAuthorityCapabilitySchema.optional(),
     },
-    async ({ board_id }) => {
+    async (input) => {
+      const { board_id } = input;
       const db = databaseProvider();
-      const tasks = db
+      try {
+        const response = db.transaction(() => {
+          const isDirectBoard = Boolean(db.prepare(
+            "SELECT 1 FROM direct_boards WHERE board_id = ?"
+          ).get(board_id));
+          if (isDirectBoard) {
+        const directActor = input.coordination_mode === "direct-v1"
+          && input.api_version === "1.0.0"
+          && input.schema_version === "1.0.0"
+          ? input.actor
+          : undefined;
+        const decision = new TaskAuthorityService(db).authorizeTaskOperation(db, {
+          actor: directActor ?? "",
+          operation: "read_board",
+          resource: { kind: "board", boardId: board_id },
+          nowMs: observeServerTime(db, new SystemClock()),
+          capability: directActor ? input.capability : undefined,
+        });
+        if (!decision.allowed) {
+          throw new TaskConflictError(
+            "Resource is not available",
+            "authorization",
+            "RESOURCE_NOT_AVAILABLE"
+          );
+        }
+          }
+          const tasks = db
         .prepare(`SELECT * FROM tasks WHERE board_id = ? AND status IN ('ready', 'backlog') ORDER BY
                   CASE priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 WHEN 'p3' THEN 3 END`)
         .all(board_id) as Record<string, unknown>[];
 
-      const unblocked = tasks.filter((t) => {
+          const unblocked = tasks.filter((t) => {
         const deps = JSON.parse(t.dependencies as string) as string[];
         if (deps.length === 0) return true;
         const done = db
           .prepare(`SELECT COUNT(*) as c FROM tasks WHERE id IN (${deps.map(() => "?").join(",")}) AND status = 'done'`)
           .get(...deps) as Record<string, number>;
         return done.c === deps.length;
-      });
+          });
 
+          return { isDirectBoard, board_id, unblocked_count: unblocked.length, tasks: unblocked };
+        }).deferred();
+        if (response.isDirectBoard) return success(response);
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ board_id, unblocked_count: unblocked.length, tasks: unblocked }),
+            text: JSON.stringify({ board_id: response.board_id, unblocked_count: response.unblocked_count, tasks: response.tasks }),
           },
         ],
       };
+      } catch (error) {
+        return directFailure(error);
+      }
     }
   );
 
@@ -714,11 +867,12 @@ export function registerTaskBoardTools(
     },
     async ({ task_id }) => {
       const db = databaseProvider();
-      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id);
-      if (!task) {
+      try {
+        const task = await new TaskService(db).readLegacyTask(task_id);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ task }) }] };
+      } catch {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify({ task }) }] };
     }
   );
 
@@ -731,9 +885,7 @@ export function registerTaskBoardTools(
     },
     async ({ project }) => {
       const db = databaseProvider();
-      const boards = project
-        ? db.prepare(`SELECT * FROM boards WHERE project = ? ORDER BY created_at DESC`).all(project)
-        : db.prepare(`SELECT * FROM boards ORDER BY created_at DESC`).all();
+      const boards = await new TaskService(db).listLegacyBoards(project);
 
       return {
         content: [{ type: "text" as const, text: JSON.stringify({ boards }) }],

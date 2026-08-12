@@ -1,16 +1,23 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 import { generateId } from "../src/utils/id.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { migrateDatabase } from "../src/database/migrations.js";
+import { LATEST_SCHEMA_VERSION, migrateDatabase } from "../src/database/migrations.js";
 import { registerTaskBoardTools } from "../src/tools/task-board.js";
 import { createServer } from "../src/server.js";
-import { createTestDatabase, removeTestDatabases } from "./helpers/database.js";
+import { FakeClock } from "../src/core/clock.js";
+import { TaskAuthorityService } from "../src/services/task-authority-service.js";
+import { TaskConflictError, TaskService } from "../src/services/task-service.js";
+import type { CapabilityContext, GrantCommand, HandoffCommand, RevokeCommand } from "../src/types/index.js";
+import { createTestDatabase, openTestDatabase, removeTestDatabases } from "./helpers/database.js";
 
 let DatabaseConstructor: typeof Database | undefined;
 try {
@@ -23,6 +30,82 @@ try {
 }
 const databaseAvailable = DatabaseConstructor !== undefined;
 const nativeDescribe = databaseAvailable ? describe : describe.skip;
+
+const unblockedRaceWorkerSource = String.raw`
+  const { parentPort, workerData } = require("node:worker_threads");
+  const Database = require("better-sqlite3");
+  const { register } = require("tsx/esm/api");
+  register();
+  (async () => {
+    const database = new Database(workerData.databasePath);
+    database.pragma("journal_mode = WAL");
+    database.pragma("busy_timeout = 5000");
+    database.pragma("foreign_keys = ON");
+    parentPort.postMessage({ type: "ready" });
+    Atomics.wait(workerData.gate, 0, 0);
+    try {
+      let value;
+      if (workerData.command.kind === "revoke") {
+        const [{ TaskService }, { FakeClock }] = await Promise.all([
+          import(workerData.serviceUrl), import(workerData.clockUrl),
+        ]);
+        value = new TaskService(database, { clock: new FakeClock(workerData.nowMs) })
+          .revokeAuthority(workerData.command.input);
+      } else {
+        const [{ createServer }, { Client }, { InMemoryTransport }] = await Promise.all([
+          import(workerData.serverUrl), import(workerData.clientUrl), import(workerData.transportUrl),
+        ]);
+        const server = createServer({ database: () => database });
+        const client = new Client({ name: "unblocked-race-worker", version: "1.0.0" });
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+        try { value = await client.callTool({ name: "tb_unblocked", arguments: workerData.command.input }); }
+        finally { await client.close(); await server.close(); }
+      }
+      parentPort.postMessage({ type: "result", outcome: { ok: true, value } });
+    } catch (error) {
+      parentPort.postMessage({ type: "result", outcome: { ok: false, code: error && error.code, message: String(error?.message ?? error) } });
+    } finally { database.close(); }
+  })().catch((error) => parentPort.postMessage({ type: "fatal", message: String(error?.stack ?? error) }));
+`;
+
+async function startUnblockedRaceWorkers(databasePath: string, nowMs: number, commands: unknown[]) {
+  const require = createRequire(import.meta.url);
+  const moduleUrls = {
+    serviceUrl: pathToFileURL(`${process.cwd()}/src/services/task-service.ts`).href,
+    clockUrl: pathToFileURL(`${process.cwd()}/src/core/clock.ts`).href,
+    serverUrl: pathToFileURL(`${process.cwd()}/src/server.ts`).href,
+    clientUrl: pathToFileURL(require.resolve("@modelcontextprotocol/sdk/client/index.js")).href,
+    transportUrl: pathToFileURL(require.resolve("@modelcontextprotocol/sdk/inMemory.js")).href,
+  };
+  const gates = commands.map(() => new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)));
+  const workers = commands.map((command, index) => new Worker(unblockedRaceWorkerSource, {
+    eval: true, workerData: { databasePath, nowMs, command, gate: gates[index], ...moduleUrls },
+  }));
+  const channels = workers.map((worker) => {
+    let markReady!: () => void;
+    let resolveResult!: (outcome: { ok: boolean; value?: unknown; code?: string; message?: string }) => void;
+    let rejectResult!: (error: Error) => void;
+    const ready = new Promise<void>((resolve) => { markReady = resolve; });
+    const result = new Promise<{ ok: boolean; value?: unknown; code?: string; message?: string }>((resolve, reject) => {
+      resolveResult = resolve; rejectResult = reject;
+    });
+    worker.on("message", (message: { type: string; outcome?: unknown; message?: string }) => {
+      if (message.type === "ready") markReady();
+      else if (message.type === "result") resolveResult(message.outcome);
+      else if (message.type === "fatal") rejectResult(new Error(message.message));
+    });
+    worker.once("error", rejectResult);
+    worker.once("exit", (code) => { if (code !== 0) rejectResult(new Error(`Unblocked race worker exited with code ${code}`)); });
+    return { ready, result };
+  });
+  await Promise.all(channels.map(({ ready }) => ready));
+  return {
+    release(index: number) { Atomics.store(gates[index], 0, 1); Atomics.notify(gates[index], 0, 1); },
+    result(index: number) { return channels[index].result; },
+    async close() { await Promise.all(workers.map((worker) => worker.terminate())); },
+  };
+}
 
 // Use a temporary database for testing
 const TEST_DB_DIR = path.join(os.tmpdir(), `forgespec-test-${Date.now()}`);
@@ -674,6 +757,9 @@ nativeDescribe("release integration — docs and version contract", () => {
     expect(content).toMatch(/local-trusted-client/);
     expect(content).toMatch(/P0/i);
     expect(content).toMatch(/cortex-ia/i);
+    expect(content).toMatch(/Schema 4 is the original additive task-authority schema/);
+    expect(content).toMatch(/Schema 5 is a separate additive migration/);
+    expect(content).toMatch(/latest schema is 5/i);
   });
 
   it("ships docs/migrations.md documenting migration, rollback, and interruption recovery", () => {
@@ -760,15 +846,16 @@ nativeDescribe("compatibility and error boundaries", () => {
 });
 
 describe("runtime compatibility facts", () => {
-  const runtimeTest = process.version === "v24.18.1" || /^v22\./.test(process.version) ? it : it.skip;
+  const supportedAbiByNodeMajor: Record<number, string> = { 22: "127", 24: "137", 26: "147" };
+  const nodeMajor = Number(/^v(\d+)/.exec(process.version)?.[1]);
 
-  runtimeTest("requires complete supported-runtime evidence before compatibility is accepted", () => {
-    if (process.version === "v24.18.1") expect(process.versions.modules).toBe("137");
-    else expect(process.versions.modules).toBe("127");
+  it("requires complete supported-runtime evidence before compatibility is accepted", () => {
+    expect(Object.hasOwn(supportedAbiByNodeMajor, nodeMajor)).toBe(true);
+    expect(process.versions.modules).toBe(supportedAbiByNodeMajor[nodeMajor]);
     expect(process.versions.napi).toBeDefined();
   });
 
-  runtimeTest("exposes the bounded snapshot/query tool inventory used by the benchmark", async () => {
+  it("exposes the bounded snapshot/query tool inventory used by the benchmark", async () => {
     const server = createServer();
     const client = new Client({ name: "runtime-facts", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -785,13 +872,13 @@ describe("runtime compatibility facts", () => {
     await server.close();
   });
 
-  runtimeTest("reports schema v3 as the runtime migration boundary", () => {
+  it("reports the latest schema as the runtime migration boundary", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgespec-runtime-facts-"));
     const databasePath = path.join(directory, "runtime.db");
     migrateDatabase(databasePath);
     const runtimeDb = new DatabaseConstructor!(databasePath, { readonly: true });
     try {
-      expect(runtimeDb.pragma("user_version", { simple: true })).toBe(3);
+      expect(runtimeDb.pragma("user_version", { simple: true })).toBe(LATEST_SCHEMA_VERSION);
       expect(runtimeDb.prepare("SELECT 1 FROM sqlite_master WHERE name = 'direct_task_versions'").get()).toBeDefined();
     } finally {
       runtimeDb.close();
@@ -802,14 +889,16 @@ describe("runtime compatibility facts", () => {
 
 nativeDescribe("release integration — E2E direct-v1 lifecycle through composed server", () => {
   let testDb: { path: string; database: Database.Database };
-  let sharedBoardId: string;
 
-  beforeAll(() => {
+  beforeEach(() => {
     testDb = createTestDatabase("forgespec-release-");
   });
 
-  afterAll(() => {
+  afterEach(() => {
     testDb.database.close();
+  });
+
+  afterAll(() => {
     removeTestDatabases();
   });
 
@@ -859,7 +948,6 @@ nativeDescribe("release integration — E2E direct-v1 lifecycle through composed
     });
     expect(boardResult.isError).not.toBe(true);
     const board = boardResult.structuredContent as { board_id: string; task_ids: string[]; board_revision: number };
-    sharedBoardId = board.board_id;
     const taskId = board.task_ids[0];
 
     // 3. Claim the ready task
@@ -928,6 +1016,18 @@ nativeDescribe("release integration — E2E direct-v1 lifecycle through composed
         schema_version: "1.0.0",
         actor: "reviewer",
         idempotency_key: "e2e-approve",
+        asserted_provenance: {
+          kind: "asserted",
+          asserted_actor: "reviewer",
+          boundary: "local-trusted-client",
+          mode: "direct-v1",
+          approval_ref: {
+            provider: "forgespec",
+            kind: "approval",
+            external_id: "e2e-approval-001",
+            digest: "sha256:" + "b".repeat(64),
+          },
+        },
       },
     });
     expect(approveResult.isError).not.toBe(true);
@@ -983,10 +1083,25 @@ nativeDescribe("release integration — E2E direct-v1 lifecycle through composed
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 
-    // Query events from the board created in the previous test
+    const boardResult = await client.callTool({
+      name: "tb_create_board",
+      arguments: {
+        project: "delta-recovery",
+        name: "Self-contained delta recovery board",
+        tasks: [{ title: "Delta recovery task" }],
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        actor: "e2e-owner",
+        idempotency_key: "delta-recovery-board",
+      },
+    });
+    expect(boardResult.isError).not.toBe(true);
+    const board = boardResult.structuredContent as { board_id: string };
+
     const result = await client.callTool({
       name: "tb_events",
-      arguments: { board_id: sharedBoardId, actor: "e2e-owner", limit: 100 },
+      arguments: { board_id: board.board_id, actor: "e2e-owner", limit: 100 },
     });
     expect(result.isError).not.toBe(true);
     const events = result.structuredContent as { items: unknown[] };
@@ -1002,4 +1117,1231 @@ nativeDescribe("release integration — E2E direct-v1 lifecycle through composed
     await client.close();
     await server.close();
   });
+});
+
+const authorityCapability: CapabilityContext = {
+  coordinationMode: "direct-v1",
+  apiVersion: "1.0.0",
+  schemaVersion: "1.0.0",
+  negotiated: ["task-authority@1.0.0"],
+};
+
+function authoritySnapshot(database: Database.Database): string {
+  return JSON.stringify({
+    boards: database.prepare("SELECT * FROM direct_boards ORDER BY board_id").all(),
+    tasks: database.prepare("SELECT * FROM direct_tasks ORDER BY task_id").all(),
+    grants: database.prepare("SELECT * FROM task_authority_grants ORDER BY grant_id").all(),
+    handoffs: database.prepare("SELECT * FROM task_authority_handoffs ORDER BY handoff_id").all(),
+    refs: database.prepare("SELECT * FROM task_authority_handoff_refs ORDER BY handoff_id, ordinal").all(),
+    revocations: database.prepare("SELECT * FROM task_authority_revocations ORDER BY revoke_id").all(),
+    events: database.prepare("SELECT * FROM authority_events ORDER BY id").all(),
+  });
+}
+
+nativeDescribe("WU-07 authority security matrix", () => {
+  it("tb_approve requires active exact approve authority plus allowed actor and canonical asserted provenance", async () => {
+    const created = createTestDatabase("forgespec-delegated-approve-");
+    const clock = new FakeClock(Date.now() - 10_000);
+    const service = new TaskService(created.database, { clock });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Delegated approve",
+      actor: "owner",
+      idempotency_key: "delegated-approve-board",
+      tasks: ["Approved resource", "Wrong resource", "Wrong operation", "Expired grant", "Revoked grant"].map((title) => ({
+        title,
+        gates: [{
+          gate_id: "security",
+          required_for: ["done" as const],
+          allowed_actors: ["reviewer", "operation-reviewer", "expired-reviewer", "revoked-reviewer"],
+        }],
+      })),
+    });
+    const approveGrant = service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "task", boardId: board.board_id, taskId: board.task_ids[0] },
+      granteeActor: "reviewer",
+      operation: "approve",
+      expiresAtMs: clock.now() + 60_000,
+      idempotencyKey: "delegated-approve-grant",
+      expectedBoardRevision: board.board_revision,
+      capability: authorityCapability,
+    });
+    const operationGrant = service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "task", boardId: board.board_id, taskId: board.task_ids[2] },
+      granteeActor: "operation-reviewer",
+      operation: "update",
+      expiresAtMs: clock.now() + 60_000,
+      idempotencyKey: "delegated-approve-wrong-operation",
+      expectedBoardRevision: approveGrant.boardRevision,
+      capability: authorityCapability,
+    });
+    const expiredGrant = service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "task", boardId: board.board_id, taskId: board.task_ids[3] },
+      granteeActor: "expired-reviewer",
+      operation: "approve",
+      expiresAtMs: clock.now() + 1,
+      idempotencyKey: "delegated-approve-expired",
+      expectedBoardRevision: operationGrant.boardRevision,
+      capability: authorityCapability,
+    });
+    const revokedGrant = service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "task", boardId: board.board_id, taskId: board.task_ids[4] },
+      granteeActor: "revoked-reviewer",
+      operation: "approve",
+      expiresAtMs: clock.now() + 60_000,
+      idempotencyKey: "delegated-approve-revoked",
+      expectedBoardRevision: expiredGrant.boardRevision,
+      capability: authorityCapability,
+    });
+    service.revokeAuthority({
+      actor: "owner",
+      grantId: revokedGrant.value.grantId,
+      idempotencyKey: "delegated-approve-revoke",
+      expectedBoardRevision: revokedGrant.boardRevision,
+      capability: authorityCapability,
+    });
+
+    const server = createServer({ database: () => created.database, clock });
+    const client = new Client({ name: "delegated-approve", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const provenance = {
+      kind: "asserted",
+      asserted_actor: "reviewer",
+      boundary: "local-trusted-client",
+      mode: "direct-v1",
+      approval_ref: {
+        provider: "forgespec",
+        kind: "approval",
+        external_id: "delegated-approval",
+        digest: `sha256:${"f".repeat(64)}`,
+      },
+    };
+    const base = {
+      name: "tb_approve",
+      arguments: {
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        task_id: board.task_ids[0],
+        gate_id: "security",
+        decision: "allow",
+        expected_revision: 1,
+        actor: "reviewer",
+        capability: authorityCapability,
+        asserted_provenance: provenance,
+      },
+    };
+
+    const allowed = await client.callTool({
+      ...base,
+      arguments: { ...base.arguments, idempotency_key: "delegated-approve-success" },
+    });
+    expect(allowed.isError).not.toBe(true);
+    const persisted = created.database.prepare("SELECT * FROM task_approval_provenance").all();
+    expect(persisted).toHaveLength(1);
+
+    const snapshot = () => JSON.stringify({
+      gates: created.database.prepare("SELECT * FROM approval_gates ORDER BY task_id, gate_id").all(),
+      decisions: created.database.prepare("SELECT * FROM approval_decisions ORDER BY id").all(),
+      provenance: created.database.prepare("SELECT * FROM task_approval_provenance ORDER BY decision_event_id").all(),
+      events: created.database.prepare("SELECT * FROM authority_events WHERE event_type = 'approval_decided' ORDER BY id").all(),
+    });
+    const unchanged = snapshot();
+    const deniedInputs = [
+      { idempotency_key: "approve-wrong-resource", task_id: board.task_ids[1] },
+      {
+        idempotency_key: "approve-wrong-operation",
+        task_id: board.task_ids[2],
+        actor: "operation-reviewer",
+        asserted_provenance: { ...provenance, asserted_actor: "operation-reviewer" },
+      },
+      {
+        idempotency_key: "approve-expired-grant",
+        task_id: board.task_ids[3],
+        actor: "expired-reviewer",
+        asserted_provenance: { ...provenance, asserted_actor: "expired-reviewer" },
+      },
+      {
+        idempotency_key: "approve-revoked-grant",
+        task_id: board.task_ids[4],
+        actor: "revoked-reviewer",
+        asserted_provenance: { ...provenance, asserted_actor: "revoked-reviewer" },
+      },
+      { idempotency_key: "approve-no-capability", capability: undefined },
+      { idempotency_key: "approve-wrong-actor", actor: "intruder", asserted_provenance: { ...provenance, asserted_actor: "intruder" } },
+      { idempotency_key: "approve-missing-provenance", asserted_provenance: undefined },
+      { idempotency_key: "approve-malformed-provenance", asserted_provenance: { ...provenance, approval_ref: { ...provenance.approval_ref, digest: "sha256:weak" } } },
+      { idempotency_key: "approve-conflicting-source", evidence_links: [provenance.approval_ref] },
+    ];
+    for (const overrides of deniedInputs) {
+      const result = await client.callTool({ ...base, arguments: { ...base.arguments, ...overrides } });
+      expect(result.isError, overrides.idempotency_key).toBe(true);
+      expect(snapshot()).toBe(unchanged);
+    }
+
+    const replayChanged = await client.callTool({
+      ...base,
+      arguments: {
+        ...base.arguments,
+        idempotency_key: "delegated-approve-success",
+        asserted_provenance: {
+          ...provenance,
+          approval_ref: { ...provenance.approval_ref, external_id: "changed-on-replay" },
+        },
+      },
+    });
+    expect(replayChanged.isError).toBe(true);
+    expect(snapshot()).toBe(unchanged);
+
+    await client.close();
+    await server.close();
+    created.database.close();
+  });
+
+  it("propagates task-authority context through each protected public mutation exactly once", async () => {
+    const created = createTestDatabase("forgespec-mutation-capability-");
+    const setup = new TaskService(created.database);
+    const board = setup.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "mutation-capability",
+      name: "Protected mutation board",
+      actor: "owner",
+      idempotency_key: "mutation-capability-board",
+      tasks: [
+        { title: "Update task" },
+        {
+          title: "Approval task",
+          gates: [{ gate_id: "security", required_for: ["done"], allowed_actors: ["owner"] }],
+        },
+        { title: "Recovery task" },
+      ],
+    });
+    const claim = setup.claimDirectTask({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      task_id: board.task_ids[2],
+      agent: "worker",
+      expected_revision: 1,
+      lease_seconds: 15,
+      idempotency_key: "mutation-capability-claim",
+    });
+    created.database.prepare("UPDATE task_attempts SET expires_at_ms = ? WHERE id = ?")
+      .run(Date.now() - 10_000, claim.attempt_id);
+
+    const server = createServer({ database: () => created.database });
+    const client = new Client({ name: "mutation-capability", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const decisionSpy = vi.spyOn(TaskAuthorityService.prototype, "authorizeTaskOperation");
+    const directContext = {
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      actor: "owner",
+      capability: authorityCapability,
+    };
+
+    const recovered = await client.callTool({
+      name: "tb_recover_claims",
+      arguments: {
+        board_id: board.board_id,
+        expected_board_revision: claim.board_revision,
+        attempt_ids: [claim.attempt_id],
+        idempotency_key: "mutation-capability-recover",
+        ...directContext,
+      },
+    });
+    expect(recovered.isError).not.toBe(true);
+    const recoveredTask = created.database.prepare("SELECT revision FROM direct_tasks WHERE task_id = ?")
+      .get(board.task_ids[2]) as { revision: number };
+
+    const requeued = await client.callTool({
+      name: "tb_requeue",
+      arguments: {
+        task_id: board.task_ids[2],
+        expected_revision: recoveredTask.revision,
+        reason: "retry under delegated authority",
+        idempotency_key: "mutation-capability-requeue",
+        ...directContext,
+      },
+    });
+    expect(requeued.isError).not.toBe(true);
+
+    const updated = await client.callTool({
+      name: "tb_update",
+      arguments: {
+        task_id: board.task_ids[0],
+        expected_revision: 1,
+        status: "blocked",
+        idempotency_key: "mutation-capability-update",
+        ...directContext,
+      },
+    });
+    expect(updated.isError).not.toBe(true);
+
+    const approved = await client.callTool({
+      name: "tb_approve",
+      arguments: {
+        task_id: board.task_ids[1],
+        gate_id: "security",
+        decision: "allow",
+        expected_revision: 1,
+        idempotency_key: "mutation-capability-approve",
+        asserted_provenance: {
+          kind: "asserted",
+          asserted_actor: "owner",
+          boundary: "local-trusted-client",
+          mode: "direct-v1",
+          approval_ref: {
+            provider: "forgespec",
+            kind: "approval",
+            external_id: "mutation-capability-approval",
+            digest: `sha256:${"a".repeat(64)}`,
+          },
+        },
+        ...directContext,
+      },
+    });
+    expect(approved.isError).not.toBe(true);
+
+    const boardRevision = (created.database.prepare("SELECT revision FROM direct_boards WHERE board_id = ?")
+      .get(board.board_id) as { revision: number }).revision;
+    const added = await client.callTool({
+      name: "tb_add_task",
+      arguments: {
+        board_id: board.board_id,
+        title: "Delegated addition",
+        expected_board_revision: boardRevision,
+        idempotency_key: "mutation-capability-add",
+        ...directContext,
+      },
+    });
+    expect(added.isError).not.toBe(true);
+
+    expect(decisionSpy).toHaveBeenCalledTimes(5);
+    expect(decisionSpy.mock.calls.map((call) => call[1].operation)).toEqual([
+      "recover", "recover", "update", "approve", "add",
+    ]);
+    for (const call of decisionSpy.mock.calls) {
+      expect(call[1].capability).toEqual(authorityCapability);
+    }
+
+    decisionSpy.mockRestore();
+    await client.close();
+    await server.close();
+    created.database.close();
+  });
+
+  it("enforces active, expired, revoked, and out-of-scope grants at the MCP mutation boundary", async () => {
+    const created = createTestDatabase("forgespec-mutation-grant-matrix-");
+    const clock = new FakeClock(Date.now() - 20_000);
+    const setup = new TaskService(created.database, { clock });
+    const board = setup.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "mutation-grant-matrix",
+      name: "Mutation grant matrix",
+      actor: "owner",
+      idempotency_key: "mutation-grant-board",
+      tasks: [{ title: "Update target" }, { title: "Requeue target" }],
+    });
+    const updateResource = { kind: "task" as const, boardId: board.board_id, taskId: board.task_ids[0] };
+    const requeueResource = { kind: "task" as const, boardId: board.board_id, taskId: board.task_ids[1] };
+    const active = setup.grantAuthority({
+      actor: "owner",
+      resource: updateResource,
+      granteeActor: "active-updater",
+      operation: "update",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "active-update-grant",
+      expectedBoardRevision: board.board_revision,
+      capability: authorityCapability,
+    });
+    const expired = setup.grantAuthority({
+      actor: "owner",
+      resource: { kind: "board", boardId: board.board_id },
+      granteeActor: "expired-adder",
+      operation: "add",
+      expiresAtMs: clock.now() + 1_000,
+      idempotencyKey: "expired-add-grant",
+      expectedBoardRevision: active.boardRevision,
+      capability: authorityCapability,
+    });
+    const revocable = setup.grantAuthority({
+      actor: "owner",
+      resource: { kind: "board", boardId: board.board_id },
+      granteeActor: "revoked-recoverer",
+      operation: "recover",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "revoked-recover-grant",
+      expectedBoardRevision: expired.boardRevision,
+      capability: authorityCapability,
+    });
+    const revoked = setup.revokeAuthority({
+      actor: "owner",
+      grantId: revocable.value.grantId,
+      idempotencyKey: "revoke-recover-grant",
+      expectedBoardRevision: revocable.boardRevision,
+      capability: authorityCapability,
+    });
+    setup.grantAuthority({
+      actor: "owner",
+      resource: requeueResource,
+      granteeActor: "wrong-scope-requeuer",
+      operation: "update",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "wrong-scope-requeue-grant",
+      expectedBoardRevision: revoked.boardRevision,
+      capability: authorityCapability,
+    });
+    created.database.prepare(
+      "UPDATE direct_tasks SET status = 'blocked', blocked_reason = 'requeue_required' WHERE task_id = ?"
+    ).run(board.task_ids[1]);
+
+    const server = createServer({ database: () => created.database });
+    const client = new Client({ name: "mutation-grant-matrix", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const directContext = {
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      capability: authorityCapability,
+    };
+
+    const allowed = await client.callTool({
+      name: "tb_update",
+      arguments: {
+        task_id: board.task_ids[0],
+        expected_revision: 1,
+        status: "blocked",
+        actor: "active-updater",
+        idempotency_key: "active-grant-update",
+        ...directContext,
+      },
+    });
+    expect(allowed.isError).not.toBe(true);
+
+    const deniedCases = [
+      {
+        name: "expired add grant",
+        tool: "tb_add_task",
+        arguments: () => ({
+          board_id: board.board_id,
+          title: "Must not be added",
+          expected_board_revision: (created.database.prepare("SELECT revision FROM direct_boards WHERE board_id = ?")
+            .get(board.board_id) as { revision: number }).revision,
+          actor: "expired-adder",
+          idempotency_key: "expired-grant-add",
+          ...directContext,
+        }),
+      },
+      {
+        name: "revoked recover grant",
+        tool: "tb_recover_claims",
+        arguments: () => ({
+          board_id: board.board_id,
+          expected_board_revision: (created.database.prepare("SELECT revision FROM direct_boards WHERE board_id = ?")
+            .get(board.board_id) as { revision: number }).revision,
+          actor: "revoked-recoverer",
+          idempotency_key: "revoked-grant-recover",
+          ...directContext,
+        }),
+      },
+      {
+        name: "out-of-scope requeue grant",
+        tool: "tb_requeue",
+        arguments: () => ({
+          task_id: board.task_ids[1],
+          expected_revision: 1,
+          reason: "must not requeue",
+          actor: "wrong-scope-requeuer",
+          idempotency_key: "wrong-scope-grant-requeue",
+          ...directContext,
+        }),
+      },
+    ];
+    for (const testCase of deniedCases) {
+      const before = authoritySnapshot(created.database);
+      const result = await client.callTool({ name: testCase.tool, arguments: testCase.arguments() });
+      expect(result.isError, testCase.name).toBe(true);
+      expect(result.structuredContent, testCase.name).toMatchObject({
+        ok: false,
+        error: { category: "authorization", code: "AUTH_OWNER_OR_GRANT_REQUIRED" },
+      });
+      expect(authoritySnapshot(created.database), testCase.name).toBe(before);
+    }
+
+    await client.close();
+    await server.close();
+    created.database.close();
+  });
+
+  it("serializes same-key grant, handoff, and revoke replays with one canonical effect", async () => {
+    const created = createTestDatabase("forgespec-delegation-race-");
+    const other = openTestDatabase(created.path);
+    const clock = new FakeClock(1_800_000_000_000);
+    const first = new TaskService(created.database, { clock });
+    const second = new TaskService(other, { clock });
+    const board = first.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Delegation race",
+      actor: "owner",
+      idempotency_key: "delegation-board",
+      tasks: [{ title: "Protected task" }],
+    });
+    const resource = { kind: "task" as const, boardId: board.board_id, taskId: board.task_ids[0] };
+    const grant: GrantCommand = {
+      actor: "owner",
+      resource,
+      granteeActor: "worker",
+      operation: "update",
+      expiresAtMs: clock.now() + 60_000,
+      idempotencyKey: "grant-same-key",
+      expectedBoardRevision: board.board_revision,
+      capability: authorityCapability,
+    };
+
+    const [grantA, grantB] = await Promise.all([
+      Promise.resolve().then(() => first.grantAuthority(grant)),
+      Promise.resolve().then(() => second.grantAuthority(grant)),
+    ]);
+    expect(grantB).toEqual({ ...grantA, replayed: true });
+    expect(created.database.prepare("SELECT COUNT(*) AS count FROM task_authority_grants").get()).toEqual({ count: 1 });
+    expect(created.database.prepare("SELECT COUNT(*) AS count FROM authority_events WHERE event_type = 'authority_granted'").get())
+      .toEqual({ count: 1 });
+
+    const handoff: HandoffCommand = {
+      actor: "owner",
+      toActor: "delegate",
+      resource,
+      operations: ["update", "revoke"],
+      expiresAtMs: clock.now() + 30_000,
+      refs: [{
+        provider: "forgespec",
+        kind: "task",
+        externalId: board.task_ids[0],
+        digest: `sha256:${"b".repeat(64)}`,
+      }],
+      idempotencyKey: "handoff-same-key",
+      expectedBoardRevision: grantA.boardRevision,
+      capability: authorityCapability,
+    };
+    const [handoffA, handoffB] = await Promise.all([
+      Promise.resolve().then(() => first.handoffAuthority(handoff)),
+      Promise.resolve().then(() => second.handoffAuthority(handoff)),
+    ]);
+    expect(handoffB).toEqual({ ...handoffA, replayed: true });
+    expect(created.database.prepare("SELECT COUNT(*) AS count FROM task_authority_handoffs").get()).toEqual({ count: 1 });
+    expect(created.database.prepare("SELECT COUNT(*) AS count FROM task_authority_handoff_refs").get()).toEqual({ count: 1 });
+    expect(JSON.stringify(created.database.prepare("SELECT * FROM task_authority_handoffs").all())).not.toMatch(/transcript/i);
+
+    clock.advance(60_000);
+    const revoke: RevokeCommand = {
+      actor: "owner",
+      grantId: grantA.value.grantId,
+      reason: "expired concurrently",
+      idempotencyKey: "revoke-same-key",
+      expectedBoardRevision: handoffA.boardRevision,
+      capability: authorityCapability,
+    };
+    const [revokeA, revokeB] = await Promise.all([
+      Promise.resolve().then(() => first.revokeAuthority(revoke)),
+      Promise.resolve().then(() => second.revokeAuthority(revoke)),
+    ]);
+    expect(revokeB).toEqual({ ...revokeA, replayed: true });
+    expect(created.database.prepare("SELECT COUNT(*) AS count FROM task_authority_revocations").get()).toEqual({ count: 1 });
+    expect(created.database.prepare("SELECT COUNT(*) AS count FROM authority_events WHERE event_type = 'authority_revoked'").get())
+      .toEqual({ count: 1 });
+    expect(JSON.parse((created.database.prepare("SELECT metadata_json FROM direct_boards WHERE board_id = ?")
+      .get(board.board_id) as { metadata_json: string }).metadata_json)).toMatchObject({ owner_actor: "owner" });
+
+    other.close();
+    created.database.close();
+  });
+
+  it("keeps asserted approval provenance immutable on replay and conflicting reuse", () => {
+    const created = createTestDatabase("forgespec-provenance-replay-");
+    const service = new TaskService(created.database, { clock: new FakeClock(1_800_000_000_000) });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Provenance replay",
+      actor: "owner",
+      idempotency_key: "provenance-board",
+      tasks: [{
+        title: "Approval task",
+        gates: [{ gate_id: "security", required_for: ["done"], allowed_actors: ["reviewer"] }],
+      }],
+    });
+    const input = {
+      coordination_mode: "direct-v1" as const,
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      task_id: board.task_ids[0],
+      gate_id: "security",
+      decision: "allow" as const,
+      expected_revision: 1,
+      actor: "reviewer",
+      idempotency_key: "approval-replay",
+      asserted_provenance: {
+        kind: "asserted" as const,
+        asserted_actor: "reviewer",
+        boundary: "local-trusted-client" as const,
+        mode: "direct-v1" as const,
+        approval_ref: {
+          provider: "forgespec",
+          kind: "approval",
+          external_id: "approval-original",
+          digest: `sha256:${"c".repeat(64)}`,
+        },
+      },
+    };
+    const original = service.approveDirectTask(input);
+    const replay = service.approveDirectTask(input);
+    expect(replay).toEqual({ ...original, replayed: true });
+    const persisted = created.database.prepare("SELECT * FROM task_approval_provenance").all();
+    expect(() => service.approveDirectTask({
+      ...input,
+      asserted_provenance: {
+        ...input.asserted_provenance,
+        approval_ref: { ...input.asserted_provenance.approval_ref, external_id: "approval-altered" },
+      },
+    })).toThrowError(expect.objectContaining({ code: "idempotency_conflict" }));
+    expect(created.database.prepare("SELECT * FROM task_approval_provenance").all()).toEqual(persisted);
+    expect(persisted).toHaveLength(1);
+    created.database.close();
+  });
+
+  it("marks explicit and evidence-link-derived asserted provenance without inventing authentication", async () => {
+    const created = createTestDatabase("forgespec-provenance-source-");
+    const service = new TaskService(created.database, { clock: new FakeClock(1_800_000_000_000) });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Provenance source",
+      actor: "owner",
+      idempotency_key: "provenance-source-board",
+      tasks: ["Explicit", "Derived", "Ambiguous", "Weak", "Missing"].map((title) => ({
+        title,
+        gates: [{ gate_id: "security", required_for: ["done" as const], allowed_actors: ["reviewer"] }],
+      })),
+    });
+    const server = createServer({ database: () => created.database });
+    const client = new Client({ name: "provenance-source", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const base = {
+      gate_id: "security",
+      decision: "allow",
+      expected_revision: 1,
+      actor: "reviewer",
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+    };
+    const reference = {
+      provider: "forgespec",
+      kind: "approval",
+      external_id: "approval-source",
+      digest: `sha256:${"e".repeat(64)}`,
+    };
+
+    const explicit = await client.callTool({
+      name: "tb_approve",
+      arguments: {
+        ...base,
+        task_id: board.task_ids[0],
+        idempotency_key: "explicit-source",
+        asserted_provenance: {
+          kind: "asserted",
+          asserted_actor: "reviewer",
+          boundary: "local-trusted-client",
+          mode: "direct-v1",
+          approval_ref: reference,
+        },
+      },
+    });
+    expect(explicit.isError).not.toBe(true);
+    const derived = await client.callTool({
+      name: "tb_approve",
+      arguments: {
+        ...base,
+        task_id: board.task_ids[1],
+        idempotency_key: "derived-source",
+        evidence_links: [{ ...reference, external_id: "derived-source" }],
+      },
+    });
+    expect(derived.isError).not.toBe(true);
+
+    const persistedDetails = created.database.prepare(
+      "SELECT resource_id, details_json FROM authority_events WHERE event_type = 'approval_decided' ORDER BY resource_id"
+    ).all() as Array<{ resource_id: string; details_json: string }>;
+    expect(persistedDetails.map(({ resource_id, details_json }) => ({
+      resource_id,
+      source: (JSON.parse(details_json) as { provenance_source: string }).provenance_source,
+    }))).toEqual([
+      { resource_id: board.task_ids[1], source: "evidence-link-derived" },
+      { resource_id: board.task_ids[0], source: "explicit" },
+    ].sort((left, right) => left.resource_id.localeCompare(right.resource_id)));
+    expect(persistedDetails.map(({ details_json }) => details_json)).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/authenticat/i)])
+    );
+
+    const sourceChangeReplay = await client.callTool({
+      name: "tb_approve",
+      arguments: {
+        ...base,
+        task_id: board.task_ids[1],
+        idempotency_key: "derived-source",
+        asserted_provenance: {
+          kind: "asserted",
+          source: "explicit",
+          asserted_actor: "reviewer",
+          boundary: "local-trusted-client",
+          mode: "direct-v1",
+          approval_ref: { ...reference, external_id: "derived-source" },
+        },
+      },
+    });
+    expect(sourceChangeReplay.isError).toBe(true);
+    expect(sourceChangeReplay.structuredContent).toMatchObject({
+      error: { category: "idempotency", code: "idempotency_conflict" },
+    });
+
+    const countsBeforeDenials = created.database.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM approval_decisions) AS decisions,
+         (SELECT COUNT(*) FROM task_approval_provenance) AS provenance,
+         (SELECT COUNT(*) FROM authority_events WHERE event_type = 'approval_decided') AS events`
+    ).get();
+    const denied = await Promise.all([
+      client.callTool({
+        name: "tb_approve",
+        arguments: {
+          ...base,
+          task_id: board.task_ids[2],
+          idempotency_key: "ambiguous-source",
+          asserted_provenance: {
+            kind: "asserted",
+            asserted_actor: "reviewer",
+            boundary: "local-trusted-client",
+            mode: "direct-v1",
+            source: "explicit",
+            approval_ref: reference,
+          },
+          evidence_links: [reference],
+        },
+      }),
+      client.callTool({
+        name: "tb_approve",
+        arguments: {
+          ...base,
+          task_id: board.task_ids[3],
+          idempotency_key: "weak-source",
+          evidence_links: [{ ...reference, digest: "sha256:weak" }],
+        },
+      }),
+      client.callTool({
+        name: "tb_approve",
+        arguments: { ...base, task_id: board.task_ids[4], idempotency_key: "missing-source" },
+      }),
+    ]);
+    expect(denied.every((result) => result.isError)).toBe(true);
+    expect(created.database.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM approval_decisions) AS decisions,
+         (SELECT COUNT(*) FROM task_approval_provenance) AS provenance,
+         (SELECT COUNT(*) FROM authority_events WHERE event_type = 'approval_decided') AS events`
+    ).get()).toEqual(countsBeforeDenials);
+
+    await client.close();
+    await server.close();
+    created.database.close();
+    const restarted = openTestDatabase(created.path);
+    expect(restarted.prepare(
+      "SELECT details_json FROM authority_events WHERE event_type = 'approval_decided' ORDER BY resource_id"
+    ).all()).toEqual(persistedDetails.map(({ details_json }) => ({ details_json })));
+    expect(() => restarted.prepare(
+      "UPDATE authority_events SET details_json = '{}' WHERE event_type = 'approval_decided'"
+    ).run()).toThrow(/immutable/);
+    restarted.close();
+  });
+
+  it("allows the grantor to revoke after expiry without rewriting the board owner", () => {
+    const created = createTestDatabase("forgespec-grantor-revoke-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const service = new TaskService(created.database, { clock });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Grantor revoke",
+      actor: "owner",
+      idempotency_key: "grantor-board",
+      tasks: [{ title: "Protected task" }],
+    });
+    const resource = { kind: "task" as const, boardId: board.board_id, taskId: board.task_ids[0] };
+    const parent = service.grantAuthority({
+      actor: "owner",
+      resource,
+      granteeActor: "grantor",
+      operation: "update",
+      expiresAtMs: clock.now() + 60_000,
+      idempotencyKey: "parent-grant",
+      expectedBoardRevision: board.board_revision,
+      capability: authorityCapability,
+    });
+    const child = service.grantAuthority({
+      actor: "grantor",
+      resource,
+      granteeActor: "worker",
+      operation: "update",
+      expiresAtMs: clock.now() + 30_000,
+      idempotencyKey: "child-grant",
+      expectedBoardRevision: parent.boardRevision,
+      capability: authorityCapability,
+    });
+    clock.advance(30_000);
+    const revoked = service.revokeAuthority({
+      actor: "grantor",
+      grantId: child.value.grantId,
+      idempotencyKey: "grantor-revoke-after-expiry",
+      expectedBoardRevision: child.boardRevision,
+      capability: authorityCapability,
+    });
+    expect(revoked.value.grantId).toBe(child.value.grantId);
+    expect(new TaskAuthorityService(created.database).authorizeTaskOperation(created.database, {
+      actor: "worker",
+      operation: "update",
+      resource,
+      capability: authorityCapability,
+      nowMs: clock.now(),
+    })).toMatchObject({ allowed: false, code: "AUTH_OWNER_OR_GRANT_REQUIRED" });
+    expect(JSON.parse((created.database.prepare("SELECT metadata_json FROM direct_boards WHERE board_id = ?")
+      .get(board.board_id) as { metadata_json: string }).metadata_json)).toMatchObject({ owner_actor: "owner" });
+    created.database.close();
+  });
+
+  it("executes 100 percent of the declared negative manifest with stable codes and unchanged snapshots", () => {
+    const created = createTestDatabase("forgespec-negative-manifest-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const service = new TaskService(created.database, { clock });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Negative manifest",
+      actor: "owner",
+      idempotency_key: "negative-board",
+      tasks: [{ title: "Protected task" }],
+    });
+    const resource = { kind: "task" as const, boardId: board.board_id, taskId: board.task_ids[0] };
+    const authorizer = new TaskAuthorityService(created.database);
+    const activeGrant = service.grantAuthority({
+      actor: "owner",
+      resource,
+      granteeActor: "revoked-worker",
+      operation: "update",
+      expiresAtMs: clock.now() + 60_000,
+      idempotencyKey: "negative-grant",
+      expectedBoardRevision: board.board_revision,
+      capability: authorityCapability,
+    });
+    const revoked = service.revokeAuthority({
+      actor: "owner",
+      grantId: activeGrant.value.grantId,
+      idempotencyKey: "negative-revoke",
+      expectedBoardRevision: activeGrant.boardRevision,
+      capability: authorityCapability,
+    });
+    const expiredGrant = service.grantAuthority({
+      actor: "owner",
+      resource,
+      granteeActor: "expired-worker",
+      operation: "update",
+      expiresAtMs: clock.now() + 50,
+      idempotencyKey: "expired-grant",
+      expectedBoardRevision: revoked.boardRevision,
+      capability: authorityCapability,
+    });
+    service.grantAuthority({
+      actor: "owner",
+      resource,
+      granteeActor: "scoped-worker",
+      operation: "update",
+      expiresAtMs: clock.now() + 60_000,
+      idempotencyKey: "scoped-grant",
+      expectedBoardRevision: expiredGrant.boardRevision,
+      capability: authorityCapability,
+    });
+    clock.advance(50);
+
+    const cases = [
+      {
+        name: "unknown operation",
+        expected: "AUTH_UNKNOWN_OPERATION",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "owner", operation: "unknown" as never, resource, nowMs: clock.now(),
+        }),
+      },
+      {
+        name: "incomplete context",
+        expected: "AUTH_CONTEXT_REQUIRED",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "", operation: "update", resource, nowMs: clock.now(),
+        }),
+      },
+      {
+        name: "non-owner update without attempt or grant",
+        expected: "AUTH_OWNER_OR_GRANT_REQUIRED",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "intruder", operation: "update", resource, nowMs: clock.now(), capability: authorityCapability,
+        }),
+      },
+      {
+        name: "non-owner add without grant",
+        expected: "AUTH_OWNER_OR_GRANT_REQUIRED",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "intruder", operation: "add", resource: { kind: "board", boardId: board.board_id },
+          nowMs: clock.now(), capability: authorityCapability,
+        }),
+      },
+      {
+        name: "revoked grant use",
+        expected: "AUTH_OWNER_OR_GRANT_REQUIRED",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "revoked-worker", operation: "update", resource, nowMs: clock.now(), capability: authorityCapability,
+        }),
+      },
+      {
+        name: "expired grant use at E",
+        expected: "AUTH_OWNER_OR_GRANT_REQUIRED",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "expired-worker", operation: "update", resource, nowMs: clock.now(), capability: authorityCapability,
+        }),
+      },
+      {
+        name: "grant outside operation scope",
+        expected: "AUTH_OWNER_OR_GRANT_REQUIRED",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "scoped-worker", operation: "read_task", resource, nowMs: clock.now(), capability: authorityCapability,
+        }),
+      },
+      {
+        name: "missing capability cannot grant",
+        expected: "AUTH_CAPABILITY_REQUIRED",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "owner", operation: "grant", resource, nowMs: clock.now(),
+          delegation: { kind: "grant", granteeActor: "worker", operation: "update", expiresAtMs: clock.now() + 10_000 },
+        }),
+      },
+      {
+        name: "unauthorized grant",
+        expected: "AUTH_SCOPE_MISMATCH",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "intruder", operation: "grant", resource, nowMs: clock.now(), capability: authorityCapability,
+          delegation: { kind: "grant", granteeActor: "worker", operation: "update", expiresAtMs: clock.now() + 10_000 },
+        }),
+      },
+      {
+        name: "unauthorized handoff",
+        expected: "AUTH_SCOPE_MISMATCH",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "intruder", operation: "handoff", resource, nowMs: clock.now(), capability: authorityCapability,
+          delegation: {
+            kind: "handoff", toActor: "worker", operations: ["update"], expiresAtMs: clock.now() + 10_000,
+            refs: [{ provider: "forgespec", kind: "task", externalId: board.task_ids[0], digest: `sha256:${"d".repeat(64)}` }],
+          },
+        }),
+      },
+      {
+        name: "unauthorized revoke",
+        expected: "AUTH_SCOPE_MISMATCH",
+        run: () => authorizer.authorizeTaskOperation(created.database, {
+          actor: "intruder", operation: "revoke", resource, nowMs: clock.now(), capability: authorityCapability,
+          delegation: { kind: "revoke", grantId: activeGrant.value.grantId },
+        }),
+      },
+    ];
+
+    let executed = 0;
+    for (const testCase of cases) {
+      const before = authoritySnapshot(created.database);
+      const decision = testCase.run();
+      expect(decision, testCase.name).toMatchObject({ allowed: false, code: testCase.expected });
+      expect(authoritySnapshot(created.database), testCase.name).toBe(before);
+      executed += 1;
+    }
+    expect(executed).toBe(cases.length);
+    expect(executed).toBe(11);
+    created.database.close();
+  });
+
+  it("prevents omitted or forged legacy mode from mutating or revealing direct-v1 resources", async () => {
+    const created = createTestDatabase("forgespec-anti-downgrade-");
+    const service = new TaskService(created.database, { clock: new FakeClock(1_800_000_000_000) });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Anti downgrade",
+      actor: "owner",
+      idempotency_key: "anti-downgrade-board",
+      tasks: [{ title: "Secret direct task" }],
+    });
+    const server = createServer({ database: () => created.database });
+    const client = new Client({ name: "anti-downgrade", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const before = authoritySnapshot(created.database);
+
+    const omittedMutation = await client.callTool({
+      name: "tb_update",
+      arguments: { task_id: board.task_ids[0], status: "blocked" },
+    });
+    expect(omittedMutation.isError).toBe(true);
+    expect(omittedMutation.structuredContent).toMatchObject({
+      ok: false,
+      error: { category: "compatibility", code: "legacy_direct_bypass" },
+    });
+    const forgedLegacyRead = await client.callTool({
+      name: "tb_get",
+      arguments: { task_id: board.task_ids[0] },
+    });
+    expect(JSON.stringify(forgedLegacyRead.structuredContent ?? forgedLegacyRead.content)).not.toContain("Secret direct task");
+    expect(authoritySnapshot(created.database)).toBe(before);
+
+    await client.close();
+    await server.close();
+    created.database.close();
+  });
+
+  it("tb_unblocked denies missing, expired, revoked, and out-of-scope direct-v1 authority without effects", async () => {
+    const created = createTestDatabase("forgespec-unblocked-authority-");
+    const clock = new FakeClock(Date.now() - 20_000);
+    const service = new TaskService(created.database, { clock });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "security-matrix",
+      name: "Protected unblocked board",
+      actor: "owner",
+      idempotency_key: "unblocked-board",
+      tasks: [{ title: "Protected ready task" }],
+    });
+    const boardResource = { kind: "board" as const, boardId: board.board_id };
+    const taskResource = { kind: "task" as const, boardId: board.board_id, taskId: board.task_ids[0] };
+    const expired = service.grantAuthority({
+      actor: "owner",
+      resource: boardResource,
+      granteeActor: "expired-reader",
+      operation: "read_board",
+      expiresAtMs: clock.now() + 1_000,
+      idempotencyKey: "expired-read-board",
+      expectedBoardRevision: board.board_revision,
+      capability: authorityCapability,
+    });
+    const active = service.grantAuthority({
+      actor: "owner",
+      resource: boardResource,
+      granteeActor: "active-reader",
+      operation: "read_board",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "active-read-board",
+      expectedBoardRevision: expired.boardRevision,
+      capability: authorityCapability,
+    });
+    const revocable = service.grantAuthority({
+      actor: "owner",
+      resource: boardResource,
+      granteeActor: "revoked-reader",
+      operation: "read_board",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "revoked-read-board",
+      expectedBoardRevision: active.boardRevision,
+      capability: authorityCapability,
+    });
+    const revoked = service.revokeAuthority({
+      actor: "owner",
+      grantId: revocable.value.grantId,
+      idempotencyKey: "revoke-read-board",
+      expectedBoardRevision: revocable.boardRevision,
+      capability: authorityCapability,
+    });
+    service.grantAuthority({
+      actor: "owner",
+      resource: taskResource,
+      granteeActor: "scoped-reader",
+      operation: "read_task",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "scoped-read-task",
+      expectedBoardRevision: revoked.boardRevision,
+      capability: authorityCapability,
+    });
+
+    const legacyBoardId = generateId("board");
+    const legacyTaskId = generateId("task");
+    created.database.prepare("INSERT INTO boards (id, project, name) VALUES (?, ?, ?)")
+      .run(legacyBoardId, "security-matrix", "Legacy unblocked board");
+    created.database.prepare(
+      "INSERT INTO tasks (id, board_id, title, status, dependencies) VALUES (?, ?, ?, 'ready', '[]')"
+    ).run(legacyTaskId, legacyBoardId, "Legacy ready task");
+
+    const server = createServer({ database: () => created.database });
+    const client = new Client({ name: "unblocked-authority", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const decisionSpy = vi.spyOn(TaskAuthorityService.prototype, "authorizeTaskOperation");
+    const directContext = {
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      capability: authorityCapability,
+    };
+
+    const allowed = await client.callTool({
+      name: "tb_unblocked",
+      arguments: { board_id: board.board_id, actor: "active-reader", ...directContext },
+    });
+    expect(allowed.isError).not.toBe(true);
+    expect(allowed.structuredContent).toMatchObject({
+      board_id: board.board_id,
+      unblocked_count: 1,
+      tasks: [{ id: board.task_ids[0], title: "Protected ready task" }],
+    });
+    expect(decisionSpy).toHaveBeenCalledTimes(1);
+
+    const deniedCases = [
+      { name: "omitted mode", arguments: { board_id: board.board_id, actor: "owner" } },
+      { name: "expired authority", arguments: { board_id: board.board_id, actor: "expired-reader", ...directContext } },
+      { name: "revoked authority", arguments: { board_id: board.board_id, actor: "revoked-reader", ...directContext } },
+      { name: "out-of-scope authority", arguments: { board_id: board.board_id, actor: "scoped-reader", ...directContext } },
+    ];
+    for (const [index, testCase] of deniedCases.entries()) {
+      const before = authoritySnapshot(created.database);
+      const result = await client.callTool({ name: "tb_unblocked", arguments: testCase.arguments });
+      expect(result.isError, testCase.name).toBe(true);
+      expect(result.structuredContent, testCase.name).toEqual({
+        ok: false,
+        error: {
+          category: "authorization",
+          code: "RESOURCE_NOT_AVAILABLE",
+          message: "Resource is not available",
+          data: { code: "RESOURCE_NOT_AVAILABLE" },
+          retryable: false,
+        },
+      });
+      expect(JSON.stringify(result.structuredContent), testCase.name).not.toContain(board.task_ids[0]);
+      expect(authoritySnapshot(created.database), testCase.name).toBe(before);
+      expect(decisionSpy, testCase.name).toHaveBeenCalledTimes(index + 2);
+    }
+
+    const legacy = await client.callTool({ name: "tb_unblocked", arguments: { board_id: legacyBoardId } });
+    expect(legacy.isError).not.toBe(true);
+    expect(JSON.parse((legacy.content[0] as { text: string }).text)).toMatchObject({
+      board_id: legacyBoardId,
+      unblocked_count: 1,
+      tasks: [{ id: legacyTaskId, title: "Legacy ready task" }],
+    });
+    expect(decisionSpy).toHaveBeenCalledTimes(5);
+
+    decisionSpy.mockRestore();
+    await client.close();
+    await server.close();
+    created.database.close();
+  });
+
+  it("linearizes revoke against independent tb_unblocked workers without readiness or count leakage", async () => {
+    for (let iteration = 0; iteration < 10; iteration += 1) {
+      const created = createTestDatabase("forgespec-revoke-unblocked-race-");
+      const clock = new FakeClock(1_900_000_100_000 + iteration);
+      const service = new TaskService(created.database, { clock });
+      const board = service.createDirectBoard({
+        coordination_mode: "direct-v1", api_version: "1.0.0", schema_version: "1.0.0",
+        project: "unblocked-race", name: "Unblocked race", actor: "owner",
+        idempotency_key: `unblocked-race-board-${iteration}`, tasks: [{ title: "Secret ready task" }],
+      });
+      const grant = service.grantAuthority({
+        actor: "owner", resource: { kind: "board", boardId: board.board_id }, granteeActor: "reader",
+        operation: "read_board", expiresAtMs: clock.now() + 60_000,
+        idempotencyKey: `unblocked-race-grant-${iteration}`, expectedBoardRevision: board.board_revision,
+        capability: authorityCapability,
+      });
+      created.database.close();
+      const readInput = {
+        board_id: board.board_id, actor: "reader", coordination_mode: "direct-v1",
+        api_version: "1.0.0", schema_version: "1.0.0", capability: authorityCapability,
+      };
+      const workers = await startUnblockedRaceWorkers(created.path, clock.now(), [{
+        kind: "revoke",
+        input: { actor: "owner", grantId: grant.value.grantId, idempotencyKey: `unblocked-race-revoke-${iteration}`,
+          expectedBoardRevision: grant.boardRevision, capability: authorityCapability },
+      }, { kind: "unblocked", input: readInput }]);
+      try {
+        if (iteration % 2 === 0) {
+          workers.release(0);
+          expect(await workers.result(0)).toMatchObject({ ok: true });
+          workers.release(1);
+          const denied = await workers.result(1);
+          expect(denied).toMatchObject({ ok: true, value: { isError: true } });
+          const serialized = JSON.stringify(denied);
+          expect(serialized).toContain("RESOURCE_NOT_AVAILABLE");
+          expect(serialized).not.toContain(board.board_id);
+          expect(serialized).not.toContain(board.task_ids[0]);
+          expect(serialized).not.toContain("unblocked_count");
+          expect(serialized).not.toContain("Secret ready task");
+        } else {
+          workers.release(1);
+          const allowed = await workers.result(1);
+          expect(allowed).toMatchObject({
+            ok: true,
+            value: { structuredContent: {
+              board_id: board.board_id, unblocked_count: 1, tasks: [{ id: board.task_ids[0] }],
+            } },
+          });
+          expect((allowed.value as { isError?: boolean }).isError).not.toBe(true);
+          workers.release(0);
+          expect(await workers.result(0)).toMatchObject({ ok: true });
+        }
+      } finally {
+        await workers.close();
+      }
+
+      const reopened = openTestDatabase(created.path);
+      const server = createServer({ database: () => reopened });
+      const client = new Client({ name: "unblocked-race-reopen", version: "1.0.0" });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const deniedAfterRestart = await client.callTool({ name: "tb_unblocked", arguments: readInput });
+      expect(deniedAfterRestart.isError).toBe(true);
+      expect(JSON.stringify(deniedAfterRestart)).not.toContain(board.task_ids[0]);
+      await client.close();
+      await server.close();
+      reopened.close();
+    }
+  }, 30_000);
 });
