@@ -1,12 +1,16 @@
 import type Database from "better-sqlite3";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { TASK_STATUSES, type TaskStatus } from "../types/index.js";
+import { TASK_STATUSES, type CapabilityContext, type TaskStatus } from "../types/index.js";
 import { observeServerTime, SystemClock, type Clock } from "../core/clock.js";
-import { hasOrdinaryAuthority } from "../core/attempt-authority.js";
+import { TaskAuthorityService } from "./task-authority-service.js";
 
 export interface TaskQueryInput {
   board_id: string;
   actor: string;
+  coordination_mode?: "legacy" | "direct-v1";
+  api_version?: string;
+  schema_version?: string;
+  capability?: CapabilityContext;
   status?: TaskStatus[];
   ready?: boolean;
   work_unit?: string;
@@ -19,6 +23,10 @@ export interface TaskQueryInput {
 export interface EventQueryInput {
   board_id: string;
   actor: string;
+  coordination_mode?: "legacy" | "direct-v1";
+  api_version?: string;
+  schema_version?: string;
+  capability?: CapabilityContext;
   task_id?: string;
   since_revision?: number;
   event_type?: string[];
@@ -62,8 +70,15 @@ export interface EventSummary {
 
 export interface Page<T> {
   items: T[];
+  page_count: number;
   next_cursor: string | null;
   snapshot_revision: number;
+}
+
+interface TaskPageData {
+  page: Page<TaskSummary>;
+  boardRevision: number;
+  counts: Record<TaskStatus, number>;
 }
 
 interface CursorPayload {
@@ -119,6 +134,7 @@ export class QueryError extends Error {
 export class QueryService {
   private readonly cursorSecret: Buffer;
   private readonly clock: Clock;
+  private readonly authority: TaskAuthorityService;
 
   constructor(
     private readonly database: Database.Database,
@@ -127,10 +143,25 @@ export class QueryService {
     if (options.cursorSecret.length < 32) throw new Error("Cursor secret must contain at least 32 bytes");
     this.cursorSecret = options.cursorSecret;
     this.clock = options.clock ?? (options.now ? { now: options.now } : new SystemClock());
+    this.authority = new TaskAuthorityService(database);
   }
 
-  queryTasks(input: TaskQueryInput): Page<TaskSummary> {
-    const boardRevision = this.authorize(input.board_id, input.actor);
+  async queryTasks(input: TaskQueryInput): Promise<Page<TaskSummary>> {
+    return this.database.transaction(() => this.taskPageData(input)).deferred().page;
+  }
+
+  async batchStatus(input: TaskQueryInput): Promise<Page<TaskSummary> & {
+    board_revision: number;
+    counts: Record<TaskStatus, number>;
+  }> {
+    const result = this.database.transaction(() => this.taskPageData(input)).deferred();
+    return { ...result.page, board_revision: result.boardRevision, counts: result.counts };
+  }
+
+  private taskPageData(input: TaskQueryInput): TaskPageData {
+    const now = observeServerTime(this.database, this.clock);
+    const exactTaskId = input.task_ids?.length === 1 ? input.task_ids[0] : undefined;
+    const boardRevision = this.authorize(input, now, exactTaskId);
     const limit = this.limit(input.limit, 200);
     if (input.task_ids && input.task_ids.length > 100) {
       throw new QueryError("At most 100 task IDs may be queried", "validation", "batch_limit");
@@ -143,14 +174,14 @@ export class QueryService {
       task_ids: input.task_ids ? [...input.task_ids].sort() : undefined,
       updated_after_revision: input.updated_after_revision,
     });
-    const cursor = input.cursor ? this.decodeCursor(input.cursor, "tasks", filter) : null;
+    const cursor = input.cursor ? this.decodeCursor(input.cursor, "tasks", filter, now) : null;
     const snapshot = cursor?.snapshot ?? boardRevision;
     if (snapshot > boardRevision) throw new QueryError("Cursor snapshot is unavailable", "cursor", "cursor_restart", true);
     const last = cursor?.last ?? "";
 
     this.verifySnapshotHistory(input.board_id, snapshot);
-    const clauses = ["t.task_id > ?", "t.is_deleted = 0"];
-    const parameters: unknown[] = [last];
+    const clauses = ["t.is_deleted = 0"];
+    const parameters: unknown[] = [];
     if (input.status?.length) {
       clauses.push(`t.status IN (${input.status.map(() => "?").join(",")})`);
       parameters.push(...input.status);
@@ -184,29 +215,34 @@ export class QueryService {
                AND newer.board_revision <= ?
                AND newer.board_revision > t.board_revision
           )
-        ORDER BY t.task_id
-        LIMIT ?`
-    ).all(input.board_id, snapshot, ...parameters, snapshot, limit + 1) as TaskRow[];
-    const pageItems = rows.slice(0, limit).map((row) => this.taskSummary(row));
-    const hasMore = rows.length > limit;
+         ORDER BY t.task_id`
+    ).all(input.board_id, snapshot, ...parameters, snapshot) as TaskRow[];
+    const counts = Object.fromEntries(TASK_STATUSES.map((status) => [status, 0])) as Record<TaskStatus, number>;
+    rows.forEach((row) => { counts[row.status] += 1; });
+    const pageRows = rows.filter((row) => row.task_id > last).slice(0, limit);
+    const pageItems = pageRows.map((row) => this.taskSummary(row));
+    const hasMore = rows.some((row) => row.task_id > (pageItems.at(-1)?.task_id ?? last));
     return {
-      items: pageItems,
-      next_cursor: hasMore
-        ? this.encodeCursor({ v: 1, kind: "tasks", filter, snapshot, last: pageItems.at(-1)!.task_id })
-        : null,
-      snapshot_revision: snapshot,
+      boardRevision,
+      counts,
+      page: {
+        items: pageItems,
+        page_count: pageItems.length,
+        next_cursor: hasMore
+          ? this.encodeCursor({ v: 1, kind: "tasks", filter, snapshot, last: pageItems.at(-1)!.task_id }, now)
+          : null,
+        snapshot_revision: snapshot,
+      },
     };
   }
 
-  batchStatus(input: TaskQueryInput): Page<TaskSummary> & { board_revision: number; counts: Record<TaskStatus, number> } {
-    const page = this.queryTasks(input);
-    const counts = Object.fromEntries(TASK_STATUSES.map((status) => [status, 0])) as Record<TaskStatus, number>;
-    page.items.forEach((item) => { counts[item.status] += 1; });
-    return { ...page, board_revision: this.authorize(input.board_id, input.actor), counts };
+  async queryEvents(input: EventQueryInput): Promise<Page<EventSummary>> {
+    return this.database.transaction(() => this.queryEventsInTransaction(input)).deferred();
   }
 
-  queryEvents(input: EventQueryInput): Page<EventSummary> {
-    const boardRevision = this.authorize(input.board_id, input.actor);
+  private queryEventsInTransaction(input: EventQueryInput): Page<EventSummary> {
+    const now = observeServerTime(this.database, this.clock);
+    const boardRevision = this.authorize(input, now, input.task_id);
     const limit = this.limit(input.limit, 200);
     const filter = this.filterHash({
       board_id: input.board_id,
@@ -214,7 +250,7 @@ export class QueryService {
       since_revision: input.since_revision,
       event_type: input.event_type ? [...input.event_type].sort() : undefined,
     });
-    const cursor = input.cursor ? this.decodeCursor(input.cursor, "events", filter) : null;
+    const cursor = input.cursor ? this.decodeCursor(input.cursor, "events", filter, now) : null;
     const snapshot = cursor?.snapshot ?? boardRevision;
     if (snapshot > boardRevision) throw new QueryError("Cursor snapshot is unavailable", "cursor", "cursor_restart", true);
     const [lastRevision, lastOrdinal, lastId] = cursor
@@ -252,6 +288,7 @@ export class QueryService {
     const final = pageItems.at(-1);
     return {
       items: pageItems,
+      page_count: pageItems.length,
       next_cursor: hasMore && final
         ? this.encodeCursor({
             v: 1,
@@ -259,33 +296,35 @@ export class QueryService {
             filter,
             snapshot,
             last: `${final.board_revision}:${final.event_ordinal}:${final.event_id}`,
-          })
+          }, now)
         : null,
       snapshot_revision: snapshot,
     };
   }
 
-  private authorize(boardId: string, actor: string): number {
-    const row = this.database.prepare(
-      "SELECT revision, metadata_json FROM direct_boards WHERE board_id = ?"
-    ).get(boardId) as { revision: number; metadata_json: string } | undefined;
-    const owner = row ? (JSON.parse(row.metadata_json) as { owner_actor?: string }).owner_actor : undefined;
-    const now = observeServerTime(this.database, this.clock);
-    const assignedAttempts = (row && actor ? this.database.prepare(
-      `SELECT a.expires_at_ms
-         FROM direct_tasks t
-         JOIN task_attempts a ON a.id = t.current_attempt_id
-        WHERE t.board_id = ?
-          AND a.actor = ?
-          AND a.state = 'active'
-        LIMIT 100`
-    ).all(boardId, actor) : []) as Array<{ expires_at_ms: number }>;
-    const assignedAttempt = assignedAttempts.some((attempt) =>
-      hasOrdinaryAuthority({ expiresAtMs: attempt.expires_at_ms, nowMs: now })
-    );
-    if (!row || !actor || (actor !== owner && !assignedAttempt)) {
-      throw new QueryError("Query authority is invalid", "authorization", "BOARD_QUERY_FORBIDDEN");
+  private authorize(input: TaskQueryInput | EventQueryInput, now: number, taskId?: string): number {
+    const boardId = input.board_id;
+    const contextFields = [input.coordination_mode, input.api_version, input.schema_version, input.capability];
+    const hasContext = contextFields.some((value) => value !== undefined);
+    const validContext = input.coordination_mode === "direct-v1"
+      && input.api_version === "1.0.0"
+      && input.schema_version === "1.0.0";
+    const actor = hasContext && !validContext ? "" : input.actor;
+    const decision = this.authority.authorizeTaskOperation(this.database, {
+      actor,
+      operation: taskId ? "read_task" : "read_board",
+      resource: taskId
+        ? { kind: "task", boardId, taskId }
+        : { kind: "board", boardId },
+      nowMs: now,
+      capability: validContext ? input.capability : undefined,
+    });
+    if (!decision.allowed) {
+      throw new QueryError("Resource is not available", "authorization", "RESOURCE_NOT_AVAILABLE");
     }
+    const row = this.database.prepare("SELECT revision FROM direct_boards WHERE board_id = ?").get(boardId) as
+      { revision: number } | undefined;
+    if (!row) throw new QueryError("Resource is not available", "authorization", "RESOURCE_NOT_AVAILABLE");
     return row.revision;
   }
 
@@ -372,8 +411,7 @@ export class QueryService {
     return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
   }
 
-  private encodeCursor(payload: Omit<CursorPayload, "issued_at_ms" | "expires_at_ms">): string {
-    const now = observeServerTime(this.database, this.clock);
+  private encodeCursor(payload: Omit<CursorPayload, "issued_at_ms" | "expires_at_ms">, now: number): string {
     const body = Buffer.from(JSON.stringify({
       ...payload,
       issued_at_ms: now,
@@ -383,7 +421,7 @@ export class QueryService {
     return `${body}.${signature}`;
   }
 
-  private decodeCursor(encoded: string, kind: CursorPayload["kind"], filter: string): CursorPayload {
+  private decodeCursor(encoded: string, kind: CursorPayload["kind"], filter: string, now: number): CursorPayload {
     try {
       const [body, signature, extra] = encoded.split(".");
       if (!body || !signature || extra) throw new Error("shape");
@@ -403,7 +441,6 @@ export class QueryService {
         throw new Error("payload");
       }
       const validPayload = payload as CursorPayload;
-      const now = observeServerTime(this.database, this.clock);
       if (now >= validPayload.expires_at_ms) {
         throw new QueryError("Cursor has expired", "cursor", "CURSOR_EXPIRED", true);
       }

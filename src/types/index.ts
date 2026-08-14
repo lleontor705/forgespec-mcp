@@ -150,3 +150,162 @@ export interface FileLease {
   updated_at_ms: number;
   released_at_ms: number | null;
 }
+
+// ── Task Authority Types ────────────────────────────────
+export const TASK_OPERATIONS = [
+  "read_board",
+  "read_task",
+  "add",
+  "update",
+  "approve",
+  "recover",
+  "grant",
+  "handoff",
+  "revoke",
+] as const;
+
+export type TaskOperation = (typeof TASK_OPERATIONS)[number];
+
+export const AUTHORITY_DENY_CODES = [
+  "AUTH_UNKNOWN_OPERATION",
+  "AUTH_CONTEXT_REQUIRED",
+  "AUTH_ATTEMPT_MISMATCH",
+  "AUTH_ATTEMPT_INACTIVE",
+  "AUTH_ATTEMPT_EXPIRED",
+  "AUTH_OWNER_OR_GRANT_REQUIRED",
+  "AUTH_GRANT_INACTIVE",
+  "AUTH_SCOPE_MISMATCH",
+  "AUTH_ACTOR_NOT_ALLOWED",
+  "AUTH_CAPABILITY_REQUIRED",
+  "AUTH_PROVENANCE_REQUIRED",
+  "AUTH_IDEMPOTENCY_CONFLICT",
+  "AUTH_REVISION_CONFLICT",
+  "RESOURCE_NOT_AVAILABLE",
+  "AUTH_STATE_UNAVAILABLE",
+] as const;
+
+export type AuthorityDenyCode = (typeof AUTHORITY_DENY_CODES)[number];
+
+export type ResourceRef =
+  | { kind: "board"; boardId: string }
+  | { kind: "task"; boardId: string; taskId: string }
+  | { kind: "grant"; boardId: string; grantId: string };
+
+export interface AttemptCredential {
+  attemptId: string;
+  claimToken: string;
+}
+
+export interface CapabilityContext {
+  coordinationMode: "direct-v1";
+  apiVersion: "1.0.0";
+  schemaVersion: "1.0.0";
+  negotiated: string[];
+}
+
+export interface ApprovalAssertedProvenance {
+  kind: "asserted";
+  source: "explicit" | "evidence-link-derived";
+  assertedActor: string;
+  boundary: "local-trusted-client";
+  mode: "direct-v1";
+  approvalRef: {
+    provider: string;
+    kind: string;
+    externalId: string;
+    digest: `sha256:${string}`;
+  };
+}
+
+export type DelegationIntent =
+  | {
+      kind: "grant";
+      granteeActor: string;
+      operation: TaskOperation;
+      expiresAtMs: number;
+    }
+  | {
+      kind: "handoff";
+      toActor: string;
+      operations: TaskOperation[];
+      expiresAtMs: number;
+      refs: Array<{ provider: "forgespec" | "cortex"; kind: string; externalId: string; digest: `sha256:${string}` }>;
+    }
+  | { kind: "revoke"; grantId: string };
+
+export interface AuthorizeTaskOperationInput {
+  actor: string;
+  operation: TaskOperation;
+  resource: ResourceRef;
+  attempt?: AttemptCredential;
+  capability?: CapabilityContext;
+  nowMs: number;
+  expectedRevision?: number;
+  gateId?: string;
+  approval?: ApprovalAssertedProvenance;
+  delegation?: DelegationIntent;
+}
+
+export type AuthorityBasis =
+  | { kind: "owner" }
+  | { kind: "attempt"; attemptId: string; expiresAtMs: number }
+  | { kind: "grant"; grantId: string; expiresAtMs: number }
+  | { kind: "allowed_actor"; gateId: string };
+
+interface AuthorityDecisionBase {
+  decisionId: string;
+  operation: TaskOperation;
+  resource: ResourceRef;
+  actor: string;
+  evaluatedAtMs: number;
+}
+
+export type AuthorityDecision =
+  | (AuthorityDecisionBase & { allowed: true; basis: AuthorityBasis })
+  | (AuthorityDecisionBase & { allowed: false; code: AuthorityDenyCode });
+
+export interface AuthorityReference {
+  provider: "forgespec" | "cortex";
+  kind: string;
+  externalId: string;
+  digest: `sha256:${string}`;
+}
+
+export interface GrantCommand {
+  actor: string;
+  resource: Exclude<ResourceRef, { kind: "grant" }>;
+  granteeActor: string;
+  operation: TaskOperation;
+  expiresAtMs: number;
+  idempotencyKey: string;
+  expectedBoardRevision: number;
+  capability: CapabilityContext;
+}
+
+export interface HandoffCommand {
+  actor: string;
+  toActor: string;
+  resource: Exclude<ResourceRef, { kind: "grant" }>;
+  operations: TaskOperation[];
+  expiresAtMs: number;
+  refs: AuthorityReference[];
+  idempotencyKey: string;
+  expectedBoardRevision: number;
+  capability: CapabilityContext;
+}
+
+export interface RevokeCommand {
+  actor: string;
+  grantId: string;
+  reason?: string;
+  idempotencyKey: string;
+  expectedBoardRevision: number;
+  capability: CapabilityContext;
+}
+
+export interface CommandResult<T> {
+  value: T;
+  boardRevision: number;
+  eventId: string;
+  replayed: boolean;
+}

@@ -46,6 +46,9 @@ describe("documentation truth checks", () => {
     expect(readme).toContain(`schema ${LATEST_SCHEMA_VERSION}`);
     expect(readme).toContain(`${packageJson.bin["forgespec-mcp"]}`);
     expect(directV1).toContain(`**Version:** ${packageJson.version}`);
+    expect(directV1).toContain(`**Schema:** ${LATEST_SCHEMA_VERSION}`);
+    expect(directV1).toContain(`The latest schema is ${LATEST_SCHEMA_VERSION}.`);
+    expect(directV1).toContain(`Migration ${LATEST_SCHEMA_VERSION}`);
     expect(migrations).toContain(`| ${LATEST_SCHEMA_VERSION} |`);
     for (const document of [readme, directV1]) {
       expect(document).toContain(`${toolNames.length} MCP tools`);

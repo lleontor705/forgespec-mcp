@@ -7,9 +7,16 @@ import {
   LEGACY_SCHEMA_SQL,
   MIGRATION_CONTROL_SCHEMA_SQL,
   DIRECT_TASK_HISTORY_SCHEMA_SQL,
+  DIRECT_AUTHORITY_PERSISTENCE_SCHEMA_SQL,
+  DIRECT_AUTHORITY_LINEAGE_SCHEMA_SQL,
+  DIRECT_AUTHORITY_LINEAGE_PARENT_COLUMN_SQL,
+  DIRECT_AUTHORITY_LINEAGE_KIND_COLUMN_SQL,
+  DIRECT_AUTHORITY_IDEMPOTENCY_HASH_COLUMN_SQL,
+  DIRECT_AUTHORITY_LINEAGE_CONSTRAINTS_SQL,
+  DIRECT_AUTHORITY_LINEAGE_IDENTITY_SCHEMA_SQL,
 } from "./schema.js";
 
-export const LATEST_SCHEMA_VERSION = 3;
+export const LATEST_SCHEMA_VERSION = 6;
 
 interface MigrationHookContext {
   version: number;
@@ -68,6 +75,30 @@ const migrations = [
     name: "direct-v1-p1-task-history",
     sql: DIRECT_TASK_HISTORY_SCHEMA_SQL,
   },
+  {
+    version: 4,
+    name: "direct-v1-additive-authority-persistence",
+    sql: DIRECT_AUTHORITY_PERSISTENCE_SCHEMA_SQL,
+  },
+  {
+    version: 5,
+    name: "direct-v1-grant-ancestry-storage-hardening",
+    sql: DIRECT_AUTHORITY_LINEAGE_SCHEMA_SQL,
+  },
+  {
+    version: 6,
+    name: "direct-v1-grant-lineage-identity-hardening",
+    sql: DIRECT_AUTHORITY_LINEAGE_IDENTITY_SCHEMA_SQL,
+  },
+] as const;
+
+const AUTHORITY_TABLES = [
+  "task_authority_grants",
+  "task_authority_revocations",
+  "task_authority_handoffs",
+  "task_authority_handoff_refs",
+  "task_authority_idempotency",
+  "task_approval_provenance",
 ] as const;
 
 export function migrateDatabase(databasePath: string, options: MigrationOptions = {}): MigrationResult {
@@ -84,6 +115,9 @@ export function migrateDatabase(databasePath: string, options: MigrationOptions 
       throw new Error(`Unsupported database user_version ${fromVersion}`);
     }
     verifyAppliedMigrationChecksums(database, fromVersion);
+    if (fromVersion >= 4) assertAuthoritySchemaAvailable(database);
+    if (fromVersion >= 5) assertAuthorityLineageAvailable(database);
+    if (fromVersion >= 6) assertAuthorityLineageIdentityAvailable(database);
 
     // Set WAL only after checksum verification. A tampered database must not
     // be modified before the startup gate reports the mismatch.
@@ -107,19 +141,15 @@ export function migrateDatabase(databasePath: string, options: MigrationOptions 
     const apply = database.transaction(() => {
       for (const migration of migrations) {
         if (migration.version <= fromVersion) continue;
-        database.exec(migration.sql);
+        if (migration.version === 5) applyAuthorityLineageMigration(database);
+        else database.exec(migration.sql);
         if (migration.version === 2) {
           recordLegacyDependencyFindings(database, now(), migration.version);
         }
         if (migration.version === 3) {
           backfillDirectTaskVersions(database);
         }
-        database
-          .prepare(
-            `INSERT INTO schema_migrations (version, name, checksum, applied_at_ms)
-             VALUES (?, ?, ?, ?)`
-          )
-          .run(migration.version, migration.name, checksum(migration.sql), now());
+        recordAppliedMigration(database, migration, now());
         database.pragma(`user_version = ${migration.version}`);
         appliedVersions.push(migration.version);
         options.beforeCommit?.({ version: migration.version, name: migration.name });
@@ -127,6 +157,9 @@ export function migrateDatabase(databasePath: string, options: MigrationOptions 
     });
 
     apply.exclusive();
+    assertAuthoritySchemaAvailable(database);
+    assertAuthorityLineageAvailable(database);
+    assertAuthorityLineageIdentityAvailable(database);
     qualifyDatabase(database, { requireWal: true });
     return {
       fromVersion,
@@ -137,6 +170,122 @@ export function migrateDatabase(databasePath: string, options: MigrationOptions 
     };
   } finally {
     database.close();
+  }
+}
+
+function recordAppliedMigration(
+  database: Database.Database,
+  migration: (typeof migrations)[number],
+  appliedAtMs: number
+): void {
+  const existing = database
+    .prepare("SELECT name, checksum FROM schema_migrations WHERE version = ?")
+    .get(migration.version) as { name: string; checksum: string } | undefined;
+  const expectedChecksum = checksum(migration.sql);
+  if (existing) {
+    if (existing.name !== migration.name || existing.checksum !== expectedChecksum) {
+      throw new Error(
+        `MIGRATION_CHECKSUM_MISMATCH: version ${migration.version} (${migration.name}); ` +
+          `expected ${expectedChecksum}; observed ${existing.checksum}. ` +
+          "Restore the last verified backup or repair the migration history before retrying."
+      );
+    }
+    return;
+  }
+  database
+    .prepare(
+      `INSERT INTO schema_migrations (version, name, checksum, applied_at_ms)
+       VALUES (?, ?, ?, ?)`
+    )
+    .run(migration.version, migration.name, expectedChecksum, appliedAtMs);
+}
+
+function assertAuthoritySchemaAvailable(database: Database.Database): void {
+  const rows = database
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name IN (${AUTHORITY_TABLES.map(() => "?").join(", ")})`
+    )
+    .all(...AUTHORITY_TABLES) as Array<{ name: string }>;
+  const available = new Set(rows.map(({ name }) => name));
+  const missing = AUTHORITY_TABLES.filter((table) => !available.has(table));
+  if (missing.length > 0) {
+    throw new Error(`AUTH_STATE_UNAVAILABLE: missing durable authority table(s): ${missing.join(", ")}`);
+  }
+}
+
+function applyAuthorityLineageMigration(database: Database.Database): void {
+  const grantColumns = new Set(
+    (database.prepare("PRAGMA table_info(task_authority_grants)").all() as Array<{ name: string }>).map(
+      ({ name }) => name
+    )
+  );
+  if (!grantColumns.has("parent_grant_id")) database.exec(DIRECT_AUTHORITY_LINEAGE_PARENT_COLUMN_SQL);
+  if (!grantColumns.has("lineage_kind")) database.exec(DIRECT_AUTHORITY_LINEAGE_KIND_COLUMN_SQL);
+
+  const idempotencyColumns = new Set(
+    (database.prepare("PRAGMA table_info(task_authority_idempotency)").all() as Array<{ name: string }>).map(
+      ({ name }) => name
+    )
+  );
+  if (!idempotencyColumns.has("idempotency_key_hash")) {
+    database.exec(DIRECT_AUTHORITY_IDEMPOTENCY_HASH_COLUMN_SQL);
+  }
+  database.exec(DIRECT_AUTHORITY_LINEAGE_CONSTRAINTS_SQL);
+}
+
+function assertAuthorityLineageAvailable(database: Database.Database): void {
+  const grantColumns = new Set(
+    (database.prepare("PRAGMA table_info(task_authority_grants)").all() as Array<{ name: string }>).map(
+      ({ name }) => name
+    )
+  );
+  const idempotencyColumns = new Set(
+    (database.prepare("PRAGMA table_info(task_authority_idempotency)").all() as Array<{ name: string }>).map(
+      ({ name }) => name
+    )
+  );
+  if (!grantColumns.has("parent_grant_id") || !grantColumns.has("lineage_kind")) {
+    throw new Error("AUTH_STATE_UNAVAILABLE: grant lineage columns are unavailable");
+  }
+  if (!idempotencyColumns.has("idempotency_key_hash")) {
+    throw new Error("AUTH_STATE_UNAVAILABLE: idempotency key hash storage is unavailable");
+  }
+
+  const corrupt = database
+    .prepare(
+      `WITH RECURSIVE ancestors(grant_id, ancestor_id) AS (
+         SELECT grant_id, parent_grant_id
+           FROM task_authority_grants
+          WHERE parent_grant_id IS NOT NULL
+         UNION
+         SELECT ancestors.grant_id, parent.parent_grant_id
+           FROM ancestors
+           JOIN task_authority_grants AS parent ON parent.grant_id = ancestors.ancestor_id
+          WHERE parent.parent_grant_id IS NOT NULL
+       )
+       SELECT 1
+         FROM ancestors
+        WHERE grant_id = ancestor_id
+        LIMIT 1`
+    )
+    .get();
+  if (corrupt) throw new Error("AUTH_STATE_UNAVAILABLE: corrupt grant lineage detected");
+}
+
+function assertAuthorityLineageIdentityAvailable(database: Database.Database): void {
+  const trigger = database
+    .prepare(
+      `SELECT sql FROM sqlite_master
+        WHERE type = 'trigger' AND name = 'task_authority_grants_lineage_identity_insert'`
+    )
+    .get() as { sql: string } | undefined;
+  if (
+    !trigger ||
+    !trigger.sql.includes("parent.operation = NEW.operation") ||
+    !trigger.sql.includes("parent.grantee_actor = NEW.granted_by_actor")
+  ) {
+    throw new Error("AUTH_STATE_UNAVAILABLE: grant lineage identity constraint is unavailable");
   }
 }
 

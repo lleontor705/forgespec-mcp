@@ -58,6 +58,21 @@ function updateInput(taskId: string, overrides: Partial<DirectTaskUpdateInput> =
   };
 }
 
+function approvalProvenance(actor: string, externalId: string) {
+  return {
+    kind: "asserted" as const,
+    asserted_actor: actor,
+    boundary: "local-trusted-client" as const,
+    mode: "direct-v1" as const,
+    approval_ref: {
+      provider: "forgespec",
+      kind: "approval",
+      external_id: externalId,
+      digest: `sha256:${"d".repeat(64)}`,
+    },
+  };
+}
+
 afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
@@ -326,25 +341,60 @@ describe("direct-v1 evidence references and approval gates", () => {
     }));
 
     expect(() => complete(2, "complete-without-gate")).toThrow(/approval/i);
+    const approvalRowsBeforeMissingProvenance = database.prepare("SELECT COUNT(*) AS count FROM approval_decisions").get();
+    const approvalEventsBeforeMissingProvenance = database.prepare(
+      "SELECT COUNT(*) AS count FROM authority_events WHERE event_type = 'approval_decided'"
+    ).get();
+    expect(() => service.approveDirectTask({
+      task_id: taskId, gate_id: "release", decision: "deny", expected_revision: 2,
+      actor: "reviewer", idempotency_key: "missing-provenance", coordination_mode: "direct-v1", api_version: "1.0.0", schema_version: "1.0.0",
+    })).toThrow(/provenance/i);
+    expect(database.prepare("SELECT COUNT(*) AS count FROM approval_decisions").get()).toEqual(approvalRowsBeforeMissingProvenance);
+    expect(database.prepare("SELECT COUNT(*) AS count FROM task_approval_provenance").get()).toEqual({ count: 0 });
+    expect(database.prepare(
+      "SELECT COUNT(*) AS count FROM authority_events WHERE event_type = 'approval_decided'"
+    ).get()).toEqual(approvalEventsBeforeMissingProvenance);
+
     const denied = service.approveDirectTask({
       task_id: taskId, gate_id: "release", decision: "deny", expected_revision: 2,
       actor: "reviewer", idempotency_key: "deny", coordination_mode: "direct-v1", api_version: "1.0.0", schema_version: "1.0.0",
+      asserted_provenance: approvalProvenance("reviewer", "approval-deny"),
     });
     expect(denied.effective_decision).toBe("deny");
     expect(() => complete(3, "complete-denied")).toThrow(/approval/i);
     expect(() => service.approveDirectTask({
       task_id: taskId, gate_id: "release", decision: "allow", expected_revision: 3,
       actor: "intruder", idempotency_key: "unauthorized", coordination_mode: "direct-v1", api_version: "1.0.0", schema_version: "1.0.0",
+      asserted_provenance: approvalProvenance("intruder", "approval-unauthorized"),
     })).toThrow(/authoriz/i);
+    expect(database.prepare("SELECT COUNT(*) AS count FROM approval_decisions").get()).toEqual({ count: 1 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM task_approval_provenance").get()).toEqual({ count: 1 });
     const allowed = service.approveDirectTask({
       task_id: taskId, gate_id: "release", decision: "allow", expected_revision: 3,
       actor: "reviewer", idempotency_key: "allow", coordination_mode: "direct-v1", api_version: "1.0.0", schema_version: "1.0.0",
+      asserted_provenance: approvalProvenance("reviewer", "approval-allow"),
     });
     expect(allowed.effective_decision).toBe("allow");
+    expect(service.approveDirectTask({
+      task_id: taskId, gate_id: "release", decision: "allow", expected_revision: 3,
+      actor: "reviewer", idempotency_key: "allow", coordination_mode: "direct-v1", api_version: "1.0.0", schema_version: "1.0.0",
+      asserted_provenance: approvalProvenance("reviewer", "approval-allow"),
+    })).toEqual({ ...allowed, replayed: true });
+    expect(() => service.approveDirectTask({
+      task_id: taskId, gate_id: "release", decision: "allow", expected_revision: 3,
+      actor: "reviewer", idempotency_key: "allow", coordination_mode: "direct-v1", api_version: "1.0.0", schema_version: "1.0.0",
+      asserted_provenance: approvalProvenance("reviewer", "approval-altered"),
+    })).toThrow(/idempotency/i);
     expect(complete(4, "complete-allowed").status).toBe("done");
     expect(database.prepare("SELECT decision, decision_no FROM approval_decisions ORDER BY decision_no").all()).toEqual([
       { decision: "deny", decision_no: 1 },
       { decision: "allow", decision_no: 2 },
+    ]);
+    expect(database.prepare(
+      "SELECT asserted_actor, boundary, mode, ref_external_id FROM task_approval_provenance ORDER BY created_at_ms, ref_external_id"
+    ).all()).toEqual([
+      { asserted_actor: "reviewer", boundary: "local-trusted-client", mode: "direct-v1", ref_external_id: "approval-allow" },
+      { asserted_actor: "reviewer", boundary: "local-trusted-client", mode: "direct-v1", ref_external_id: "approval-deny" },
     ]);
     expect(() => database.prepare("UPDATE approval_decisions SET decision = 'deny'").run()).toThrow(/immutable/i);
     database.close();

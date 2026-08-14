@@ -32,10 +32,10 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 - **Zero infrastructure** -- Embedded SQLite database, no external services required
 - **Universal compatibility** -- Works with any MCP client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more
-- **Package:** `forgespec-mcp@1.5.0`; runtime schema 3; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
+- **Package:** `forgespec-mcp@1.5.0`; runtime schema 6; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
 - **Runtime policy:** CI runs nine isolated jobs for Node `22.x`, `24.x`, and `26.x` on Ubuntu, Windows, and macOS. Node 22 uses native ABI 127; Node 24 uses ABI 137; Node 26 uses ABI 147.
 - **Entrypoint:** the package bin is `build/index.js`, exposed as `forgespec-mcp`.
-- **Runtime inventory:** **25 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
+- **Runtime inventory:** **28 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
 - **SQLite preflight:** startup verifies immutable migration checksums and effective `STRICT`, JSON1, and WAL capabilities before MCP traffic.
 - **Performance fixture:** 10,000 tasks × 20 versions, page 100, 30 warmed pages; reference targets are median `<250 ms` and p95 `<500 ms`.
 - **Retention:** task history is append-only and is not pruned by this release.
@@ -49,6 +49,8 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 ForgeSpec 1.5.0 provides **direct-v1**, an additive coordination mode that provides transactional CAS, scoped idempotency, immutable audit history, exclusive attempt-based claim leases, normalized dependency DAGs, structured evidence references, approval gates, bounded snapshot queries, compound cursors, and atomic file reservation leases.
 
 Clients negotiate via `forgespec_capabilities` before using direct-v1 tools. See [docs/direct-v1.md](docs/direct-v1.md) for authority, snapshots, errors, rollout, and the complete inventory. See [docs/migrations.md](docs/migrations.md) for checksum preflight, migration, rollback, and interruption recovery.
+
+The advertised `task-authority@1.0.0` extension is optional and additive. A client must explicitly negotiate `task-authority` and observe exact selection of `1.0.0` before using grant, reference-only handoff, or revoke APIs; omission or an unsupported version leaves those APIs disabled without legacy fallback. Existing direct-v1 contracts and genuine legacy tools/schemas remain compatible. Approval identity is recorded as **asserted provenance** within `local-trusted-client`, not as authenticated identity. To roll back, disable advertisement/use and leave additive authority and audit data intact and inert; never down-migrate it.
 
 ---
 
@@ -189,7 +191,7 @@ Each phase has a **confidence threshold** that must be met before transitioning 
 
 ## Tools Reference
 
-ForgeSpec exposes **25 MCP tools**. The authoritative runtime inventory is maintained in [docs/direct-v1.md](docs/direct-v1.md) and tested against `tools/list`.
+ForgeSpec exposes **28 MCP tools**. The authoritative runtime inventory is maintained in [docs/direct-v1.md](docs/direct-v1.md) and tested against `tools/list`.
 
 ### Capability Tool (1)
 
@@ -209,7 +211,7 @@ Manage the development lifecycle with typed, validated contracts.
 | `sdd_list` | List contracts with optional project/phase filters |
 | `sdd_history` | Get phase transition history for a project |
 
-### Task Board Tools (16)
+### Task Board Tools (19)
 
 SQLite-backed task management with dependency tracking and auto-unblocking.
 
@@ -228,6 +230,9 @@ SQLite-backed task management with dependency tracking and auto-unblocking.
 | `tb_recover_claims` | Recover expired claims |
 | `tb_requeue` | Requeue a task |
 | `tb_approve` | Record an approval decision |
+| `tb_grant` | Create an attenuated, expiring task-authority grant |
+| `tb_handoff` | Create a reference-only attenuated handoff |
+| `tb_revoke` | Append an authority revocation without changing board ownership |
 | `tb_query` | Query snapshot task pages |
 | `tb_batch_status` | Read bounded board/work-unit status |
 | `tb_events` | Read authority-event deltas |

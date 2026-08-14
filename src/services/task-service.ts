@@ -18,6 +18,17 @@ import {
   type TaskStatus,
 } from "../types/index.js";
 import { generateId } from "../utils/id.js";
+import { TaskAuthorityService } from "./task-authority-service.js";
+import type {
+  AuthorityReference,
+  CapabilityContext,
+  CommandResult,
+  GrantCommand,
+  HandoffCommand,
+  ResourceRef,
+  RevokeCommand,
+  TaskOperation,
+} from "../types/index.js";
 
 interface DirectContext {
   coordination_mode: "direct-v1";
@@ -25,6 +36,7 @@ interface DirectContext {
   schema_version: string;
   actor: string;
   idempotency_key: string;
+  capability?: CapabilityContext;
 }
 
 export interface DirectTaskCreate {
@@ -65,8 +77,22 @@ export interface DirectApproveInput extends DirectContext {
   gate_id: string;
   decision: "allow" | "deny";
   expected_revision: number;
+  asserted_provenance?: ApprovalAssertedProvenanceInput;
   evidence_links?: EvidenceRefV1[];
   reason?: string;
+}
+
+interface ApprovalAssertedProvenanceInput {
+  kind: "asserted";
+  source?: "explicit";
+  asserted_actor: string;
+  boundary: "local-trusted-client";
+  mode: "direct-v1";
+  approval_ref: EvidenceRefV1;
+}
+
+interface ResolvedApprovalAssertedProvenance extends Omit<ApprovalAssertedProvenanceInput, "source"> {
+  source: "explicit" | "evidence-link-derived";
 }
 
 export interface DirectSetDependenciesInput extends DirectContext {
@@ -170,6 +196,10 @@ export interface DirectRecoverClaimsResult {
   reblocked: string[];
 }
 
+export type GrantResult = CommandResult<{ grantId: string }>;
+export type HandoffResult = CommandResult<{ handoffId: string; grantIds: string[] }>;
+export type RevokeResult = CommandResult<{ revokeId: string; grantId: string }>;
+
 export class TaskConflictError extends Error {
   constructor(
     message: string,
@@ -247,12 +277,14 @@ const validTransitions: Record<TaskStatus, TaskStatus[]> = {
 
 export class TaskService {
   private readonly clock: Clock;
+  private readonly authority: TaskAuthorityService;
 
   constructor(
     private readonly database: Database.Database,
     options: { now?: () => number; clock?: Clock } = {}
   ) {
     this.clock = options.clock ?? (options.now ? { now: options.now } : new SystemClock());
+    this.authority = new TaskAuthorityService(database);
   }
 
   createDirectBoard(input: DirectBoardCreateInput): DirectBoardMutationResult {
@@ -347,6 +379,15 @@ export class TaskService {
       const board = this.requireDirectBoard(input.board_id);
       if (board.revision !== input.expected_board_revision) this.stale("board", board.revision);
       const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "add",
+        resource: { kind: "board", boardId: board.board_id },
+        nowMs: now,
+        expectedRevision: input.expected_board_revision,
+        capability: input.capability,
+      });
+      this.requireAllowedDecision(decision);
       const timestamp = new Date(now).toISOString();
       const taskId = generateId("task");
       const dependencies = input.dependencies ?? [];
@@ -566,9 +607,17 @@ export class TaskService {
       const replay = this.readReplay<DirectRecoverClaimsResult>(scope, keyHash, digest);
       if (replay) return { ...replay, replayed: true };
       const board = this.requireDirectBoard(input.board_id);
-      this.requireBoardOwner(board, input.actor);
       if (board.revision !== input.expected_board_revision) this.stale("board", board.revision);
       const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "recover",
+        resource: { kind: "board", boardId: board.board_id },
+        nowMs: now,
+        expectedRevision: input.expected_board_revision,
+        capability: input.capability,
+      });
+      this.requireAllowedDecision(decision);
       const requested = input.attempt_ids ?? [];
       const attempts = (requested.length > 0
         ? this.database.prepare(
@@ -632,7 +681,6 @@ export class TaskService {
       if (replay) return { ...replay, replayed: true };
       const task = this.requireDirectTask(input.task_id);
       const board = this.requireDirectBoard(task.board_id);
-      this.requireBoardOwner(board, input.actor);
       if (task.revision !== input.expected_revision) this.stale("task", task.revision);
       const recoveryRequeue = task.status === "blocked" && task.blocked_reason === "requeue_required" && !task.current_attempt_id;
       const dependencyReopen = task.status === "done" && !task.current_attempt_id;
@@ -640,6 +688,14 @@ export class TaskService {
         throw new TaskConflictError("Task does not require explicit requeue", "state", "requeue_not_required");
       }
       const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "recover",
+        resource: { kind: "task", boardId: board.board_id, taskId: task.task_id },
+        nowMs: now,
+        capability: input.capability,
+      });
+      this.requireAllowedDecision(decision);
       const taskRevision = task.revision + 1;
       const boardRevision = board.revision + 1;
       const reblocked = dependencyReopen
@@ -687,13 +743,25 @@ export class TaskService {
       if (replay) return { ...replay, replayed: true };
       const task = this.requireDirectTask(input.task_id);
       if (task.revision !== input.expected_revision) this.stale("task", task.revision);
+      const board = this.requireDirectBoard(task.board_id);
+      const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "update",
+        resource: { kind: "task", boardId: board.board_id, taskId: task.task_id },
+        attempt: input.attempt_id && input.claim_token
+          ? { attemptId: input.attempt_id, claimToken: input.claim_token }
+          : undefined,
+        nowMs: now,
+        capability: input.capability,
+      });
+      this.requireAllowedDecision(decision);
       const attempt = task.current_attempt_id
         ? this.requireAttemptAuthority(task, input.attempt_id, input.actor, input.claim_token)
         : null;
       if (!task.current_attempt_id && (input.attempt_id || input.claim_token)) {
         throw new TaskConflictError("Attempt authority has been superseded", "authorization", "superseded_authority");
       }
-      const board = this.requireDirectBoard(task.board_id);
       const status = input.status ?? task.status;
       if (input.status !== undefined && input.status !== task.status && !validTransitions[task.status].includes(input.status)) {
         throw new TaskConflictError(`Invalid task transition from ${task.status} to ${input.status}`, "state", "invalid_transition");
@@ -705,13 +773,12 @@ export class TaskService {
         };
         storeIdempotentResponse(this.database, {
           scope, keyHash, requestDigest: digest, response, resourceType: "task", resourceId: task.task_id,
-          resultingRevision: task.revision, createdAtMs: this.effectiveNow(),
+          resultingRevision: task.revision, createdAtMs: now,
         });
         return response;
       }
       this.requireEffectiveApprovals(task.task_id, status);
       const metadata = JSON.parse(task.metadata_json) as TaskMetadata;
-      const now = this.effectiveNow();
       const timestamp = new Date(now).toISOString();
       if (input.notes) metadata.notes.push({ text: input.notes, timestamp });
       const taskRevision = task.revision + 1;
@@ -769,6 +836,7 @@ export class TaskService {
     this.validateContext(input);
     this.validateExpectedRevision(input.expected_revision, "Expected revision");
     this.validateEvidenceLinks(input.evidence_links ?? []);
+    const assertedProvenance = this.requireApprovalAssertedProvenance(input);
     if (!input.gate_id || !["allow", "deny"].includes(input.decision)) {
       throw new TaskConflictError("Gate and decision are required", "approval", "approval_invalid");
     }
@@ -780,16 +848,30 @@ export class TaskService {
       if (replay) return { ...replay, replayed: true };
       const task = this.requireDirectTask(input.task_id);
       if (task.revision !== input.expected_revision) this.stale("task", task.revision);
-      const gate = this.database.prepare(
-        "SELECT policy_json FROM approval_gates WHERE task_id = ? AND gate_id = ?"
-      ).get(task.task_id, input.gate_id) as { policy_json: string } | undefined;
-      if (!gate) throw new TaskConflictError("Approval gate is not declared", "approval", "approval_gate_missing");
-      const policy = JSON.parse(gate.policy_json) as ApprovalGateV1;
-      if (!policy.allowed_actors.includes(input.actor)) {
-        throw new TaskConflictError("Approval authorization is invalid", "authorization", "approval_unauthorized");
-      }
       const board = this.requireDirectBoard(task.board_id);
       const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "approve",
+        resource: { kind: "task", boardId: board.board_id, taskId: task.task_id },
+        nowMs: now,
+        gateId: input.gate_id,
+        capability: input.capability,
+        approval: {
+          kind: assertedProvenance.kind,
+          source: assertedProvenance.source,
+          assertedActor: assertedProvenance.asserted_actor,
+          boundary: assertedProvenance.boundary,
+          mode: assertedProvenance.mode,
+          approvalRef: {
+            provider: assertedProvenance.approval_ref.provider,
+            kind: assertedProvenance.approval_ref.kind,
+            externalId: assertedProvenance.approval_ref.external_id,
+            digest: assertedProvenance.approval_ref.digest,
+          },
+        },
+      });
+      this.requireAllowedDecision(decision);
       const taskRevision = task.revision + 1;
       const boardRevision = board.revision + 1;
       const decisionNo = (this.database.prepare(
@@ -808,12 +890,32 @@ export class TaskService {
       evidenceIds.forEach((evidenceId) => linkDecision.run(decisionId, evidenceId));
       this.updateTaskAuthority(task, taskRevision, task.status, task.current_attempt_id, task.blocked_reason, now, boardRevision);
       this.updateBoardRevision(board, boardRevision, now);
-      this.appendBoardEvent(board.board_id, boardRevision, 0, "approval_decided", input.actor, keyHash, {
-        gate_id: input.gate_id,
-        decision: input.decision,
-        decision_id: decisionId,
-        evidence_ids: evidenceIds,
-      }, now, task.task_id, taskRevision, task.current_attempt_id ?? undefined);
+      const decisionEventId = this.appendApprovalDecisionEvent({
+        boardId: board.board_id,
+        boardRevision,
+        actor: input.actor,
+        correlationHash: keyHash,
+        createdAtMs: now,
+        taskId: task.task_id,
+        taskRevision,
+        attemptId: task.current_attempt_id ?? undefined,
+        details: {
+          gate_id: input.gate_id,
+          decision: input.decision,
+          decision_id: decisionId,
+           evidence_ids: evidenceIds,
+           provenance_kind: "asserted",
+           provenance_source: assertedProvenance.source,
+         },
+      });
+      this.insertApprovalAssertedProvenance({
+        boardId: board.board_id,
+        taskId: task.task_id,
+        gateId: input.gate_id,
+        decisionEventId,
+        provenance: assertedProvenance,
+        createdAtMs: now,
+      });
       const response: DirectApprovalResult = {
         ok: true,
         replayed: false,
@@ -878,6 +980,45 @@ export class TaskService {
     return reconcile.immediate();
   }
 
+  async readLegacyBoard(boardId: string): Promise<{
+    board: Record<string, unknown>;
+    tasks: Record<string, unknown>[];
+  }> {
+    if (this.database.prepare("SELECT 1 FROM direct_boards WHERE board_id = ?").get(boardId)) {
+      throw new TaskConflictError("Resource is not available", "authorization", "RESOURCE_NOT_AVAILABLE");
+    }
+    const board = this.database.prepare("SELECT * FROM boards WHERE id = ?").get(boardId) as
+      Record<string, unknown> | undefined;
+    if (!board) throw new TaskConflictError("Resource is not available", "authorization", "RESOURCE_NOT_AVAILABLE");
+    const tasks = this.database.prepare(
+      `SELECT t.* FROM tasks t
+        WHERE t.board_id = ?
+          AND NOT EXISTS (SELECT 1 FROM direct_tasks d WHERE d.task_id = t.id)
+        ORDER BY t.created_at, t.id`
+    ).all(boardId) as Record<string, unknown>[];
+    return { board: { ...board, mode: "legacy" }, tasks };
+  }
+
+  async readLegacyTask(taskId: string): Promise<Record<string, unknown>> {
+    if (this.database.prepare("SELECT 1 FROM direct_tasks WHERE task_id = ?").get(taskId)) {
+      throw new TaskConflictError("Resource is not available", "authorization", "RESOURCE_NOT_AVAILABLE");
+    }
+    const task = this.database.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as
+      Record<string, unknown> | undefined;
+    if (!task) throw new TaskConflictError("Resource is not available", "authorization", "RESOURCE_NOT_AVAILABLE");
+    return task;
+  }
+
+  async listLegacyBoards(project?: string): Promise<Record<string, unknown>[]> {
+    const projectClause = project ? "b.project = ? AND" : "";
+    return this.database.prepare(
+      `SELECT b.* FROM boards b
+        WHERE ${projectClause}
+          NOT EXISTS (SELECT 1 FROM direct_boards d WHERE d.board_id = b.id)
+        ORDER BY b.created_at DESC`
+    ).all(...(project ? [project] : [])) as Record<string, unknown>[];
+  }
+
   assertLegacyTaskMutationAllowed(taskId: string): void {
     if (this.database.prepare("SELECT 1 FROM direct_tasks WHERE task_id = ?").get(taskId)) {
       throw new TaskConflictError("Legacy mutation cannot modify a direct-v1 task", "compatibility", "legacy_direct_bypass");
@@ -893,6 +1034,20 @@ export class TaskService {
   private validateContext(input: DirectContext): void {
     this.validateVersions(input);
     if (!input.actor || !input.idempotency_key) throw new TaskConflictError("Actor and idempotency key are required", "validation");
+    if (input.capability !== undefined) this.validateTaskAuthorityCapability(input.capability);
+  }
+
+  private validateTaskAuthorityCapability(capability: CapabilityContext): void {
+    const authorityCapabilities = capability?.negotiated.filter((item) => item.startsWith("task-authority@")) ?? [];
+    if (capability?.coordinationMode !== "direct-v1" || capability.apiVersion !== "1.0.0"
+        || capability.schemaVersion !== "1.0.0" || authorityCapabilities.length !== 1
+        || authorityCapabilities[0] !== "task-authority@1.0.0") {
+      throw new TaskConflictError(
+        "Exact task-authority@1.0.0 negotiation is required",
+        "compatibility",
+        "AUTH_CAPABILITY_REQUIRED"
+      );
+    }
   }
 
   private validateVersions(input: { coordination_mode: string; api_version: string; schema_version: string }): void {
@@ -1032,6 +1187,389 @@ export class TaskService {
         throw new TaskConflictError("Evidence reference is invalid or contains forbidden fields", "validation", "evidence_invalid");
       }
     }
+  }
+
+  grantAuthority(input: GrantCommand): GrantResult {
+    this.validateDelegationCommand(input.actor, input.idempotencyKey, input.capability);
+    if (!input.granteeActor || !this.isTaskOperation(input.operation)) {
+      throw new TaskConflictError("Grant intent is invalid", "validation", "AUTH_CONTEXT_REQUIRED");
+    }
+    return this.runMutation(() => {
+      const board = this.requireDirectBoard(input.resource.boardId);
+      const digest = this.authorityRequestDigest(input);
+      const replay = this.readAuthorityReplay<GrantResult>("grant", board.board_id, input.idempotencyKey, digest);
+      if (replay) return { ...replay, replayed: true };
+      const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "grant",
+        resource: input.resource,
+        capability: input.capability,
+        nowMs: now,
+        expectedRevision: input.expectedBoardRevision,
+        delegation: {
+          kind: "grant",
+          granteeActor: input.granteeActor,
+          operation: input.operation,
+          expiresAtMs: input.expiresAtMs,
+        },
+      });
+      this.requireAllowedDecision(decision);
+      const parentGrantId = decision.basis.kind === "grant" ? decision.basis.grantId : null;
+      const lineageKind = parentGrantId ? "delegated" : "owner_root";
+      const boardRevision = board.revision + 1;
+      const grantId = generateId("grant");
+      const eventId = this.appendAuthorityCommandEvent(
+        board, boardRevision, 0, "authority_granted", input.actor, input.resource,
+        hashIdempotencyKey(input.idempotencyKey), { grant_id: grantId, grantee_actor: input.granteeActor, operation: input.operation }, now
+      );
+      this.database.prepare(
+         `INSERT INTO task_authority_grants
+           (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation, granted_by_actor,
+             expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id, parent_grant_id, lineage_kind)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'grant', NULL, ?, ?, ?, ?)`
+      ).run(
+        grantId, board.board_id, input.resource.kind, this.resourceId(input.resource), input.granteeActor,
+        input.operation, input.actor, input.expiresAtMs, now, eventId, parentGrantId, lineageKind
+      );
+      this.updateBoardRevision(board, boardRevision, now);
+      const response: GrantResult = { value: { grantId }, boardRevision, eventId, replayed: false };
+      this.storeAuthorityReplay("grant", board.board_id, input.idempotencyKey, digest, "grant", grantId, response, now);
+      return response;
+    });
+  }
+
+  handoffAuthority(input: HandoffCommand): HandoffResult {
+    this.validateDelegationCommand(input.actor, input.idempotencyKey, input.capability);
+    this.validateAuthorityReferences(input.refs);
+    if (!input.toActor || input.operations.length === 0 || new Set(input.operations).size !== input.operations.length
+        || input.operations.some((operation) => !this.isTaskOperation(operation))) {
+      throw new TaskConflictError("Handoff intent is invalid", "validation", "AUTH_CONTEXT_REQUIRED");
+    }
+    return this.runMutation(() => {
+      const board = this.requireDirectBoard(input.resource.boardId);
+      const digest = this.authorityRequestDigest(input);
+      const replay = this.readAuthorityReplay<HandoffResult>("handoff", board.board_id, input.idempotencyKey, digest);
+      if (replay) return { ...replay, replayed: true };
+      const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "handoff",
+        resource: input.resource,
+        capability: input.capability,
+        nowMs: now,
+        expectedRevision: input.expectedBoardRevision,
+        delegation: {
+          kind: "handoff",
+          toActor: input.toActor,
+          operations: input.operations,
+          expiresAtMs: input.expiresAtMs,
+          refs: input.refs,
+        },
+      });
+      this.requireAllowedDecision(decision);
+      const boardRevision = board.revision + 1;
+      const handoffId = generateId("handoff");
+      const correlation = hashIdempotencyKey(input.idempotencyKey);
+      const eventId = this.appendAuthorityCommandEvent(
+        board, boardRevision, 0, "authority_handoff", input.actor, input.resource, correlation,
+        { handoff_id: handoffId, to_actor: input.toActor, operations: input.operations }, now
+      );
+      this.database.prepare(
+        `INSERT INTO task_authority_handoffs
+           (handoff_id, board_id, from_actor, to_actor, resource_kind, resource_id, expires_at_ms, created_at_ms, created_event_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        handoffId, board.board_id, input.actor, input.toActor, input.resource.kind,
+        this.resourceId(input.resource), input.expiresAtMs, now, eventId
+      );
+      const insertRef = this.database.prepare(
+        `INSERT INTO task_authority_handoff_refs
+           (handoff_id, ordinal, provider, kind, external_id, digest) VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      input.refs.forEach((ref, ordinal) => insertRef.run(handoffId, ordinal, ref.provider, ref.kind, ref.externalId, ref.digest));
+      const grantIds = input.operations.map((operation, index) => {
+        const parentGrantId = decision.basis.kind === "owner" ? null
+          : this.authority.activeDelegationParent(this.database, {
+              actor: input.actor, resource: input.resource, nowMs: now,
+            }, operation)?.grantId ?? null;
+        if (decision.basis.kind !== "owner" && !parentGrantId) {
+          throw new TaskConflictError("Delegation parent is no longer authoritative", "authorization", "AUTH_SCOPE_MISMATCH");
+        }
+        const lineageKind = parentGrantId ? "delegated" : "owner_root";
+        const grantId = generateId("grant");
+        const grantEventId = this.appendAuthorityCommandEvent(
+          board, boardRevision, index + 1, "authority_handoff_grant", input.actor, input.resource,
+          correlation, { handoff_id: handoffId, grant_id: grantId, grantee_actor: input.toActor, operation }, now
+        );
+        this.database.prepare(
+          `INSERT INTO task_authority_grants
+             (grant_id, board_id, resource_kind, resource_id, grantee_actor, operation, granted_by_actor,
+               expires_at_ms, origin_kind, origin_id, created_at_ms, created_event_id, parent_grant_id, lineage_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'handoff', ?, ?, ?, ?, ?)`
+        ).run(
+          grantId, board.board_id, input.resource.kind, this.resourceId(input.resource), input.toActor,
+          operation, input.actor, input.expiresAtMs, handoffId, now, grantEventId, parentGrantId, lineageKind
+        );
+        return grantId;
+      });
+      this.updateBoardRevision(board, boardRevision, now);
+      const response: HandoffResult = { value: { handoffId, grantIds }, boardRevision, eventId, replayed: false };
+      this.storeAuthorityReplay("handoff", board.board_id, input.idempotencyKey, digest, "handoff", handoffId, response, now);
+      return response;
+    });
+  }
+
+  revokeAuthority(input: RevokeCommand): RevokeResult {
+    this.validateDelegationCommand(input.actor, input.idempotencyKey, input.capability);
+    if (!input.grantId) throw new TaskConflictError("Grant id is required", "validation", "AUTH_CONTEXT_REQUIRED");
+    return this.runMutation(() => {
+      const target = this.database.prepare(
+        `SELECT grant_id, board_id, resource_kind, resource_id FROM task_authority_grants WHERE grant_id = ?`
+      ).get(input.grantId) as { grant_id: string; board_id: string; resource_kind: "board" | "task"; resource_id: string } | undefined;
+      if (!target) throw new TaskConflictError("Grant is not available", "authorization", "RESOURCE_NOT_AVAILABLE");
+      const board = this.requireDirectBoard(target.board_id);
+      const digest = this.authorityRequestDigest(input);
+      const replay = this.readAuthorityReplay<RevokeResult>("revoke", board.board_id, input.idempotencyKey, digest);
+      if (replay) return { ...replay, replayed: true };
+      const resource = this.parentResource(target);
+      const now = this.effectiveNow();
+      const decision = this.authority.authorizeTaskOperation(this.database, {
+        actor: input.actor,
+        operation: "revoke",
+        resource,
+        capability: input.capability,
+        nowMs: now,
+        expectedRevision: input.expectedBoardRevision,
+        delegation: { kind: "revoke", grantId: input.grantId },
+      });
+      this.requireAllowedDecision(decision);
+      const existing = this.database.prepare(
+        "SELECT revoke_id, created_event_id FROM task_authority_revocations WHERE grant_id = ?"
+      ).get(input.grantId) as { revoke_id: string; created_event_id: string } | undefined;
+      if (existing) {
+        const response: RevokeResult = {
+          value: { revokeId: existing.revoke_id, grantId: input.grantId },
+          boardRevision: board.revision,
+          eventId: existing.created_event_id,
+          replayed: false,
+        };
+        this.storeAuthorityReplay("revoke", board.board_id, input.idempotencyKey, digest, "revoke", existing.revoke_id, response, now);
+        return response;
+      }
+      const boardRevision = board.revision + 1;
+      const revokeId = generateId("revoke");
+      const eventId = this.appendAuthorityCommandEvent(
+        board, boardRevision, 0, "authority_revoked", input.actor, resource,
+        hashIdempotencyKey(input.idempotencyKey), { revoke_id: revokeId, grant_id: input.grantId, reason: input.reason ?? null }, now
+      );
+      this.database.prepare(
+        `INSERT INTO task_authority_revocations
+           (revoke_id, grant_id, board_id, revoked_by_actor, reason, created_at_ms, created_event_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(revokeId, input.grantId, board.board_id, input.actor, input.reason ?? null, now, eventId);
+      this.updateBoardRevision(board, boardRevision, now);
+      const response: RevokeResult = { value: { revokeId, grantId: input.grantId }, boardRevision, eventId, replayed: false };
+      this.storeAuthorityReplay("revoke", board.board_id, input.idempotencyKey, digest, "revoke", revokeId, response, now);
+      return response;
+    });
+  }
+
+  private requireApprovalAssertedProvenance(input: DirectApproveInput): ResolvedApprovalAssertedProvenance {
+    if (input.asserted_provenance && (input.evidence_links?.length ?? 0) > 0) {
+      throw new TaskConflictError(
+        "Approval asserted provenance must have exactly one canonical source",
+        "approval",
+        "AUTH_PROVENANCE_REQUIRED"
+      );
+    }
+    const provenance: ResolvedApprovalAssertedProvenance | undefined = input.asserted_provenance
+      ? { ...input.asserted_provenance, source: input.asserted_provenance.source ?? "explicit" }
+      : this.approvalProvenanceFromEvidence(input);
+    const allowed = new Set(["kind", "source", "asserted_actor", "boundary", "mode", "approval_ref"]);
+    const reference = provenance?.approval_ref;
+    const allowedReference = new Set(["provider", "kind", "external_id", "digest"]);
+    if (!provenance || Object.keys(provenance).some((key) => !allowed.has(key)) ||
+        provenance.kind !== "asserted" ||
+        !["explicit", "evidence-link-derived"].includes(provenance.source) ||
+        provenance.asserted_actor !== input.actor ||
+        provenance.boundary !== "local-trusted-client" || provenance.mode !== "direct-v1" ||
+        !reference || Object.keys(reference).some((key) => !allowedReference.has(key)) ||
+        !reference.provider || !reference.kind || !reference.external_id ||
+        !/^sha256:[0-9a-f]{64}$/.test(reference.digest)) {
+      throw new TaskConflictError(
+        "Approval asserted provenance is required and must match the asserted actor",
+        "approval",
+        "AUTH_PROVENANCE_REQUIRED"
+      );
+    }
+    return provenance;
+  }
+
+  private approvalProvenanceFromEvidence(input: DirectApproveInput): ResolvedApprovalAssertedProvenance | undefined {
+    if (input.asserted_provenance || input.evidence_links?.length !== 1) return undefined;
+    return {
+      kind: "asserted",
+      source: "evidence-link-derived",
+      asserted_actor: input.actor,
+      boundary: "local-trusted-client",
+      mode: "direct-v1",
+      approval_ref: input.evidence_links[0],
+    };
+  }
+
+  private appendApprovalDecisionEvent(input: {
+    boardId: string;
+    boardRevision: number;
+    actor: string;
+    correlationHash: string;
+    details: Record<string, unknown>;
+    createdAtMs: number;
+    taskId: string;
+    taskRevision: number;
+    attemptId?: string;
+  }): string {
+    const eventId = generateId("event");
+    this.database.prepare(
+      `INSERT INTO authority_events
+          (event_id, resource_type, resource_id, board_id, board_revision, resource_revision, event_ordinal,
+           event_type, actor, attempt_id, outcome, correlation_hash, details_json, created_at_ms)
+        VALUES (?, 'task', ?, ?, ?, ?, 0, 'approval_decided', ?, ?, 'success', ?, ?, ?)`
+    ).run(
+      eventId, input.taskId, input.boardId, input.boardRevision, input.taskRevision, input.actor,
+      input.attemptId ?? null, input.correlationHash, JSON.stringify(input.details), input.createdAtMs
+    );
+    return eventId;
+  }
+
+  private insertApprovalAssertedProvenance(input: {
+    boardId: string;
+    taskId: string;
+    gateId: string;
+    decisionEventId: string;
+    provenance: ResolvedApprovalAssertedProvenance;
+    createdAtMs: number;
+  }): void {
+    const reference = input.provenance.approval_ref;
+    this.database.prepare(
+      `INSERT INTO task_approval_provenance
+         (board_id, task_id, gate_id, decision_event_id, asserted_actor, boundary, mode,
+          ref_provider, ref_kind, ref_external_id, ref_digest, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      input.boardId, input.taskId, input.gateId, input.decisionEventId,
+      input.provenance.asserted_actor, input.provenance.boundary, input.provenance.mode,
+      reference.provider, reference.kind, reference.external_id, reference.digest, input.createdAtMs
+    );
+  }
+
+  private validateDelegationCommand(actor: string, idempotencyKey: string, capability: CapabilityContext): void {
+    if (!actor || !idempotencyKey) {
+      throw new TaskConflictError("Actor and idempotency key are required", "validation", "AUTH_CONTEXT_REQUIRED");
+    }
+    this.validateTaskAuthorityCapability(capability);
+  }
+
+  private validateAuthorityReferences(refs: AuthorityReference[]): void {
+    if (refs.length === 0 || refs.length > 100 || refs.some((ref) =>
+      !["forgespec", "cortex"].includes(ref.provider) || !ref.kind || !ref.externalId
+      || !/^sha256:[0-9a-f]{64}$/.test(ref.digest)
+    )) throw new TaskConflictError("Handoff references are invalid", "validation", "AUTH_CONTEXT_REQUIRED");
+  }
+
+  private isTaskOperation(operation: unknown): operation is TaskOperation {
+    return typeof operation === "string" && [
+      "read_board", "read_task", "add", "update", "approve", "recover", "grant", "handoff", "revoke",
+    ].includes(operation);
+  }
+
+  private requireAllowedDecision(
+    decision: ReturnType<TaskAuthorityService["authorizeTaskOperation"]>
+  ): asserts decision is Extract<ReturnType<TaskAuthorityService["authorizeTaskOperation"]>, { allowed: true }> {
+    if (!decision.allowed) {
+      throw new TaskConflictError("Task authority: authorization denied the operation", "authorization", decision.code);
+    }
+  }
+
+  private authorityRequestDigest(input: GrantCommand | HandoffCommand | RevokeCommand): string {
+    return requestDigest(this.withoutUndefined({ ...input, idempotencyKey: undefined }));
+  }
+
+  private readAuthorityReplay<T>(
+    commandKind: "grant" | "handoff" | "revoke",
+    boardId: string,
+    idempotencyKey: string,
+    digest: string
+  ): T | null {
+    const keyHash = hashIdempotencyKey(idempotencyKey);
+    const row = this.database.prepare(
+      `SELECT request_hash, canonical_response_json FROM task_authority_idempotency
+       WHERE command_kind = ? AND board_id = ?
+         AND (idempotency_key_hash = ? OR (idempotency_key_hash IS NULL AND idempotency_key = ?))
+       ORDER BY idempotency_key_hash IS NOT NULL DESC LIMIT 1`
+    ).get(commandKind, boardId, keyHash, idempotencyKey) as { request_hash: string; canonical_response_json: string } | undefined;
+    if (!row) return null;
+    if (row.request_hash !== digest) {
+      throw new TaskConflictError("Idempotency key was reused with a different payload", "idempotency", "AUTH_IDEMPOTENCY_CONFLICT");
+    }
+    return JSON.parse(row.canonical_response_json) as T;
+  }
+
+  private storeAuthorityReplay<T>(
+    commandKind: "grant" | "handoff" | "revoke",
+    boardId: string,
+    idempotencyKey: string,
+    digest: string,
+    resultKind: string,
+    resultId: string,
+    response: T,
+    now: number
+  ): void {
+    const keyHash = hashIdempotencyKey(idempotencyKey);
+    this.database.prepare(
+      `INSERT INTO task_authority_idempotency
+         (command_kind, board_id, idempotency_key, idempotency_key_hash, request_hash,
+          result_kind, result_id, canonical_response_json, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(commandKind, boardId, keyHash, keyHash, digest, resultKind, resultId, JSON.stringify(response), now);
+  }
+
+  private resourceId(resource: Exclude<ResourceRef, { kind: "grant" }>): string {
+    return resource.kind === "board" ? resource.boardId : resource.taskId;
+  }
+
+  private parentResource(target: {
+    board_id: string;
+    resource_kind: "board" | "task";
+    resource_id: string;
+  }): Exclude<ResourceRef, { kind: "grant" }> {
+    return target.resource_kind === "board"
+      ? { kind: "board", boardId: target.board_id }
+      : { kind: "task", boardId: target.board_id, taskId: target.resource_id };
+  }
+
+  private appendAuthorityCommandEvent(
+    board: DirectBoardRow,
+    boardRevision: number,
+    ordinal: number,
+    eventType: string,
+    actor: string,
+    resource: Exclude<ResourceRef, { kind: "grant" }>,
+    correlationHash: string,
+    details: Record<string, unknown>,
+    now: number
+  ): string {
+    const eventId = generateId("event");
+    this.database.prepare(
+      `INSERT INTO authority_events
+         (event_id, resource_type, resource_id, board_id, board_revision, resource_revision, event_ordinal,
+          event_type, actor, attempt_id, outcome, correlation_hash, details_json, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'success', ?, ?, ?)`
+    ).run(
+      eventId, resource.kind, this.resourceId(resource), board.board_id, boardRevision, boardRevision,
+      ordinal, eventType, actor, correlationHash, JSON.stringify(details), now
+    );
+    return eventId;
   }
 
   private attachEvidence(

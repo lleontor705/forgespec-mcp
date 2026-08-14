@@ -3,7 +3,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ALL_DIRECT_V1_CAPABILITIES,
   DIRECT_V1_P0_CAPABILITIES,
+  TASK_AUTHORITY_CAPABILITY_ID,
   negotiateCapabilities,
 } from "../src/core/capabilities.js";
 import { registerCapabilitiesTool } from "../src/tools/capabilities.js";
@@ -33,7 +35,11 @@ describe("direct-v1 capability negotiation", () => {
     expect(result.capabilities.filter(({ id }) => DIRECT_V1_P0_CAPABILITIES.includes(id))).toHaveLength(
       DIRECT_V1_P0_CAPABILITIES.length
     );
-    expect(result.capabilities.every(({ selected }) => selected === "1.0.0")).toBe(true);
+    expect(
+      result.capabilities
+        .filter(({ id }) => ALL_DIRECT_V1_CAPABILITIES.includes(id))
+        .every(({ selected }) => selected === "1.0.0")
+    ).toBe(true);
     expect(result.limits).toMatchObject({ max_page_size: 200, max_idempotency_key_bytes: 256 });
   });
 
@@ -108,6 +114,64 @@ describe("direct-v1 capability negotiation", () => {
     expect(result.modes).toEqual(["legacy", "direct-v1"]);
     expect(result.security.identity_model).toBe("local-trusted-client");
     expect(result.schemas.sdd_envelope).toEqual({ min_inclusive: "1.0.0", max_exclusive: "2.0.0" });
+  });
+
+  it("unnegotiated client keeps existing direct-v1 surface only", () => {
+    const result = negotiateCapabilities({ requested_mode: "direct-v1" });
+    const taskAuthority = result.capabilities.find(({ id }) => id === TASK_AUTHORITY_CAPABILITY_ID);
+
+    expect(result.compatibility).toMatchObject({ compatible: true, selected_mode: "direct-v1" });
+    expect(taskAuthority).toEqual({
+      id: "task-authority",
+      supported: { min_inclusive: "1.0.0", max_exclusive: "2.0.0" },
+    });
+    expect(
+      result.capabilities
+        .filter(({ id }) => ALL_DIRECT_V1_CAPABILITIES.includes(id))
+        .every(({ selected }) => selected === "1.0.0")
+    ).toBe(true);
+  });
+
+  it("selects task-authority only for an exact supported negotiation", () => {
+    const result = negotiateCapabilities({
+      requested_mode: "direct-v1",
+      required: [{
+        id: TASK_AUTHORITY_CAPABILITY_ID,
+        range: { min_inclusive: "1.0.0", max_exclusive: "1.0.1" },
+        optional: true,
+      }],
+    });
+
+    expect(result.compatibility).toMatchObject({
+      compatible: true,
+      selected_mode: "direct-v1",
+      unavailable_optional: [],
+    });
+    expect(result.capabilities.find(({ id }) => id === TASK_AUTHORITY_CAPABILITY_ID)).toEqual({
+      id: "task-authority",
+      supported: { min_inclusive: "1.0.0", max_exclusive: "2.0.0" },
+      selected: "1.0.0",
+    });
+  });
+
+  it("unsupported task-authority capability fails without downgrade", () => {
+    const result = negotiateCapabilities({
+      requested_mode: "direct-v1",
+      required: [{
+        id: TASK_AUTHORITY_CAPABILITY_ID,
+        range: { min_inclusive: "2.0.0", max_exclusive: "3.0.0" },
+      }],
+    });
+
+    expect(result.modes).toEqual(["legacy", "direct-v1"]);
+    expect(result.compatibility.compatible).toBe(false);
+    expect(result.compatibility.selected_mode).toBeUndefined();
+    expect(result.compatibility.missing).toEqual([]);
+    expect(result.compatibility.incompatible).toEqual([{
+      id: "task-authority",
+      required: { min_inclusive: "2.0.0", max_exclusive: "3.0.0" },
+      supported: { min_inclusive: "1.0.0", max_exclusive: "2.0.0" },
+    }]);
   });
 
   it("exposes identical structured and JSON capability responses through MCP", async () => {
