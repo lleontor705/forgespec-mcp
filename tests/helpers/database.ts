@@ -126,11 +126,62 @@ export function seedTaskCreatedEvent(
     .run(eventId, taskId, boardId, boardRevision, eventOrdinal);
 }
 
+/**
+ * Transient Windows error codes observed when removing a temp SQLite directory
+ * whose WAL/SHM files are still being released by the OS or antivirus scanners
+ * after better-sqlite3 reports the handle closed. Recursion can surface EBUSY,
+ * EPERM, or ENOTEMPTY briefly before the directory becomes removable.
+ */
+const RETRYABLE_TEMPDIR_ERRORS = new Set(["EBUSY", "EPERM", "ENOTEMPTY"]);
+
+/**
+ * Synchronously blocks the caller for `ms` milliseconds. Test teardown is
+ * synchronous, so we cannot await a timer; Atomics.wait provides a precise
+ * blocking sleep without spinning the event loop or busy-waiting.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)), 0, 0, ms);
+}
+
+/**
+ * Removes a temp directory with bounded exponential backoff against transient
+ * Windows file locks (EBUSY/EPERM/ENOTEMPTY). The extended retry is
+ * Windows-only: on every other platform, and for any non-transient error, the
+ * failure is re-thrown immediately so cleanup problems stay visible. After the
+ * final attempt the error is re-thrown without a trailing sleep.
+ */
+function removeTempDirectory(directory: string): void {
+  const isWindows = process.platform === "win32";
+  const maxAttempts = 6;
+  const baseDelayMs = 25;
+  let lastError: NodeJS.ErrnoException | undefined;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      fs.rmSync(directory, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error as NodeJS.ErrnoException;
+      const code = lastError.code;
+      const retryable = isWindows && code !== undefined && RETRYABLE_TEMPDIR_ERRORS.has(code);
+      if (!retryable) {
+        throw lastError;
+      }
+      // Sleep only when another attempt remains; the final attempt must
+      // rethrow immediately without a trailing sleep. Delays are bounded and
+      // fully reachable: 25, 50, 100, 200, 400 ms (total 775 ms).
+      if (attempt < maxAttempts - 1) {
+        sleepSync(baseDelayMs * 2 ** attempt);
+      }
+    }
+  }
+  throw lastError ?? new Error(`removeTempDirectory failed to remove ${directory}`);
+}
+
 export function removeTestDatabases(): void {
   for (const database of openDatabases.splice(0)) {
     if (database.open) database.close();
   }
   for (const directory of directories.splice(0)) {
-    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    removeTempDirectory(directory);
   }
 }

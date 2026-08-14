@@ -803,7 +803,10 @@ describe("direct-v1 bounded queries", () => {
     } finally {
       await harness.close();
     }
-  });
+    // Each variant spawns worker_threads (tsx registration + native SQLite load)
+    // and runs 10 sequential DB create/reopen iterations, which exceeds Vitest's
+    // 5000 ms default on slow Windows CI. Allow generous, explicit headroom.
+  }, 30000);
 });
 
 describe("bounded public inventory", () => {
