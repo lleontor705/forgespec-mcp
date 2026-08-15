@@ -69,6 +69,7 @@ export function registerFileTools(
       expected_task_revision: z.number().int().min(1).optional(),
       idempotency_key: z.string().min(1).max(256).optional(),
     },
+    { readOnlyHint: false, idempotentHint: true },
     async (input) => {
       const { patterns, agent, ttl_minutes, check_only } = input;
       const db = databaseProvider();
@@ -188,6 +189,7 @@ export function registerFileTools(
       expected_revision: z.number().int().min(1).optional(),
       idempotency_key: z.string().min(1).max(256).optional(),
     },
+    { readOnlyHint: false, idempotentHint: true },
     async (input) => {
       const { agent, patterns } = input;
       const db = databaseProvider();

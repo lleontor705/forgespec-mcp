@@ -283,6 +283,10 @@ export function registerTaskBoardTools(
       try {
         snapshot = await new TaskService(db).readLegacyBoard(board_id);
       } catch {
+        // A protected direct-v1 board and a nonexistent board are deliberately
+        // indistinguishable here: differentiating them would let an unauthorized
+        // caller probe direct-v1 existence. Authorized discovery of owned or
+        // granted boards goes through tb_list_boards with direct-v1 context.
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ error: "Board not found" }) }],
         };
@@ -532,6 +536,7 @@ export function registerTaskBoardTools(
       expectedBoardRevision: z.number().int().min(1),
       capability: TaskAuthorityCapabilitySchema,
     },
+    { readOnlyHint: false, idempotentHint: true },
     async (input) => {
       try {
         return success(new TaskService(databaseProvider()).grantAuthority(input as GrantCommand) as unknown as ToolResponse);
@@ -555,6 +560,7 @@ export function registerTaskBoardTools(
       expectedBoardRevision: z.number().int().min(1),
       capability: TaskAuthorityCapabilitySchema,
     },
+    { readOnlyHint: false, idempotentHint: true },
     async (input) => {
       try {
         return success(new TaskService(databaseProvider()).handoffAuthority(input as HandoffCommand) as unknown as ToolResponse);
@@ -575,6 +581,7 @@ export function registerTaskBoardTools(
       expectedBoardRevision: z.number().int().min(1),
       capability: TaskAuthorityCapabilitySchema,
     },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     async (input) => {
       try {
         return success(new TaskService(databaseProvider()).revokeAuthority(input as RevokeCommand) as unknown as ToolResponse);
@@ -871,6 +878,8 @@ export function registerTaskBoardTools(
         const task = await new TaskService(db).readLegacyTask(task_id);
         return { content: [{ type: "text" as const, text: JSON.stringify({ task }) }] };
       } catch {
+        // Same indistinguishability rule as tb_status: no existence oracle for
+        // protected direct-v1 tasks on the legacy read path.
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Task not found" }) }] };
       }
     }
@@ -879,13 +888,18 @@ export function registerTaskBoardTools(
   // ── List Boards ────────────────────────────────────
   server.tool(
     "tb_list_boards",
-    "List all task boards, optionally filtered by project. Use this to discover board IDs after context loss.",
+    "List task boards, optionally filtered by project. With actor plus direct-v1 context (coordination_mode/api_version/schema_version 1.0.0), also lists direct-v1 boards the actor owns or holds an active grant on. Use this to discover board IDs after context loss.",
     {
       project: z.string().optional().describe("Filter by project"),
+      actor: z.string().min(1).max(256).optional().describe("Actor identity; with direct-v1 context, includes owned or actively granted direct-v1 boards"),
+      coordination_mode: z.enum(["legacy", "direct-v1"]).optional(),
+      api_version: z.string().max(32).optional(),
+      schema_version: z.string().max(32).optional(),
+      capability: TaskAuthorityCapabilitySchema.optional(),
     },
-    async ({ project }) => {
+    async (input) => {
       const db = databaseProvider();
-      const boards = await new TaskService(db).listLegacyBoards(project);
+      const boards = await new TaskService(db).listBoardsForActor(input);
 
       return {
         content: [{ type: "text" as const, text: JSON.stringify({ boards }) }],

@@ -1,6 +1,6 @@
-# ForgeSpec MCP
+# ForgeSpec MCP (Complete Technical Reference)
 
-> The coordination backbone for multi-agent AI development. MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, and advisory file locking to coordinate work across multiple AI agents. Built on the Model Context Protocol SDK with better-sqlite3 and Zod schema validation.
+> The coordination backbone for multi-agent AI development. MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, granular authority control (`task-authority@1.0.0`), and advisory file locking to coordinate work across multiple AI agents. Built on the Model Context Protocol SDK with better-sqlite3 and Zod schema validation.
 
 ## Why ForgeSpec?
 
@@ -8,520 +8,107 @@ Building software with multiple AI agents introduces coordination challenges tha
 
 | Problem | Without ForgeSpec | With ForgeSpec |
 |---------|-------------------|----------------|
-| Conflicting edits | Two agents modify the same file, causing merge conflicts | File reservation with TTL prevents conflicts |
+| Conflicting edits | Two agents modify the same file, causing merge conflicts | File reservation leases with TTL prevent edit conflicts |
 | No shared context | Each agent works in isolation | Contract validation creates shared audit trail |
 | Unstructured work | Agents jump to code without specs | 9-phase pipeline enforces structured flow |
-| Lost progress | No way to resume after failure | SQLite task board persists state |
+| Lost progress | No way to resume after failure | SQLite task board persists state across sessions |
 | No quality gates | Code ships without validation | Confidence thresholds block premature transitions |
+| Unauthorized mutations | Any agent can mutate any task/board | Authority grants/handoffs (`task-authority@1.0.0`) enforce zero-trust bounds |
 
 **Key advantages:**
-- Zero infrastructure — Embedded SQLite, no external services required
+- Zero infrastructure — Embedded SQLite database, no external services required
 - Universal compatibility — Any MCP client (Claude Code, Codex CLI, Gemini CLI, OpenClaw)
-- Instant setup — One command: `npx -y forgespec-mcp`
+- Instant setup — One command: `npx -y forgespec-mcp@1.5.3`
 - Battle-tested pipeline — 9 phases with confidence thresholds
-- Full audit trail — Every contract, task, and reservation is logged with timestamps
-- Cross-platform — Tested on Ubuntu, Windows, macOS with Node 18, 20, 22
+- Full audit trail — Every contract, task, grant, revocation, and reservation is logged with timestamps
+- Cross-platform — Tested on Ubuntu, Windows, macOS with Node 22, 24, 26 (primary Node 24.18.1)
 - Cortex-ready — Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph
 
 ## Recommended: Pair with Cortex
 
-ForgeSpec manages the **workflow** (contracts, tasks, file locks). [Cortex](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Together they form a complete multi-agent coordination stack:
+ForgeSpec manages the **workflow** (contracts, tasks, file locks, authority). [Cortex](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Together they form a complete multi-agent coordination stack:
 
-- **ForgeSpec** validates SDD contracts, manages task dependencies, prevents file conflicts
+- **ForgeSpec** validates SDD contracts, manages task dependencies, enforces authority grants, prevents file conflicts
 - **Cortex** stores artifacts as observations, connects them via knowledge graph, enables session recovery
 - Artifacts saved with `type: "cortex"` are persisted to Cortex via `mem_save` and linked with `mem_relate`
 - ForgeSpec works standalone without Cortex — artifacts can also use `type: "openspec"` (filesystem) or `type: "inline"` (returned in response)
 
 ## Overview
 
-forgespec-mcp is an MCP (Model Context Protocol) server designed for multi-agent AI development workflows. It enforces a structured 9-phase development pipeline through typed contracts, manages tasks with intelligent dependency resolution, and provides advisory file locking for agent coordination.
+forgespec-mcp is an MCP (Model Context Protocol) server designed for multi-agent AI development workflows. It enforces a structured 9-phase development pipeline through typed contracts, manages tasks with intelligent dependency resolution, and provides advisory file locking and authority delegation for agent coordination.
 
 **Key characteristics:**
 - TypeScript, compiled to ES2022 with Node16 module resolution
-- SQLite database with WAL mode for concurrent access
-- Zod runtime schema validation for all inputs
+- SQLite database with WAL mode for concurrent access and PRAGMA qualification
+- Zod runtime schema validation for all inputs and outputs
+- Official MCP Tool Annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) on all 30 tools
+- In-memory/SQLite rate limiting per actor identity to prevent runaway mutation loops
 - Runs as a stdio MCP transport (launched by client applications)
-- Node.js >= 18 required
+- Node.js >= 22 required (22.x, 24.x, 26.x supported; primary Node 24.18.1)
 
 ## Installation and Usage
 
 ### Using npx (no installation required)
 
 ```bash
-npx -y forgespec-mcp
+npx -y forgespec-mcp@1.5.3
 ```
 
 ### Install globally
 
 ```bash
-npm install -g forgespec-mcp
+npm install -g forgespec-mcp@1.5.3
 ```
 
-### Claude Code
-
-```bash
-claude mcp add forgespec --transport stdio -- npx -y forgespec-mcp
-```
-
-### Codex CLI (`~/.codex/config.toml`)
-
-```toml
-[mcp_servers.forgespec]
-command = "npx"
-args = ["-y", "forgespec-mcp"]
-```
-
-### Gemini CLI (`settings.json`)
-
-```json
-{
-  "mcpServers": {
-    "forgespec": {
-      "command": "npx",
-      "args": ["-y", "forgespec-mcp"]
-    }
-  }
-}
-```
-
-### OpenClaw (`openclaw.json`)
-
-```json5
-mcp: {
-  servers: {
-    forgespec: { command: "npx", args: ["-y", "forgespec-mcp"] }
-  }
-}
-```
-
-## SDD Pipeline
-
-The 9-phase Spec-Driven Development lifecycle:
-
-```
-init → explore → propose → spec → design → tasks → apply → verify → archive
-```
-
-Each phase has confidence thresholds and allowed transitions enforced by the contract validator.
-
-| Phase | Confidence Threshold | Can Transition To | Purpose |
-|-------|---------------------|-------------------|---------|
-| init | 0.5 | explore, propose | Bootstrap project context and conventions |
-| explore | 0.5 | propose, spec | Investigate codebase, diagnose issues |
-| propose | 0.7 | spec, design, init | Draft change proposal with scope and risks |
-| spec | 0.8 | design, tasks | Write detailed specifications with Given/When/Then |
-| design | 0.7 | tasks, spec | Define architecture, data flows, file changes |
-| tasks | 0.8 | apply | Decompose into dependency-ordered implementation tasks |
-| apply | 0.6 | verify, tasks | Execute implementation (partial completion allowed) |
-| verify | 0.9 | archive, apply | Validate implementation against specs |
-| archive | 0.9 | — | Merge specs, generate retrospective |
-
-### SDD Contract Schema
-
-Every SDD contract follows this structure:
-
-```typescript
-{
-  schema_version: string;           // defaults to "1.0"
-  phase: SddPhase;                 // init|explore|propose|spec|design|tasks|apply|verify|archive
-  change_name: string;              // 1-256 chars, identifies the change
-  project: string;                  // 1-256 chars, project identifier
-  status: "success" | "partial" | "failed" | "blocked";
-  confidence: number;               // 0.0-1.0 range
-  executive_summary: string;        // 10-65536 chars
-  artifacts_saved: Artifact[];      // max 50 items
-  next_recommended: SddPhase[];     // max 9 phases
-  risks: Risk[];                    // max 50 items
-  data: Record<string, unknown>;   // arbitrary metadata
-}
-```
-
-**Risk object:**
-```typescript
-{ description: string; level: "low" | "medium" | "high" | "critical"; }
-```
-
-**Artifact object:**
-```typescript
-{ topic_key: string; type: "cortex" | "openspec" | "inline"; path?: string; }
-```
-
-## Tools Reference (19 total)
-
-### SDD Contract Tools (6 tools)
-
-#### `sdd_validate`
-Validate an SDD contract against the phase schema. Returns validation result with confidence check and allowed transitions.
-
-**Parameters:**
-- `contract` (string, required): JSON string of the SDD contract (max 128KB)
-
-**Returns:** `{ valid, phase, confidence, threshold, meets_confidence, allowed_next_phases, warnings }` or `{ valid: false, errors }`.
-
-**Example:**
-```jsonc
-// Input
-{ "contract": "{\"phase\":\"propose\",\"change_name\":\"add-auth\",\"project\":\"my-app\",\"status\":\"success\",\"confidence\":0.85,\"executive_summary\":\"Add JWT auth service with login/logout endpoints.\"}" }
-
-// Output
-{ "valid": true, "phase": "propose", "confidence": 0.85, "threshold": 0.7, "meets_confidence": true, "allowed_next_phases": ["spec", "design", "init"], "warnings": [] }
-```
-
-#### `sdd_save`
-Validate and persist an SDD contract to the database. The contract must pass validation before it is saved.
-
-**Parameters:**
-- `contract` (string, required): JSON string of the SDD contract (max 128KB)
-
-**Returns:** `{ saved: true, id, phase, project }` or `{ saved: false, error }`.
-
-**Example:**
-```jsonc
-// Input
-{ "contract": "{\"phase\":\"propose\",\"change_name\":\"add-auth\",\"project\":\"my-app\",\"status\":\"success\",\"confidence\":0.85,\"executive_summary\":\"Add JWT auth service.\"}" }
-
-// Output
-{ "saved": true, "id": "sdd_a1b2c3d4-...", "phase": "propose", "project": "my-app" }
-```
-
-#### `sdd_get`
-Retrieve a single SDD contract by its ID.
-
-**Parameters:**
-- `contract_id` (string, required): Contract ID
-
-**Returns:** Full contract data or `{ error: "Contract {id} not found" }`.
-
-#### `sdd_list`
-List all contracts with optional filters.
-
-**Parameters:**
-- `project` (string, optional): Filter by project name (alphanumeric, dots, hyphens, underscores)
-- `phase` (string, optional): Filter by SDD phase
-- `limit` (number, optional): Max entries (1-100, default 20)
-
-**Returns:** `{ contracts: [...], count }`.
-
-#### `sdd_history`
-Get the phase transition history for a project, ordered chronologically.
-
-**Parameters:**
-- `project` (string, required): Project name (alphanumeric, dots, hyphens, underscores)
-- `limit` (number, optional): Max entries (1-100, default 20)
-
-**Returns:** `{ project, history: [{ id, phase, change_name, status, confidence, executive_summary, created_at }] }`.
-
-**Example:**
-```jsonc
-// Input
-{ "project": "my-app", "limit": 3 }
-
-// Output
-{ "project": "my-app", "history": [
-  { "id": "sdd_...", "phase": "verify", "change_name": "add-auth", "status": "success", "confidence": 0.92, "created_at": "2025-01-15T10:45:00Z" },
-  { "id": "sdd_...", "phase": "apply", "change_name": "add-auth", "status": "success", "confidence": 0.78, "created_at": "2025-01-15T10:30:00Z" },
-  { "id": "sdd_...", "phase": "spec", "change_name": "add-auth", "status": "success", "confidence": 0.85, "created_at": "2025-01-15T09:00:00Z" }
-]}
-```
-
-#### `sdd_phases`
-Get all phase definitions with their allowed transitions and confidence thresholds. No parameters required.
-
-**Returns:** `{ phases: [{ phase, confidence_threshold, can_transition_to }] }`.
-
-### Task Board Tools (10 tools)
-
-#### `tb_create_board`
-Create a new task board for a project.
-
-**Parameters:**
-- `project` (string, required): Project identifier (alphanumeric, dots, hyphens, underscores)
-- `name` (string, required): Board name (max 256 chars)
-
-**Returns:** `{ created: true, board_id, project, name }`.
-
-**Example:**
-```jsonc
-// Input
-{ "project": "my-app", "name": "add-auth-service" }
-
-// Output
-{ "created": true, "board_id": "board_x7k9m2...", "project": "my-app", "name": "add-auth-service" }
-```
-
-#### `tb_add_task`
-Add a task to a board with priority, spec reference, acceptance criteria, and dependencies.
-
-**Parameters:**
-- `board_id` (string, required): Board ID
-- `title` (string, required): Task title (3-512 chars)
-- `description` (string, optional): Task description (max 65536 chars)
-- `priority` (string, optional): p0 (critical), p1 (high), p2 (medium, default), p3 (low)
-- `spec_ref` (string, optional): Reference to a spec artifact (max 512 chars)
-- `acceptance_criteria` (string, optional): Criteria for task completion (max 65536 chars)
-- `dependencies` (string[], optional): Array of task IDs this task depends on
-
-**Returns:** `{ created: true, task_id, board_id, title, priority }`.
-
-**Example:**
-```jsonc
-// Input
-{ "board_id": "board_x7k9m2...", "title": "Create JWT utility module", "priority": "p0", "spec_ref": "sdd/add-auth/spec", "acceptance_criteria": "All token operations pass unit tests", "dependencies": [] }
-
-// Output
-{ "created": true, "task_id": "task_abc123...", "board_id": "board_x7k9m2...", "title": "Create JWT utility module", "priority": "p0" }
-```
-
-#### `tb_status`
-Get board status with tasks grouped by their current status.
-
-**Parameters:**
-- `board_id` (string, required): Board ID
-
-**Returns:** `{ board, tasks: { backlog, ready, in_progress, in_review, done, blocked }, summary: { total, by_status } }`.
-
-#### `tb_claim`
-Claim a task for an agent. Verifies all dependencies are met before allowing claim. Only tasks in `ready` or `backlog` status can be claimed.
-
-**Parameters:**
-- `task_id` (string, required): Task ID
-- `agent` (string, required): Agent identifier (alphanumeric, dots, hyphens, underscores)
-
-**Returns:** `{ claimed: true, task_id, agent, status: "in_progress" }` or error with blockers.
-
-**Example:**
-```jsonc
-// Input
-{ "task_id": "task_abc123...", "agent": "implement-agent-1" }
-
-// Output (success)
-{ "claimed": true, "task_id": "task_abc123...", "agent": "implement-agent-1", "status": "in_progress" }
-
-// Output (blocked)
-{ "error": "Blocked by unfinished dependencies", "blockers": [{ "id": "task_xyz...", "status": "in_progress" }] }
-```
-
-#### `tb_update`
-Update task status. When a task is marked `done`, all dependent tasks with no remaining blockers are automatically moved to `ready`. Moving to `done` requires the task to be in `in_progress` or `in_review`.
-
-**Parameters:**
-- `task_id` (string, required): Task ID
-- `status` (string, required): New status (backlog, ready, in_progress, in_review, done, blocked)
-- `notes` (string, optional): Notes about the update (max 65536 chars)
-
-**Returns:** `{ updated: true, task_id, status, unblocked_tasks, notes }`.
-
-**Example:**
-```jsonc
-// Input
-{ "task_id": "task_abc123...", "status": "done", "notes": "JWT module complete with RS256" }
-
-// Output
-{ "updated": true, "task_id": "task_abc123...", "status": "done", "unblocked_tasks": ["task_def456..."], "notes": "JWT module complete with RS256" }
-```
-
-#### `tb_unblocked`
-List tasks that are ready to work on — no unresolved dependencies.
-
-**Parameters:**
-- `board_id` (string, required): Board ID
-
-**Returns:** `{ board_id, unblocked_count, tasks: [...] }`.
-
-#### `tb_get`
-Get full task details by ID.
-
-**Parameters:**
-- `task_id` (string, required): Task ID
-
-**Returns:** `{ task: { id, board_id, title, description, status, priority, assignee, spec_ref, acceptance_criteria, dependencies, notes, created_at, updated_at, claimed_at, completed_at } }`.
-
-#### `tb_delete_task`
-Delete a task. Only tasks in `backlog` or `done` status can be deleted. Automatically removes this task from other tasks' dependency lists.
-
-**Parameters:**
-- `task_id` (string, required): Task ID
-
-**Returns:** `{ deleted: true, task_id }`.
-
-#### `tb_add_notes`
-Append timestamped notes to a task without changing its status.
-
-**Parameters:**
-- `task_id` (string, required): Task ID
-- `notes` (string, required): Note text (max 65536 chars)
-
-**Returns:** `{ added: true, task_id, notes_count }`.
-
-#### `tb_list`
-List all boards, optionally filtered by project.
-
-**Parameters:**
-- `project` (string, optional): Filter by project name
-
-**Returns:** `{ boards: [...] }`.
-
-### File Reservation Tools (3 tools)
-
-#### `file_reserve`
-Reserve files or glob patterns to prevent conflicts between agents. Reservations expire after the specified TTL. Checks for conflicts before reserving.
-
-**Parameters:**
-- `patterns` (string[], required): File paths or glob patterns (e.g. `["src/auth/**", "package.json"]`)
-- `agent` (string, required): Agent identifier (alphanumeric, dots, hyphens, underscores)
-- `ttl_minutes` (number, optional): Time-to-live in minutes (default 15)
-
-**Returns:** `{ reserved: true, reservation_ids, agent, patterns, expires_at }` or `{ reserved: false, conflicts }`.
-
-**Example:**
-```jsonc
-// Input
-{ "patterns": ["src/auth/**", "src/middleware/auth.ts"], "agent": "implement-agent-1", "ttl_minutes": 30 }
-
-// Output (success)
-{ "reserved": true, "reservation_ids": ["res_..."], "agent": "implement-agent-1", "patterns": ["src/auth/**", "src/middleware/auth.ts"], "expires_at": "2025-01-15T10:30:00.000Z" }
-
-// Output (conflict)
-{ "reserved": false, "conflicts": [{ "pattern": "src/auth/**", "held_by": "implement-agent-2", "expires_at": "2025-01-15T10:15:00.000Z" }] }
-```
-
-#### `file_check`
-Check for active conflicts on file patterns against other agents' reservations.
-
-**Parameters:**
-- `patterns` (string[], required): File paths or glob patterns to check
-- `agent` (string, required): Agent checking (excludes own reservations)
-
-**Returns:** `{ has_conflicts, conflicts: [{ pattern, held_by, expires_at }] }`.
-
-**Example:**
-```jsonc
-// Input
-{ "patterns": ["src/auth/jwt.ts"], "agent": "implement-agent-2" }
-
-// Output
-{ "has_conflicts": true, "conflicts": [{ "pattern": "src/auth/**", "held_by": "implement-agent-1", "expires_at": "2025-01-15T10:30:00.000Z" }] }
-```
-
-#### `file_release`
-Release file reservations for an agent.
-
-**Parameters:**
-- `agent` (string, required): Agent identifier (alphanumeric, dots, hyphens, underscores)
-- `patterns` (string[], optional): Specific patterns to release. If omitted, releases all reservations for the agent.
-
-**Returns:** `{ released: true, count, agent }`.
-
-## Database Schema
-
-SQLite with WAL mode, foreign keys enabled. Stored at `~/.forgespec/forgespec.db` by default.
-
-### Tables
-
-**contracts** — SDD contract storage
-- `id` (TEXT PK), `phase`, `change_name`, `project`, `status`, `confidence` (REAL), `executive_summary`, `data` (JSON TEXT), `created_at`
-
-**boards** — Task board definitions
-- `id` (TEXT PK), `project`, `name`, `created_at`, `updated_at`
-
-**tasks** — Individual tasks within boards
-- `id` (TEXT PK), `board_id` (FK → boards, CASCADE delete), `title`, `description`, `status`, `priority`, `assignee`, `spec_ref`, `acceptance_criteria`, `dependencies` (JSON array), `notes` (JSON array of {text, timestamp}), `created_at`, `updated_at`, `claimed_at`, `completed_at`
-
-**file_reservations** — Active file locks
-- `id` (TEXT PK), `pattern`, `agent`, `expires_at`, `created_at`
-
-**audit_log** — Action audit trail
-- `id` (INTEGER PK AUTOINCREMENT), `timestamp`, `action`, `entity_type`, `entity_id`, `agent_name`, `details`
-
-### Indexes
-- `idx_tasks_board` on tasks(board_id)
-- `idx_tasks_status` on tasks(status)
-- `idx_contracts_project` on contracts(project)
-- `idx_reservations_agent` on file_reservations(agent)
-
-### SQLite Configuration
-- WAL journal mode for concurrent reads
-- Synchronous = NORMAL
-- 32MB cache size
-- Memory temp store
-- 5-second busy timeout
+## Inventory of 30 MCP Tools
+
+### 1. Capability & Diagnostic Tools (3)
+- `forgespec_capabilities`: Negotiate API/schema versions, capabilities, limits, and coordination mode (`readOnlyHint: true, idempotentHint: true`).
+- `forgespec_health`: Get server health diagnostics, SQLite integrity status (`PRAGMA quick_check`), system time, active file lease count, board/task counts, and version telemetry (`readOnlyHint: true, idempotentHint: true`).
+- `tb_audit_log`: Query historical audit trail of authority grants, revocations, and approval decisions (`readOnlyHint: true, idempotentHint: true`).
+
+### 2. SDD Contract Tools (5)
+- `sdd_validate`: Validate an SDD contract against phase schema with confidence check (`readOnlyHint: true, idempotentHint: true`).
+- `sdd_save`: Validate and persist an SDD contract to SQLite (`readOnlyHint: false, idempotentHint: true`).
+- `sdd_get`: Retrieve a single contract by ID (`readOnlyHint: true, idempotentHint: true`).
+- `sdd_list`: List contracts with optional project/phase filters (`readOnlyHint: true, idempotentHint: true`).
+- `sdd_history`: Get phase transition history for a project (`readOnlyHint: true, idempotentHint: true`).
+
+### 3. Task Board Tools (19)
+- `tb_create_board`: Create a new task board with optional inline tasks (`readOnlyHint: false, idempotentHint: true`).
+- `tb_add_task`: Add a task with priority, spec reference, acceptance criteria, and dependencies (`readOnlyHint: false, idempotentHint: false`).
+- `tb_status`: Get board status with tasks grouped by status (`readOnlyHint: true, idempotentHint: true`).
+- `tb_claim`: Claim a task for execution (`readOnlyHint: false, idempotentHint: false`).
+- `tb_update`: Update task status and append timestamped notes (`readOnlyHint: false, idempotentHint: true`).
+- `tb_unblocked`: List tasks ready to work on with resolved dependencies (`readOnlyHint: true, idempotentHint: true`).
+- `tb_get`: Get full task details by ID (`readOnlyHint: true, idempotentHint: true`).
+- `tb_list_boards`: List task boards; with direct-v1 actor context, includes owned or actively granted direct-v1 boards (`readOnlyHint: true, idempotentHint: true`).
+- `tb_set_dependencies`: Set normalized dependency edges (`readOnlyHint: false, idempotentHint: true`).
+- `tb_heartbeat`: Renew an active attempt lease (`readOnlyHint: false, idempotentHint: true`).
+- `tb_recover_claims`: Recover expired claims (`readOnlyHint: false, idempotentHint: true`).
+- `tb_requeue`: Requeue a recovered task (`readOnlyHint: false, idempotentHint: true`).
+- `tb_approve`: Record an immutable approval decision with asserted provenance (`readOnlyHint: false, idempotentHint: true`).
+- `tb_grant`: Create an attenuated, expiring task-authority grant (`readOnlyHint: false, idempotentHint: true`).
+- `tb_handoff`: Create a reference-only attenuated handoff (`readOnlyHint: false, idempotentHint: true`).
+- `tb_revoke`: Append an authority revocation without changing board ownership (`readOnlyHint: false, destructiveHint: true, idempotentHint: true`).
+- `tb_query`: Query snapshot task pages with signed compound cursors (`readOnlyHint: true, idempotentHint: true`).
+- `tb_batch_status`: Read bounded board/work-unit status (`readOnlyHint: true, idempotentHint: true`).
+- `tb_events`: Read authority-event deltas (`readOnlyHint: true, idempotentHint: true`).
+
+### 4. File Reservation Tools (3)
+- `file_reserve`: Reserve files or glob patterns with TTL (`readOnlyHint: false, idempotentHint: true`).
+- `file_release`: Release file reservations (`readOnlyHint: false, idempotentHint: true`).
+- `file_renew`: Renew an active direct-v1 file lease (`readOnlyHint: false, idempotentHint: true`).
+
+---
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FORGESPEC_DIR` | `~/.forgespec` | Database directory |
-| `FORGESPEC_DB` | `~/.forgespec/forgespec.db` | Full database path (overrides FORGESPEC_DIR) |
+- `FORGESPEC_DIR` (default `~/.forgespec`): Directory for database storage.
+- `FORGESPEC_DB` (default `~/.forgespec/forgespec.db`): Full path to SQLite database.
 
-## Project Structure
-
-```
-src/
-  index.ts              — Entry point: stdio transport bootstrap
-  server.ts             — MCP server factory, registers tool groups
-  types/index.ts        — Zod schemas, TypeScript types, phase definitions
-  database/index.ts     — SQLite initialization, schema creation, WAL config
-  tools/
-    sdd-contracts.ts    — 6 SDD contract management tools
-    task-board.ts       — 10 task board tools with dependency logic
-    file-reservation.ts — 3 file reservation tools with pattern matching
-  utils/id.ts           — UUID-based ID generation with prefixes
-tests/
-  sdd-contracts.test.ts — Schema validation, phase transitions, confidence thresholds
-  tools.test.ts         — Database tool integration tests
-docs/
-  assets/
-    logo.svg            — ForgeSpec logo
-    sdd-pipeline.svg    — SDD pipeline diagram
-    architecture.svg    — Architecture overview diagram
-```
-
-## Dependencies
-
-### Production
-- `@modelcontextprotocol/sdk` ^1.29.0 — MCP protocol implementation
-- `better-sqlite3` ^11.8.0 — Embedded SQLite database
-- `zod` ^3.23.0 — Runtime schema validation
-
-### Development
-- `typescript` ^5.7.0 — TypeScript compiler
-- `vitest` ^3.0.0 — Test runner with v8 coverage
-- `tsx` ^4.0.0 — TypeScript executor with hot reload
-- `standard-version` ^9.5.0 — Automatic semantic versioning from conventional commits
-- `@types/better-sqlite3` ^7.6.12 — Type definitions
-- `@types/node` ^22.0.0 — Node.js types
-
-## Development
-
-```bash
-git clone https://github.com/lleontor705/forgespec-mcp.git
-cd forgespec-mcp
-npm install
-npm run dev       # Run with tsx (hot reload)
-npm test          # Run tests with vitest
-npm run build     # Compile TypeScript to build/
-npm run lint      # Type check (tsc --noEmit)
-npm run inspect   # Open MCP Inspector
-```
-
-## Versioning
-
-ForgeSpec uses conventional commits with automatic semver bumping via standard-version:
-
-```bash
-# Commits determine the version bump:
-#   fix: ...    → patch (1.2.0 → 1.2.1)
-#   feat: ...   → minor (1.2.0 → 1.3.0)
-#   feat!: ...  → major (1.2.0 → 2.0.0)
-
-npm run release            # Auto-bump from commits
-npm run release:patch      # Force patch bump
-npm run release:minor      # Force minor bump
-npm run release:major      # Force major bump
-
-git push --follow-tags origin master   # Triggers CI/CD → npm publish
-```
+---
 
 ## License
 
-MIT
+MIT © [lleontor705](https://github.com/lleontor705)

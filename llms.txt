@@ -1,26 +1,26 @@
 # ForgeSpec MCP
 
-> The coordination backbone for multi-agent AI development. MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, and advisory file locking to coordinate work across multiple AI agents. Works with any MCP-compatible client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more.
+> The coordination backbone for multi-agent AI development. MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management with authority control, and advisory file locking to coordinate work across multiple AI agents. Works with any MCP-compatible client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more.
 
 ## Why ForgeSpec?
 
 Multi-agent AI development creates coordination challenges: conflicting file edits, lost context between agents, unstructured workflows, no quality gates, and no way to resume failed tasks. ForgeSpec solves all of these with:
 
-- **Zero infrastructure** — Embedded SQLite, no external services
+- **Zero infrastructure** — Embedded SQLite database, no external services required
 - **Universal compatibility** — Any MCP client (Claude Code, Codex, Gemini, OpenClaw)
-- **Instant setup** — `npx -y forgespec-mcp`
+- **Instant setup** — `npx -y forgespec-mcp@1.5.3`
 - **9-phase SDD pipeline** — Enforced confidence thresholds prevent premature transitions
-- **Full audit trail** — Every contract, task, and reservation is logged
-- **Cross-platform** — Tested on Ubuntu, Windows, macOS with Node 18, 20, 22
+- **Full audit trail & authority** — Every contract, task, grant, revocation, and reservation is logged with immutable history
+- **Cross-platform** — Tested on Ubuntu, Windows, macOS with Node 22, 24, 26 (primary Node 24.18.1)
 - **Cortex-ready** — Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph
 
 ## Recommended: Pair with Cortex
 
-ForgeSpec manages the **workflow** (contracts, tasks, file locks). [Cortex](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Artifacts saved with `type: "cortex"` are persisted to Cortex and linked via knowledge graph. ForgeSpec also works standalone with `type: "openspec"` (filesystem) or `type: "inline"`.
+ForgeSpec manages the **workflow** (contracts, tasks, file locks, authority). [Cortex](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Artifacts saved with `type: "cortex"` are persisted to Cortex and linked via knowledge graph. ForgeSpec also works standalone with `type: "openspec"` (filesystem) or `type: "inline"`.
 
 ## Quick Start
 
-- [npm package](https://www.npmjs.com/package/forgespec-mcp): Install via `npx -y forgespec-mcp` or `npm install -g forgespec-mcp`
+- [npm package](https://www.npmjs.com/package/forgespec-mcp): Install via `npx -y forgespec-mcp@1.5.3` or `npm install -g forgespec-mcp@1.5.3`
 - [GitHub Repository](https://github.com/lleontor705/forgespec-mcp): Source code, issues, and contributions
 - [Full documentation](https://github.com/lleontor705/forgespec-mcp/blob/master/llms-full.txt): Complete tool reference with parameters and schemas
 
@@ -32,32 +32,45 @@ ForgeSpec manages the **workflow** (contracts, tasks, file locks). [Cortex](http
 init(0.5) → explore(0.5) → propose(0.7) → spec(0.8) → design(0.7) → tasks(0.8) → apply(0.6) → verify(0.9) → archive(0.9)
 ```
 
-## Tools (19 total)
+## Tools (30 total)
 
-### SDD Contract Tools (6)
+### Capability & Diagnostic Tools (3)
+- `forgespec_capabilities`: Negotiate API/schema versions, capabilities, limits, and mode
+- `forgespec_health`: Server health diagnostics, database integrity, system time, active lease counts, and version telemetry
+- `tb_audit_log`: Query historical audit trail of authority grants, revocations, and approval decisions
+
+### SDD Contract Tools (5)
 - `sdd_validate`: Validate contract against phase schema with confidence check
 - `sdd_save`: Validate and persist contract to SQLite
 - `sdd_get`: Retrieve contract by ID
 - `sdd_list`: List contracts (filter by project/phase)
 - `sdd_history`: Phase transition history for a project
-- `sdd_phases`: All phases with transitions and thresholds
 
-### Task Board Tools (10)
-- `tb_create_board`: Create task board for a project
+### Task Board Tools (19)
+- `tb_create_board`: Create task board with optional inline tasks (atomic)
 - `tb_add_task`: Add task with priority, spec ref, acceptance criteria, dependencies
 - `tb_status`: Board status with tasks grouped by status
-- `tb_claim`: Claim task (validates dependencies, auto-moves to in_progress)
+- `tb_claim`: Claim task (validates dependencies before assignment)
 - `tb_update`: Update status (auto-unblocks dependents on completion)
-- `tb_unblocked`: List tasks ready to work on
+- `tb_unblocked`: List tasks ready to work on (all dependencies resolved)
 - `tb_get`: Full task details by ID
-- `tb_delete_task`: Delete task (backlog/done only), cleans up dependencies
-- `tb_add_notes`: Append timestamped notes
-- `tb_list`: List all boards (filter by project)
+- `tb_list_boards`: List task boards (includes direct-v1 owned/granted boards with actor context)
+- `tb_set_dependencies`: Set normalized dependency edges
+- `tb_heartbeat`: Renew active attempt lease
+- `tb_recover_claims`: Recover expired claims
+- `tb_requeue`: Requeue a recovered task
+- `tb_approve`: Record immutable approval decision with asserted provenance
+- `tb_grant`: Create attenuated, expiring task-authority grant
+- `tb_handoff`: Create reference-only attenuated handoff
+- `tb_revoke`: Append authority revocation (destructive operation)
+- `tb_query`: Query snapshot task pages with signed compound cursors
+- `tb_batch_status`: Read bounded board/work-unit status
+- `tb_events`: Read authority-event deltas
 
 ### File Reservation Tools (3)
-- `file_reserve`: Reserve files/globs with TTL (default 15 min)
-- `file_check`: Check for conflicts on file patterns
-- `file_release`: Release reservations (specific or all)
+- `file_reserve`: Reserve files/globs with TTL (default 15 min; `check_only: true` for dry-run)
+- `file_release`: Release file reservations
+- `file_renew`: Renew an active direct-v1 file lease
 
 ## Configuration
 

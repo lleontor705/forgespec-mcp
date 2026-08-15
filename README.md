@@ -32,10 +32,10 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 - **Zero infrastructure** -- Embedded SQLite database, no external services required
 - **Universal compatibility** -- Works with any MCP client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more
-- **Package:** `forgespec-mcp@1.5.0`; runtime schema 6; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
+- **Package:** `forgespec-mcp@1.5.3`; runtime schema 6; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
 - **Runtime policy:** CI runs nine isolated jobs for Node `22.x`, `24.x`, and `26.x` on Ubuntu, Windows, and macOS. Node 22 uses native ABI 127; Node 24 uses ABI 137; Node 26 uses ABI 147.
 - **Entrypoint:** the package bin is `build/index.js`, exposed as `forgespec-mcp`.
-- **Runtime inventory:** **28 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
+- **Runtime inventory:** **30 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
 - **SQLite preflight:** startup verifies immutable migration checksums and effective `STRICT`, JSON1, and WAL capabilities before MCP traffic.
 - **Performance fixture:** 10,000 tasks × 20 versions, page 100, 30 warmed pages; reference targets are median `<250 ms` and p95 `<500 ms`.
 - **Retention:** task history is append-only and is not pruned by this release.
@@ -191,13 +191,15 @@ Each phase has a **confidence threshold** that must be met before transitioning 
 
 ## Tools Reference
 
-ForgeSpec exposes **28 MCP tools**. The authoritative runtime inventory is maintained in [docs/direct-v1.md](docs/direct-v1.md) and tested against `tools/list`.
+ForgeSpec exposes **30 MCP tools**. The authoritative runtime inventory is maintained in [docs/direct-v1.md](docs/direct-v1.md) and tested against `tools/list`.
 
-### Capability Tool (1)
+### Capability & Diagnostic Tools (3)
 
 | Tool | Description |
 |------|-------------|
 | `forgespec_capabilities` | Negotiate API/schema versions, capabilities, limits, and mode |
+| `forgespec_health` | Get server health diagnostics, database status, system time, and version telemetry |
+| `tb_audit_log` | Query historical audit trail of authority grants, revocations, and approval decisions |
 
 ### SDD Contract Tools (5)
 

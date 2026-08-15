@@ -1019,6 +1019,87 @@ export class TaskService {
     ).all(...(project ? [project] : [])) as Record<string, unknown>[];
   }
 
+  /**
+   * Lists legacy boards plus, when a valid direct-v1 actor context is supplied,
+   * the direct-v1 boards that actor owns or holds an active read_board grant on.
+   *
+   * Ordering guarantees:
+   * 1. Candidate board IDs are prefiltered by an owner-or-active-grant
+   *    relationship, so the canonical decision is only evaluated for related
+   *    boards instead of scanning every board in the database.
+   * 2. No protected board payload is read before a canonical allow decision.
+   * 3. The time observation, every authorization decision, and every payload
+   *    read share one immediate transaction (the same mode revoke uses), so the
+   *    listing linearizes with concurrent revoke/grant commits.
+   *
+   * Unrelated actors, expired or revoked grantees, and callers without the full
+   * direct-v1 context never see direct-v1 boards (anti-enumeration is preserved).
+   */
+  async listBoardsForActor(input: {
+    project?: string;
+    actor?: string;
+    coordination_mode?: "legacy" | "direct-v1";
+    api_version?: string;
+    schema_version?: string;
+    capability?: CapabilityContext;
+  }): Promise<Record<string, unknown>[]> {
+    const legacyBoards = await this.listLegacyBoards(input.project);
+    const directActor = input.coordination_mode === "direct-v1"
+      && input.api_version === "1.0.0"
+      && input.schema_version === "1.0.0"
+      ? input.actor
+      : undefined;
+    if (!directActor) return legacyBoards;
+    const listDirectBoards = this.database.transaction((): Record<string, unknown>[] => {
+      const now = this.effectiveNow();
+      // ID-only prefilter: owner lineage or an unexpired, non-revoked board
+      // read_board grant. This reads no boards payload and is not an authority
+      // decision; the canonical authorizeTaskOperation below remains the only
+      // allow gate and re-validates grant lineage, expiry, and revocation.
+      const candidates = this.database.prepare(
+        `SELECT board_id FROM direct_boards
+          WHERE json_extract(metadata_json, '$.owner_actor') = ?
+          UNION
+          SELECT g.board_id FROM task_authority_grants g
+           WHERE g.grantee_actor = ? AND g.operation = 'read_board' AND g.resource_kind = 'board'
+             AND g.expires_at_ms > ?
+             AND NOT EXISTS (SELECT 1 FROM task_authority_revocations r WHERE r.grant_id = g.grant_id)
+          ORDER BY board_id`
+      ).all(directActor, directActor, now) as Array<{ board_id: string }>;
+      const allowed: Record<string, unknown>[] = [];
+      for (const candidate of candidates) {
+        const decision = this.authority.authorizeTaskOperation(this.database, {
+          actor: directActor,
+          operation: "read_board",
+          resource: { kind: "board", boardId: candidate.board_id },
+          nowMs: now,
+          capability: input.capability,
+        });
+        if (!decision.allowed) continue;
+        // Protected payload is read only after the canonical allow.
+        const row = this.database.prepare(
+          `SELECT b.id, b.project, b.name, b.created_at, b.updated_at, d.revision
+             FROM boards b JOIN direct_boards d ON d.board_id = b.id
+            WHERE b.id = ? ${input.project ? "AND b.project = ?" : ""}`
+        ).get(...(input.project ? [candidate.board_id, input.project] : [candidate.board_id])) as
+          | {
+              id: string;
+              project: string;
+              name: string;
+              created_at: string;
+              updated_at: string;
+              revision: number;
+            }
+          | undefined;
+        if (row) allowed.push({ ...row, mode: "direct-v1" });
+      }
+      return allowed.sort((left, right) =>
+        String(right.created_at).localeCompare(String(left.created_at))
+        || String(left.id).localeCompare(String(right.id)));
+    });
+    return [...legacyBoards, ...listDirectBoards.immediate()];
+  }
+
   assertLegacyTaskMutationAllowed(taskId: string): void {
     if (this.database.prepare("SELECT 1 FROM direct_tasks WHERE task_id = ?").get(taskId)) {
       throw new TaskConflictError("Legacy mutation cannot modify a direct-v1 task", "compatibility", "legacy_direct_bypass");
