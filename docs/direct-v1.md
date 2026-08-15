@@ -1,6 +1,6 @@
 # ForgeSpec direct-v1
 
-**Version:** 1.5.2 | **API version:** 1.0.0 | **Schema:** 6 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
+**Version:** 1.5.3 | **API version:** 1.0.0 | **Schema:** 6 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
 
 direct-v1 is the transactional coordination mode for boards, tasks, contracts, and file leases. The runtime currently exposes **30 MCP tools**; the inventory below is generated from `tools/list` and is the compatibility checklist.
 

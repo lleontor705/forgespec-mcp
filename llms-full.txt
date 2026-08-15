@@ -18,7 +18,7 @@ Building software with multiple AI agents introduces coordination challenges tha
 **Key advantages:**
 - Zero infrastructure — Embedded SQLite database, no external services required
 - Universal compatibility — Any MCP client (Claude Code, Codex CLI, Gemini CLI, OpenClaw)
-- Instant setup — One command: `npx -y forgespec-mcp@1.5.2`
+- Instant setup — One command: `npx -y forgespec-mcp@1.5.3`
 - Battle-tested pipeline — 9 phases with confidence thresholds
 - Full audit trail — Every contract, task, grant, revocation, and reservation is logged with timestamps
 - Cross-platform — Tested on Ubuntu, Windows, macOS with Node 22, 24, 26 (primary Node 24.18.1)
@@ -51,13 +51,13 @@ forgespec-mcp is an MCP (Model Context Protocol) server designed for multi-agent
 ### Using npx (no installation required)
 
 ```bash
-npx -y forgespec-mcp@1.5.2
+npx -y forgespec-mcp@1.5.3
 ```
 
 ### Install globally
 
 ```bash
-npm install -g forgespec-mcp@1.5.2
+npm install -g forgespec-mcp@1.5.3
 ```
 
 ## Inventory of 30 MCP Tools

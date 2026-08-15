@@ -32,7 +32,7 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 - **Zero infrastructure** -- Embedded SQLite database, no external services required
 - **Universal compatibility** -- Works with any MCP client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more
-- **Package:** `forgespec-mcp@1.5.2`; runtime schema 6; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
+- **Package:** `forgespec-mcp@1.5.3`; runtime schema 6; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
 - **Runtime policy:** CI runs nine isolated jobs for Node `22.x`, `24.x`, and `26.x` on Ubuntu, Windows, and macOS. Node 22 uses native ABI 127; Node 24 uses ABI 137; Node 26 uses ABI 147.
 - **Entrypoint:** the package bin is `build/index.js`, exposed as `forgespec-mcp`.
 - **Runtime inventory:** **30 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.

@@ -8,7 +8,7 @@ Multi-agent AI development creates coordination challenges: conflicting file edi
 
 - **Zero infrastructure** — Embedded SQLite database, no external services required
 - **Universal compatibility** — Any MCP client (Claude Code, Codex, Gemini, OpenClaw)
-- **Instant setup** — `npx -y forgespec-mcp@1.5.2`
+- **Instant setup** — `npx -y forgespec-mcp@1.5.3`
 - **9-phase SDD pipeline** — Enforced confidence thresholds prevent premature transitions
 - **Full audit trail & authority** — Every contract, task, grant, revocation, and reservation is logged with immutable history
 - **Cross-platform** — Tested on Ubuntu, Windows, macOS with Node 22, 24, 26 (primary Node 24.18.1)
@@ -20,7 +20,7 @@ ForgeSpec manages the **workflow** (contracts, tasks, file locks, authority). [C
 
 ## Quick Start
 
-- [npm package](https://www.npmjs.com/package/forgespec-mcp): Install via `npx -y forgespec-mcp@1.5.2` or `npm install -g forgespec-mcp@1.5.2`
+- [npm package](https://www.npmjs.com/package/forgespec-mcp): Install via `npx -y forgespec-mcp@1.5.3` or `npm install -g forgespec-mcp@1.5.3`
 - [GitHub Repository](https://github.com/lleontor705/forgespec-mcp): Source code, issues, and contributions
 - [Full documentation](https://github.com/lleontor705/forgespec-mcp/blob/master/llms-full.txt): Complete tool reference with parameters and schemas
 
