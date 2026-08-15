@@ -2345,3 +2345,215 @@ nativeDescribe("WU-07 authority security matrix", () => {
     }
   }, 30_000);
 });
+
+nativeDescribe("direct-v1 indistinguishable legacy reads and authorized board discovery", () => {
+  it("tb_status and tb_get answer a protected direct-v1 ID exactly like a nonexistent ID", async () => {
+    const created = createTestDatabase("forgespec-indistinguishable-");
+    const service = new TaskService(created.database);
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "indistinguishable",
+      name: "Secret indistinguishable board",
+      actor: "owner",
+      idempotency_key: "indistinguishable-board",
+      tasks: [{ title: "Secret indistinguishable task" }],
+    });
+    const server = createServer({ database: () => created.database });
+    const client = new Client({ name: "indistinguishable", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const statusExisting = await client.callTool({ name: "tb_status", arguments: { board_id: board.board_id } });
+    const statusMissing = await client.callTool({ name: "tb_status", arguments: { board_id: "board-indistinguishable-missing" } });
+    expect(statusExisting.content).toEqual(statusMissing.content);
+    expect(JSON.parse((statusExisting.content[0] as { text: string }).text)).toEqual({ error: "Board not found" });
+
+    const getExisting = await client.callTool({ name: "tb_get", arguments: { task_id: board.task_ids[0] } });
+    const getMissing = await client.callTool({ name: "tb_get", arguments: { task_id: "task-indistinguishable-missing" } });
+    expect(getExisting.content).toEqual(getMissing.content);
+    expect(JSON.parse((getExisting.content[0] as { text: string }).text)).toEqual({ error: "Task not found" });
+
+    const serialized = JSON.stringify([statusExisting, getExisting]);
+    expect(serialized).not.toContain(board.board_id);
+    expect(serialized).not.toContain(board.task_ids[0]);
+    expect(serialized).not.toContain("Secret indistinguishable");
+    expect(serialized).not.toMatch(/direct-v1/i);
+
+    await client.close();
+    await server.close();
+    created.database.close();
+  });
+
+  it("tb_list_boards includes direct-v1 boards only for the owner or an active grantee", async () => {
+    const created = createTestDatabase("forgespec-board-discovery-");
+    const clock = new FakeClock(Date.now() - 20_000);
+    const service = new TaskService(created.database, { clock });
+    const owned = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "discovery",
+      name: "Owned direct board",
+      actor: "owner",
+      idempotency_key: "discovery-owned",
+      tasks: [{ title: "Owned secret task" }],
+    });
+    const foreign = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "discovery",
+      name: "Foreign direct board",
+      actor: "other-owner",
+      idempotency_key: "discovery-foreign",
+      tasks: [{ title: "Foreign secret task" }],
+    });
+    const activeGrant = service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "board", boardId: owned.board_id },
+      granteeActor: "active-grantee",
+      operation: "read_board",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "discovery-active-grant",
+      expectedBoardRevision: owned.board_revision,
+      capability: authorityCapability,
+    });
+    const expiredGrant = service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "board", boardId: owned.board_id },
+      granteeActor: "expired-grantee",
+      operation: "read_board",
+      expiresAtMs: clock.now() + 1_000,
+      idempotencyKey: "discovery-expired-grant",
+      expectedBoardRevision: activeGrant.boardRevision,
+      capability: authorityCapability,
+    });
+    const revocable = service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "board", boardId: owned.board_id },
+      granteeActor: "revoked-grantee",
+      operation: "read_board",
+      expiresAtMs: Date.now() + 60_000,
+      idempotencyKey: "discovery-revocable-grant",
+      expectedBoardRevision: expiredGrant.boardRevision,
+      capability: authorityCapability,
+    });
+    service.revokeAuthority({
+      actor: "owner",
+      grantId: revocable.value.grantId,
+      idempotencyKey: "discovery-revoke-grant",
+      expectedBoardRevision: revocable.boardRevision,
+      capability: authorityCapability,
+    });
+    const legacyBoardId = generateId("board");
+    created.database.prepare("INSERT INTO boards (id, project, name) VALUES (?, ?, ?)")
+      .run(legacyBoardId, "discovery", "Legacy discovery board");
+
+    const server = createServer({ database: () => created.database });
+    const client = new Client({ name: "board-discovery", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const directContext = {
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+    };
+
+    const noActor = await client.callTool({ name: "tb_list_boards", arguments: { project: "discovery" } });
+    const noActorBoards = JSON.parse((noActor.content[0] as { text: string }).text).boards;
+    expect(noActorBoards.map((entry: Record<string, unknown>) => entry.id)).toEqual([legacyBoardId]);
+    expect(JSON.stringify(noActorBoards)).not.toContain(owned.board_id);
+    expect(JSON.stringify(noActorBoards)).not.toContain(foreign.board_id);
+
+    const ownerListing = await client.callTool({
+      name: "tb_list_boards",
+      arguments: { project: "discovery", actor: "owner", ...directContext },
+    });
+    const ownerBoards = JSON.parse((ownerListing.content[0] as { text: string }).text).boards as Record<string, unknown>[];
+    const ownerIds = ownerBoards.map((entry) => entry.id);
+    expect(ownerIds).toEqual(expect.arrayContaining([legacyBoardId, owned.board_id]));
+    const ownedEntry = ownerBoards.find((entry) => entry.id === owned.board_id);
+    expect(ownedEntry).toMatchObject({ mode: "direct-v1", project: "discovery" });
+    expect(typeof ownedEntry!.revision).toBe("number");
+    expect(JSON.stringify(ownerBoards)).not.toContain(foreign.board_id);
+    expect(JSON.stringify(ownerBoards)).not.toContain("Foreign direct board");
+
+    const granteeListing = await client.callTool({
+      name: "tb_list_boards",
+      arguments: { project: "discovery", actor: "active-grantee", ...directContext, capability: authorityCapability },
+    });
+    const granteeBoards = JSON.parse((granteeListing.content[0] as { text: string }).text).boards;
+    expect(granteeBoards.map((entry: Record<string, unknown>) => entry.id)).toEqual(
+      expect.arrayContaining([legacyBoardId, owned.board_id])
+    );
+    expect(JSON.stringify(granteeBoards)).not.toContain(foreign.board_id);
+
+    for (const actor of ["expired-grantee", "revoked-grantee", "intruder"]) {
+      const denied = await client.callTool({
+        name: "tb_list_boards",
+        arguments: { project: "discovery", actor, ...directContext, capability: authorityCapability },
+      });
+      const deniedBoards = JSON.parse((denied.content[0] as { text: string }).text).boards;
+      expect(deniedBoards.map((entry: Record<string, unknown>) => entry.id)).toEqual([legacyBoardId]);
+      const serialized = JSON.stringify(deniedBoards);
+      expect(serialized).not.toContain(owned.board_id);
+      expect(serialized).not.toContain(foreign.board_id);
+      expect(serialized).not.toContain("Owned direct board");
+      expect(serialized).not.toContain("Owned secret task");
+    }
+
+    await client.close();
+    await server.close();
+    created.database.close();
+  });
+
+  it("authorized discovery enforces the grant expiry boundary and requires full direct-v1 context", async () => {
+    const created = createTestDatabase("forgespec-discovery-boundary-");
+    const clock = new FakeClock(Date.now() - 20_000);
+    const service = new TaskService(created.database, { clock });
+    const board = service.createDirectBoard({
+      coordination_mode: "direct-v1",
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      project: "boundary",
+      name: "Boundary board",
+      actor: "owner",
+      idempotency_key: "boundary-board",
+      tasks: [{ title: "Secret boundary task" }],
+    });
+    service.grantAuthority({
+      actor: "owner",
+      resource: { kind: "board", boardId: board.board_id },
+      granteeActor: "grantee",
+      operation: "read_board",
+      expiresAtMs: clock.now() + 1_000,
+      idempotencyKey: "boundary-grant",
+      expectedBoardRevision: board.board_revision,
+      capability: authorityCapability,
+    });
+    const granteeContext = {
+      actor: "grantee",
+      coordination_mode: "direct-v1" as const,
+      api_version: "1.0.0",
+      schema_version: "1.0.0",
+      capability: authorityCapability,
+    };
+
+    clock.set(clock.now() + 999);
+    const beforeBoundary = await service.listBoardsForActor(granteeContext);
+    expect(beforeBoundary.map((entry) => entry.id)).toContain(board.board_id);
+
+    clock.set(clock.now() + 1);
+    const atBoundary = await service.listBoardsForActor(granteeContext);
+    expect(atBoundary.map((entry) => entry.id)).not.toContain(board.board_id);
+    const ownerAtBoundary = await service.listBoardsForActor({ ...granteeContext, actor: "owner", capability: undefined });
+    expect(ownerAtBoundary.map((entry) => entry.id)).toContain(board.board_id);
+
+    const partialContext = await service.listBoardsForActor({ actor: "owner", project: "boundary" });
+    expect(partialContext.map((entry) => entry.id)).not.toContain(board.board_id);
+
+    created.database.close();
+  });
+});

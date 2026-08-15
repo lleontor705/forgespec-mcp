@@ -37,6 +37,7 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
         .max(131072)
         .describe("JSON string of the SDD contract to validate"),
     },
+    { readOnlyHint: true, idempotentHint: true },
     async ({ contract }) => {
       try {
         const parsed = JSON.parse(contract);
@@ -115,6 +116,7 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
       parent_contract_id: z.string().max(256).optional(),
       submitted_digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
     },
+    { readOnlyHint: false, idempotentHint: true },
     async (input) => {
       try {
         const service = new ContractService(databaseProvider());
@@ -161,6 +163,7 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
       consistency: z.enum(["best_effort"]).optional(),
       limit: z.number().int().min(1).max(100).default(20).describe("Max entries to return"),
     },
+    { readOnlyHint: true, idempotentHint: true },
     async ({ project, change_name, phase, since_revision, cursor, consistency, limit }) => {
       const db = databaseProvider();
       const hasDirectHistory = Boolean(
@@ -255,6 +258,7 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
     {
       contract_id: z.string().max(256).describe("Contract ID to retrieve"),
     },
+    { readOnlyHint: true, idempotentHint: true },
     async ({ contract_id }) => {
       try {
         const response = new ContractService(databaseProvider()).get(contract_id);
@@ -284,6 +288,7 @@ export function registerSddTools(server: McpServer, databaseProvider = getDb): v
       phase: z.enum(SDD_PHASES).optional().describe("Filter by SDD phase"),
       limit: z.number().int().min(1).max(100).default(20).describe("Max entries to return"),
     },
+    { readOnlyHint: true, idempotentHint: true },
     async ({ project, phase, limit }) => {
       const db = databaseProvider();
       const conditions: string[] = [];

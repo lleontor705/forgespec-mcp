@@ -58,6 +58,7 @@ export function registerCapabilitiesTool(
       description: "Negotiate ForgeSpec coordination mode, schemas, independently versioned features, and limits.",
       inputSchema: CapabilitiesInputSchema,
       outputSchema: CapabilitiesOutputSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async (input) => {
       const output = negotiateCapabilities(input, options);

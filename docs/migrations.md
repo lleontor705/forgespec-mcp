@@ -1,6 +1,6 @@
 # ForgeSpec migrations and rollback
 
-**Package:** `forgespec-mcp@1.5.0` | **Current schema:** 6 | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
+**Package:** `forgespec-mcp@1.5.2` | **Current schema:** 6 | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
 
 ## Schema versions
 
