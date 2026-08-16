@@ -359,4 +359,177 @@ describe("direct-v1 normalized file leases", () => {
     await server.close();
     created.database.close();
   });
+
+  it("bridges direct-v1 actor and expected_revision wire fields onto a valid lease", async () => {
+    const created = createTestDatabase("forgespec-file-bridge-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const { claim } = createAuthority(created.database, clock, "bridge");
+    const server = new McpServer({ name: "file-bridge-server", version: "1.0.0" });
+    registerFileTools(server, () => created.database, { clock });
+    const client = new Client({ name: "file-bridge-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const reserved = await client.callTool({
+        name: "file_reserve",
+        arguments: {
+          coordination_mode: "direct-v1",
+          api_version: "1.0.0",
+          schema_version: "1.0.0",
+          patterns: ["src/bridge/**"],
+          actor: "worker-a",
+          expected_revision: claim.task_revision,
+          workspace_id: "workspace-a",
+          case_policy: "insensitive",
+          ttl_minutes: 15,
+          task_id: claim.task_id,
+          attempt_id: claim.attempt_id,
+          claim_token: claim.claim_token,
+          idempotency_key: "bridge-actor-expected-revision",
+        },
+      });
+      expect(reserved.isError).not.toBe(true);
+      const payload = reserved.structuredContent
+        ?? JSON.parse((reserved.content as Array<{ text: string }>)[0].text);
+      const lease = payload as { ok?: boolean; replayed?: boolean; revision?: number; lease_id?: string };
+      expect(lease).toMatchObject({ ok: true, replayed: false, revision: 1 });
+      expect(lease.lease_id).toBeTruthy();
+      expect(created.database
+        .prepare("SELECT actor, state FROM file_leases WHERE id = ?")
+        .get(lease.lease_id)).toEqual({ actor: "worker-a", state: "active" });
+    } finally {
+      await client.close();
+      await server.close();
+      created.database.close();
+    }
+  });
+
+  it("keeps direct-v1 legacy agent and expected_task_revision fields accepted", async () => {
+    const created = createTestDatabase("forgespec-file-legacy-alias-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const { claim } = createAuthority(created.database, clock, "legacy-alias");
+    const server = new McpServer({ name: "file-legacy-alias-server", version: "1.0.0" });
+    registerFileTools(server, () => created.database, { clock });
+    const client = new Client({ name: "file-legacy-alias-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const authority = {
+        coordination_mode: "direct-v1",
+        api_version: "1.0.0",
+        schema_version: "1.0.0",
+        workspace_id: "workspace-a",
+        case_policy: "insensitive",
+        ttl_minutes: 15,
+        task_id: claim.task_id,
+        attempt_id: claim.attempt_id,
+        claim_token: claim.claim_token,
+      };
+      const legacyOnly = await client.callTool({
+        name: "file_reserve",
+        arguments: {
+          ...authority,
+          patterns: ["src/legacy-direct/**"],
+          agent: "worker-a",
+          expected_task_revision: claim.task_revision,
+          idempotency_key: "legacy-agent-task-revision",
+        },
+      });
+      expect(legacyOnly.isError).not.toBe(true);
+      const equalAliases = await client.callTool({
+        name: "file_reserve",
+        arguments: {
+          ...authority,
+          patterns: ["docs/aliases/**"],
+          agent: "worker-a",
+          actor: "worker-a",
+          expected_task_revision: claim.task_revision,
+          expected_revision: claim.task_revision,
+          idempotency_key: "equal-aliases",
+        },
+      });
+      expect(equalAliases.isError).not.toBe(true);
+      expect(created.database.prepare("SELECT COUNT(*) AS count FROM file_leases WHERE state = 'active'").get())
+        .toEqual({ count: 2 });
+    } finally {
+      await client.close();
+      await server.close();
+      created.database.close();
+    }
+  });
+
+  it("rejects divergent identity and revision aliases instead of discarding them silently", async () => {
+    const created = createTestDatabase("forgespec-file-divergent-");
+    const clock = new FakeClock(1_800_000_000_000);
+    const { claim } = createAuthority(created.database, clock, "divergent");
+    const server = new McpServer({ name: "file-divergent-server", version: "1.0.0" });
+    registerFileTools(server, () => created.database, { clock });
+    const client = new Client({ name: "file-divergent-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      const divergentIdentity = await client.callTool({
+        name: "file_reserve",
+        arguments: {
+          coordination_mode: "direct-v1",
+          api_version: "1.0.0",
+          schema_version: "1.0.0",
+          patterns: ["src/conflict/**"],
+          agent: "worker-a",
+          actor: "intruder-name",
+          expected_task_revision: claim.task_revision,
+          expected_revision: claim.task_revision,
+          workspace_id: "workspace-a",
+          case_policy: "insensitive",
+          ttl_minutes: 15,
+          task_id: claim.task_id,
+          attempt_id: claim.attempt_id,
+          claim_token: claim.claim_token,
+          idempotency_key: "divergent-identity",
+        },
+      });
+      expect(divergentIdentity.isError).toBe(true);
+      const identityError = (divergentIdentity.structuredContent
+        ?? JSON.parse((divergentIdentity.content as Array<{ text: string }>)[0].text)) as {
+          error?: { code?: string; category?: string };
+        };
+      expect(identityError.error).toMatchObject({ code: "identity_conflict", category: "validation" });
+
+      const divergentRevision = await client.callTool({
+        name: "file_reserve",
+        arguments: {
+          coordination_mode: "direct-v1",
+          api_version: "1.0.0",
+          schema_version: "1.0.0",
+          patterns: ["src/conflict/**"],
+          agent: "worker-a",
+          actor: "worker-a",
+          expected_task_revision: claim.task_revision,
+          expected_revision: claim.task_revision + 1,
+          workspace_id: "workspace-a",
+          case_policy: "insensitive",
+          ttl_minutes: 15,
+          task_id: claim.task_id,
+          attempt_id: claim.attempt_id,
+          claim_token: claim.claim_token,
+          idempotency_key: "divergent-revision",
+        },
+      });
+      expect(divergentRevision.isError).toBe(true);
+      const revisionError = (divergentRevision.structuredContent
+        ?? JSON.parse((divergentRevision.content as Array<{ text: string }>)[0].text)) as {
+          error?: { code?: string; category?: string };
+        };
+      expect(revisionError.error).toMatchObject({ code: "expected_revision_conflict", category: "validation" });
+
+      expect(created.database.prepare("SELECT COUNT(*) AS count FROM file_leases").get()).toEqual({ count: 0 });
+    } finally {
+      await client.close();
+      await server.close();
+      created.database.close();
+    }
+  });
 });
