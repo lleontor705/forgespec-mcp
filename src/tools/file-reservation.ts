@@ -5,6 +5,7 @@ import type { Clock } from "../core/clock.js";
 import { directErrorResponse } from "../core/errors.js";
 import { getDb } from "../database/index.js";
 import {
+  FileLeaseConflictError,
   FileLeaseService,
   type DirectFileReleaseInput,
   type DirectFileRenewInput,
@@ -36,6 +37,43 @@ const directVersionFields = {
   schema_version: z.string().max(32).optional(),
 };
 
+function resolveDirectIdentity(agent: string | undefined, actor: string | undefined): string {
+  if (agent !== undefined && actor !== undefined && agent !== actor) {
+    throw new FileLeaseConflictError(
+      "agent and actor must match when both are provided",
+      "validation",
+      "identity_conflict"
+    );
+  }
+  const identity = agent ?? actor;
+  if (!identity) {
+    throw new FileLeaseConflictError("File lease authority fields are required", "validation");
+  }
+  return identity;
+}
+
+function resolveExpectedTaskRevision(
+  expectedTaskRevision: number | undefined,
+  expectedRevision: number | undefined
+): number {
+  if (
+    expectedTaskRevision !== undefined
+    && expectedRevision !== undefined
+    && expectedTaskRevision !== expectedRevision
+  ) {
+    throw new FileLeaseConflictError(
+      "expected_task_revision and expected_revision must match when both are provided",
+      "validation",
+      "expected_revision_conflict"
+    );
+  }
+  const revision = expectedTaskRevision ?? expectedRevision;
+  if (revision === undefined) {
+    throw new FileLeaseConflictError("Expected task revision is required", "cas", "expected_revision_required");
+  }
+  return revision;
+}
+
 export function registerFileTools(
   server: McpServer,
   databaseProvider: () => Database.Database = getDb,
@@ -49,7 +87,18 @@ export function registerFileTools(
       patterns: z
         .array(z.string())
         .describe("File paths or glob patterns to reserve (e.g. ['src/auth/**', 'package.json'])"),
-      agent: z.string().max(256).regex(/^[a-zA-Z0-9_.-]+$/).describe("Agent reserving the files"),
+      agent: z
+        .string()
+        .max(256)
+        .regex(/^[a-zA-Z0-9_.-]+$/)
+        .optional()
+        .describe("Agent reserving the files (legacy advisory mode; direct-v1 also accepts actor)"),
+      actor: z
+        .string()
+        .min(1)
+        .max(256)
+        .optional()
+        .describe("Direct-v1 actor identity for the lease; mapped onto the internal agent field"),
       ttl_minutes: z
         .number()
         .min(1)
@@ -66,7 +115,18 @@ export function registerFileTools(
       task_id: z.string().min(1).max(256).optional(),
       attempt_id: z.string().min(1).max(256).optional(),
       claim_token: z.string().min(1).max(512).optional(),
-      expected_task_revision: z.number().int().min(1).optional(),
+      expected_task_revision: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Expected direct task revision for direct-v1 CAS (direct-v1 also accepts expected_revision)"),
+      expected_revision: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Direct-v1 alias mapped onto expected_task_revision"),
       idempotency_key: z.string().min(1).max(256).optional(),
     },
     { readOnlyHint: false, idempotentHint: true },
@@ -76,10 +136,33 @@ export function registerFileTools(
       if (input.coordination_mode === "direct-v1") {
         if (check_only) return directFailure(new Error("check_only is a legacy advisory operation"));
         try {
-          return success(new FileLeaseService(db, options).reserve(input as DirectFileReserveInput) as unknown as Record<string, unknown>);
+          const directInput = {
+            coordination_mode: "direct-v1",
+            api_version: input.api_version,
+            schema_version: input.schema_version,
+            patterns,
+            agent: resolveDirectIdentity(agent, input.actor),
+            ttl_minutes,
+            workspace_id: input.workspace_id,
+            case_policy: input.case_policy,
+            task_id: input.task_id,
+            attempt_id: input.attempt_id,
+            claim_token: input.claim_token,
+            expected_task_revision: resolveExpectedTaskRevision(
+              input.expected_task_revision,
+              input.expected_revision
+            ),
+            idempotency_key: input.idempotency_key,
+          } as DirectFileReserveInput;
+          return success(new FileLeaseService(db, options).reserve(directInput) as unknown as Record<string, unknown>);
         } catch (error) {
           return directFailure(error);
         }
+      }
+      if (!agent) {
+        return directFailure(
+          new FileLeaseConflictError("agent is required for advisory file reservations", "validation", "agent_required")
+        );
       }
       const now = new Date();
       const expiresAt = new Date(
