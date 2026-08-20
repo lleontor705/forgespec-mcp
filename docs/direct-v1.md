@@ -1,12 +1,12 @@
 # ForgeSpec direct-v1
 
-**Version:** 1.6.0 | **API version:** 1.0.0 | **Schema:** 6 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
+**Version:** 2.0.0 | **API version:** 1.0.0 | **Schema:** 6 | **Entrypoint:** `build/index.js` | **Primary Node:** 24.18.1 | **Supported Node:** 22.x, 24.x, and 26.x
 
-direct-v1 is the transactional coordination mode for boards, tasks, contracts, and file leases. The runtime currently exposes **30 MCP tools**; the inventory below is generated from `tools/list` and is the compatibility checklist.
+direct-v1 is the transactional coordination mode for boards, tasks, contracts, and file leases. The runtime currently exposes **14 MCP tools**; the inventory below is generated from `tools/list` and is the compatibility checklist.
 
 ## Runtime inventory
 
-`forgespec_capabilities`, `forgespec_health`, `tb_audit_log`, `sdd_validate`, `sdd_save`, `sdd_history`, `sdd_get`, `sdd_list`, `tb_create_board`, `tb_add_task`, `tb_status`, `tb_claim`, `tb_set_dependencies`, `tb_heartbeat`, `tb_recover_claims`, `tb_requeue`, `tb_approve`, `tb_grant`, `tb_handoff`, `tb_revoke`, `tb_query`, `tb_batch_status`, `tb_events`, `tb_update`, `tb_unblocked`, `tb_get`, `tb_list_boards`, `file_reserve`, `file_release`, `file_renew`.
+`task_board_create`, `task_board_get`, `task_add`, `task_claim`, `task_heartbeat`, `task_complete`, `task_block`, `spec_save`, `spec_get`, `spec_list`, `file_reserve`, `file_release`, `system_health`, `system_audit_log`.
 
 Clients should call `forgespec_capabilities` before using direct-v1. The server reports package version, API/schema versions, limits, capabilities, and the `local-trusted-client` boundary.
 

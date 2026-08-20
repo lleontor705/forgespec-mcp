@@ -32,10 +32,10 @@ Building software with multiple AI agents (Claude, Codex, Gemini, etc.) introduc
 
 - **Zero infrastructure** -- Embedded SQLite database, no external services required
 - **Universal compatibility** -- Works with any MCP client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more
-- **Package:** `forgespec-mcp@1.6.0`; runtime schema 6; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
+- **Package:** `forgespec-mcp@2.0.0`; runtime schema 6; Node `24.18.1` is the primary runtime and Node `22.x`, `24.x`, and `26.x` are supported.
 - **Runtime policy:** CI runs nine isolated jobs for Node `22.x`, `24.x`, and `26.x` on Ubuntu, Windows, and macOS. Node 22 uses native ABI 127; Node 24 uses ABI 137; Node 26 uses ABI 147.
 - **Entrypoint:** the package bin is `build/index.js`, exposed as `forgespec-mcp`.
-- **Runtime inventory:** **30 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
+- **Runtime inventory:** **14 MCP tools**, listed in [docs/direct-v1.md](docs/direct-v1.md) and checked against `tools/list`.
 - **SQLite preflight:** startup verifies immutable migration checksums and effective `STRICT`, JSON1, and WAL capabilities before MCP traffic.
 - **Performance fixture:** 10,000 tasks × 20 versions, page 100, 30 warmed pages; reference targets are median `<250 ms` and p95 `<500 ms`.
 - **Retention:** task history is append-only and is not pruned by this release.
@@ -191,7 +191,7 @@ Each phase has a **confidence threshold** that must be met before transitioning 
 
 ## Tools Reference
 
-ForgeSpec exposes **30 MCP tools**. The authoritative runtime inventory is maintained in [docs/direct-v1.md](docs/direct-v1.md) and tested against `tools/list`.
+ForgeSpec exposes **14 MCP tools**. The authoritative runtime inventory is maintained in [docs/direct-v1.md](docs/direct-v1.md) and tested against `tools/list`.
 
 ### Capability & Diagnostic Tools (3)
 
@@ -238,6 +238,36 @@ SQLite-backed task management with dependency tracking and auto-unblocking.
 | `tb_query` | Query snapshot task pages |
 | `tb_batch_status` | Read bounded board/work-unit status |
 | `tb_events` | Read authority-event deltas |
+
+
+### ForgeSpec v2.0 Unified Tools
+
+| Tool | Category | Description |
+|---|---|---|
+| `task_board_create` | Tasks | Create project board with optional inline tasks in one atomic call |
+| `task_board_get` | Tasks | Retrieve consolidated board status and tasks with token compression |
+| `task_add` | Tasks | Add task with acceptance criteria, priority, and dependencies |
+| `task_claim` | Tasks | Claim ready task with execution lease and optional file locks |
+| `task_heartbeat` | Tasks | Extend claim execution lease duration |
+| `task_complete` | Tasks | Mark task done, release file locks, and auto-unblock dependents |
+| `task_block` | Tasks | Mark task blocked with explicit reason |
+| `spec_save` | Specs | Save/version technical specifications and contracts |
+| `spec_get` | Specs | Retrieve specification contract for project/phase |
+| `spec_list` | Specs | List all specifications recorded for a project |
+| `file_lock_acquire` | Files | Acquire exclusive advisory lease on files or glob patterns |
+| `file_lock_release` | Files | Release active file reservations |
+| `system_health` | System | Server diagnostics, Node/SQLite version, memory, and uptime |
+| `system_audit_log` | System | Query tamper-evident immutable mutation history |
+
+
+### Agent Facade Tools
+
+| Tool | Description |
+|---|---|
+| `fs_board_summary` | Condensed, token-efficient board status summary |
+| `fs_claim_work` | 1-step claim task and lock working files |
+| `fs_finish_work` | 1-step complete task, unblock dependents, and release locks |
+| `fs_save_phase` | Record SDD milestone outcomes with clean payloads |
 
 ### File Reservation Tools (3)
 

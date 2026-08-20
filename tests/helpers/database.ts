@@ -18,11 +18,14 @@ export function createTemporaryDatabasePath(prefix = "forgespec-runtime-"): stri
   return path.join(directory, "forgespec.db");
 }
 
+import { SCHEMA_V2_SQL } from "../../src/database/schema-v2.js";
+
 export function openTestDatabase(databasePath: string): Database.Database {
   const database = new Database(databasePath);
   database.pragma("journal_mode = WAL");
   database.pragma("busy_timeout = 5000");
   database.pragma("foreign_keys = ON");
+  database.exec(SCHEMA_V2_SQL);
   openDatabases.push(database);
   return database;
 }

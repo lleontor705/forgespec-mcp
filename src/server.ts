@@ -3,12 +3,10 @@ import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import type Database from "better-sqlite3";
-import { registerSddTools } from "./tools/sdd-contracts.js";
-import { registerTaskBoardTools } from "./tools/task-board.js";
-import { registerFileTools } from "./tools/file-reservation.js";
-import { registerCapabilitiesTool } from "./tools/capabilities.js";
-import { registerHealthTool } from "./tools/health.js";
-import { registerAuditLogTool } from "./tools/audit-log.js";
+import { registerTaskTools } from "./tools/tasks.js";
+import { registerSpecTools } from "./tools/specs.js";
+import { registerFileLeaseTools } from "./tools/files.js";
+import { registerSystemTools } from "./tools/system.js";
 import { getDb } from "./database/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -26,12 +24,12 @@ export function createServer(options?: ServerOptions): McpServer {
 
   const databaseProvider = options?.database ?? getDb;
 
-  registerCapabilitiesTool(server, { serverVersion: pkg.version });
-  registerHealthTool(server, databaseProvider);
-  registerAuditLogTool(server, databaseProvider);
-  registerSddTools(server, databaseProvider);
-  registerTaskBoardTools(server, databaseProvider);
-  registerFileTools(server, databaseProvider);
+  // ── ForgeSpec v2.0.0 Clean Break Suite (14 Tools) ──
+  registerTaskTools(server, databaseProvider);
+  registerSpecTools(server, databaseProvider);
+  registerFileLeaseTools(server, databaseProvider);
+  registerSystemTools(server, databaseProvider);
 
   return server;
 }
+

@@ -5,6 +5,8 @@ import fs from "node:fs";
 import { migrateDatabase, qualifyDatabase } from "./migrations.js";
 import { TaskService } from "../services/task-service.js";
 
+import { SCHEMA_V2_SQL } from "./schema-v2.js";
+
 const DEFAULT_DIR = path.join(os.homedir(), ".forgespec");
 const DB_DIR = process.env.FORGESPEC_DIR || DEFAULT_DIR;
 const DB_PATH = process.env.FORGESPEC_DB || path.join(DB_DIR, "forgespec.db");
@@ -21,10 +23,11 @@ export function getDb(): Database.Database {
   db = new Database(DB_PATH);
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = normal");
-  db.pragma("cache_size = -32000");
+  db.pragma("cache_size = -64000");
   db.pragma("temp_store = memory");
-  db.pragma("busy_timeout = 5000");
+  db.pragma("busy_timeout = 10000");
   db.pragma("foreign_keys = ON");
+  db.exec(SCHEMA_V2_SQL);
   const qualification = qualifyDatabase(db, { requireWal: true });
   new TaskService(db).reconcileAllProjections();
 

@@ -14,8 +14,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ExpectedVersion = '1.6.0'
-# Authorized exact repair target: forgespec-mcp@1.6.0
+$ExpectedVersion = '2.0.0'
+# Authorized exact repair target: forgespec-mcp@2.0.0
 $PublicShim = Join-Path $env:LOCALAPPDATA 'Volta\bin\forgespec-mcp.cmd'
 # Stable persisted command: $env:LOCALAPPDATA\Volta\bin\forgespec-mcp.cmd
 $Mutexes = @()
@@ -24,7 +24,7 @@ $ConfigBackup = $null
 function Fail([string]$Message) { throw "ForgeSpec repair failed: $Message" }
 
 function Acquire-ResourceLocks {
-  foreach ($name in @('ForgeSpec-Volta-forgespec-mcp-1.6.0', 'ForgeSpec-OpenCode-config')) {
+  foreach ($name in @('ForgeSpec-Volta-forgespec-mcp-2.0.0', 'ForgeSpec-OpenCode-config')) {
     $mutex = [Threading.Mutex]::new($false, $name)
     if (-not $mutex.WaitOne(30000)) { Fail "Could not acquire exclusive resource lock $name" }
     $script:Mutexes += $mutex
