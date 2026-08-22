@@ -99,6 +99,7 @@ jobs:
         shell: bash
         run: |
           npm install --prefix "$RUNNER_TEMP/opencode-host" --ignore-scripts --omit=peer --package-lock=false opencode-ai@1.18.3
+          (cd "$RUNNER_TEMP/opencode-host/node_modules/opencode-ai" && node postinstall.mjs)
           echo "$RUNNER_TEMP/opencode-host/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Verify actual OpenCode host against packed plugin URL
         run: node scripts/verify-opencode-host.mjs --mode=packed --artifacts-dir="$GITHUB_WORKSPACE/.release-artifacts"
