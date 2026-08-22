@@ -1,12 +1,21 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import plugin from "../../plugins/opencode-forgespec/index.js";
 
 describe("packaged OpenCode plugin to MCP identity path", () => {
+  beforeAll(() => {
+    if (!existsSync(resolve("build/index.js")) || !existsSync(resolve("build/identity/broker-cli.js"))) {
+      execFileSync(process.execPath, [resolve("node_modules/typescript/bin/tsc")], {
+        cwd: resolve(__dirname, "../.."),
+        stdio: "ignore",
+      });
+    }
+  });
   it("probes the clean package entrypoint and accepts signed health/task calls", async () => {
     const dir = mkdtempSync(join(tmpdir(), "forgespec-plugin-e2e-"));
     const previous = { db: process.env.FORGESPEC_DB, sidecar: process.env.FORGESPEC_IDENTITY_SIDECAR_PATH, cursor: process.env.FORGESPEC_CURSOR_SECRET };
