@@ -2,11 +2,16 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { randomBytes } from "node:crypto";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createServer } from "./server.js";
 import { close, get, open } from "./storage/database.js";
 import { openIdentityStore } from "./identity/store.js";
 import { IdentityVerifier } from "./identity/verifier.js";
 import { readIdentityBootstrap } from "./runtime/identity-bootstrap.js";
+
+export { createServer } from "./server.js";
+export default createServer;
 
 function resolveCursorSecret(): string {
   const configured = process.env.FORGESPEC_CURSOR_SECRET;
@@ -60,10 +65,30 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  console.error(formatStartupError(error));
-  process.exit(1);
-});
+function isMainModule(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    const script = fileURLToPath(import.meta.url);
+    const resolvedArg = path.resolve(process.argv[1]);
+    const resolvedScript = path.resolve(script);
+    return resolvedArg === resolvedScript ||
+      resolvedArg === resolvedScript.replace(/\.ts$/, ".js") ||
+      resolvedArg.endsWith("build/index.js") ||
+      resolvedArg.endsWith("build\\index.js") ||
+      resolvedArg.endsWith("src/index.ts") ||
+      resolvedArg.endsWith("src\\index.ts") ||
+      path.basename(resolvedArg).toLowerCase() === "forgespec-mcp";
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  main().catch((error) => {
+    console.error(formatStartupError(error));
+    process.exit(1);
+  });
+}
 
 function formatStartupError(error: unknown): string {
   const message = error instanceof Error ? error.message : "Unknown startup failure";
