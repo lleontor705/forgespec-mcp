@@ -211,6 +211,12 @@ jobs:
         run: npm publish ./plugins/opencode-forgespec --provenance --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Install pinned official OpenCode host
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/opencode-host" --ignore-scripts --omit=peer --package-lock=false opencode-ai@1.18.3
+          (cd "$RUNNER_TEMP/opencode-host/node_modules/opencode-ai" && node postinstall.mjs)
+          echo "$RUNNER_TEMP/opencode-host/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Retry npm visibility and signed health assertion
         shell: bash
         env:

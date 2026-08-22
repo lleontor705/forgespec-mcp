@@ -96,6 +96,7 @@ describe("package-lock runtime policy", () => {
     expect(installs).toEqual([
       'npm install --prefix "$RUNNER_TEMP/opencode-host" --ignore-scripts --omit=peer --package-lock=false opencode-ai@1.18.3',
       'npm install --prefix "$TMP" --ignore-scripts --omit=peer --package-lock=false "$(pwd)/$TARBALL" "$(pwd)/$PLUGIN_TARBALL"',
+      'npm install --prefix "$RUNNER_TEMP/opencode-host" --ignore-scripts --omit=peer --package-lock=false opencode-ai@1.18.3',
       'npm install --prefix "$POST_TMP" --ignore-scripts --omit=peer --package-lock=false "opencode-forgespec@$VERSION" "forgespec-mcp@$VERSION"',
     ]);
     expect(workflows).not.toMatch(/upload-artifact|download-artifact/);
