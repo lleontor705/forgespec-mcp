@@ -82,6 +82,12 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+      - name: Set package version without lifecycle scripts
+        run: npm version "${{ needs.prepare-release.outputs.version }}" --no-git-tag-version --allow-same-version --ignore-scripts
+      - name: Align standalone plugin version without lifecycle scripts
+        run: npm version "${{ needs.prepare-release.outputs.version }}" --prefix plugins/opencode-forgespec --no-git-tag-version --allow-same-version --ignore-scripts
+      - name: Align plugin dependency version without lifecycle scripts
+        run: npm pkg set dependencies.forgespec-mcp="${{ needs.prepare-release.outputs.version }}" --prefix plugins/opencode-forgespec
       - name: Pack release artifacts before host verification
         shell: bash
         run: |

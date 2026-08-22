@@ -1,6 +1,6 @@
 {
   "name": "opencode-forgespec",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "OpenCode integration plugin for ForgeSpec MCP coordination and file reservation",
   "type": "module",
   "engines": {
@@ -18,7 +18,7 @@
     "@opencode-ai/plugin": ">=1.0.0"
   },
   "dependencies": {
-    "forgespec-mcp": "2.0.0"
+    "forgespec-mcp": "2.1.0"
   },
   "scripts": {
     "test": "vitest run"

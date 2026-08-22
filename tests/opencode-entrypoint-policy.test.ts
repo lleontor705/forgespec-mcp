@@ -33,7 +33,7 @@ describe("stable OpenCode entrypoint policy", () => {
   it("keeps the standalone plugin package installable and single-export", () => {
     const pluginPackage = JSON.parse(fs.readFileSync(path.join(ROOT, "plugins", "opencode-forgespec", "package.json"), "utf8"));
     expect(pluginPackage.name).toBe("opencode-forgespec");
-    expect(pluginPackage.dependencies["forgespec-mcp"]).toBe("2.0.0");
+    expect(pluginPackage.dependencies["forgespec-mcp"]).toBe(packageJson.version);
     expect(pluginPackage.exports).toEqual({ ".": "./index.js" });
     expect(pluginPackage.engines.node).toBe(">=22");
   });

@@ -25,8 +25,8 @@ describe("package-lock runtime policy", () => {
   it("contains only the supported root engines metadata", () => {
     const lock = readLockfile();
     expect(lock.name).toBe("forgespec-mcp");
-    expect(lock.version).toBe("2.0.0");
-    expect(lock.packages?.["" ]?.version).toBe("2.0.0");
+    expect(lock.version).toBe("2.1.0");
+    expect(lock.packages?.["" ]?.version).toBe("2.1.0");
     expect(lock.packages?.["" ]?.bin).toEqual({ "forgespec-identity-broker": "build/identity/broker-cli.js", "forgespec-mcp": "build/index.js" });
     expect(lock.packages?.[""]?.engines?.node).toBe(">=22 <23 || >=24 <25 || >=26 <27");
   });
