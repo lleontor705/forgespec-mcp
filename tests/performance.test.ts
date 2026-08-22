@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { LATEST_SCHEMA_VERSION, migrateDatabase } from "../src/database/migrations.js";
+import { createFreshStore } from "../src/storage/bootstrap.js";
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgespec-performance-"));
 const databasePath = path.join(directory, "benchmark.db");
@@ -11,42 +11,26 @@ let database: Database.Database;
 
 // Windows runners can need a larger hook budget for this 200k-row fixture.
 beforeAll(() => {
-  migrateDatabase(databasePath);
   database = new Database(databasePath);
   database.pragma("foreign_keys = ON");
+  database.pragma("journal_mode = WAL");
+  createFreshStore(database);
 
   if (
-    database.pragma("user_version", { simple: true }) !== LATEST_SCHEMA_VERSION
-    || !database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'direct_task_versions'").get()
+    !database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'fs_tasks'").get()
   ) {
     return;
   }
 
   const insertFixture = database.transaction(() => {
-    database.prepare("INSERT INTO boards (id, project, name) VALUES (?, ?, ?)").run("benchmark-board", "benchmark", "Benchmark");
-    database.prepare(
-      "INSERT INTO direct_boards (board_id, change_name, schema_version, revision, metadata_json, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).run("benchmark-board", "benchmark", "1.0.0", 20_000, "{}", 1, 1);
-
+    database.prepare("INSERT INTO fs_boards (id, project, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run("benchmark-board", "benchmark", "Benchmark", 1, 1);
     const insertTask = database.prepare(
-      "INSERT INTO tasks (id, board_id, title, status) VALUES (?, ?, ?, 'ready')"
-    );
-    const insertDirectTask = database.prepare(
-      "INSERT INTO direct_tasks (task_id, board_id, revision, status, metadata_json, created_at_ms, updated_at_ms) VALUES (?, ?, ?, 'ready', ?, ?, ?)"
-    );
-    const insertVersion = database.prepare(
-      `INSERT INTO direct_task_versions
-       (board_id, task_id, board_revision, task_revision, status, metadata_json, created_at_ms, updated_at_ms, is_deleted)
-       VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, 0)`
+      "INSERT INTO fs_tasks (board_id, id, title, priority, status, created_at, updated_at) VALUES (?, ?, ?, 'p2', 'ready', ?, ?)"
     );
 
     for (let taskNumber = 0; taskNumber < 10_000; taskNumber += 1) {
       const taskId = `benchmark-task-${taskNumber}`;
-      insertTask.run(taskId, "benchmark-board", taskId);
-      insertDirectTask.run(taskId, "benchmark-board", 20, "{}", 1, 1);
-      for (let version = 1; version <= 20; version += 1) {
-        insertVersion.run("benchmark-board", taskId, version, version, "{}", version, version);
-      }
+      insertTask.run("benchmark-board", taskId, taskId, 1, 1);
     }
   });
   insertFixture();
@@ -64,21 +48,18 @@ describe("historical task query performance contract", () => {
   });
 
   it("qualifies the latest schema and the snapshot selection indexes", () => {
-    expect(database.pragma("user_version", { simple: true })).toBe(LATEST_SCHEMA_VERSION);
-
     const table = database
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'direct_task_versions'")
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fs_tasks'")
       .get() as { name: string } | undefined;
-    expect(table?.name).toBe("direct_task_versions");
+    expect(table?.name).toBe("fs_tasks");
 
     const indexes = database
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'direct_task_versions'")
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'fs_tasks'")
       .all() as Array<{ name: string }>;
     expect(indexes.map((index) => index.name)).toEqual(
       expect.arrayContaining([
-        "idx_task_versions_board_snapshot",
-        "idx_task_versions_board_task_snapshot",
-        "idx_task_versions_task_history",
+        "idx_fs_tasks_board",
+        "idx_fs_tasks_board_status",
       ])
     );
   });
@@ -87,41 +68,23 @@ describe("historical task query performance contract", () => {
     const plan = database
       .prepare(
         `EXPLAIN QUERY PLAN
-         SELECT v.task_id, v.status, v.metadata_json
-         FROM direct_task_versions v
-         WHERE v.board_id = ? AND v.board_revision <= ? AND v.task_id > ?
-           AND v.is_deleted = 0
-           AND NOT EXISTS (
-             SELECT 1
-             FROM direct_task_versions newer
-             WHERE newer.board_id = v.board_id
-               AND newer.task_id = v.task_id
-               AND newer.board_revision <= ?
-               AND newer.board_revision > v.board_revision
-           )
-         ORDER BY v.task_id
+         SELECT v.id, v.status, v.title
+         FROM fs_tasks v
+         WHERE v.board_id = ? AND v.id > ? AND v.status = 'ready'
+         ORDER BY v.id
          LIMIT 100`
       )
-      .all("benchmark-board", 20_000, "", 20_000) as Array<{ detail: string }>;
+      .all("benchmark-board", "") as Array<{ detail: string }>;
 
-    expect(plan.map((step) => step.detail).join(" ")).toMatch(/idx_task_versions_board_task_snapshot/);
+    expect(plan.map((step) => step.detail).join(" ")).toMatch(/sqlite_autoindex_fs_tasks_1/);
   });
 
   it("keeps 30 warmed pages of 100 below the latency budget", () => {
     const pageQuery = database.prepare(
-      `SELECT v.task_id, v.status, v.metadata_json
-       FROM direct_task_versions v
-       WHERE v.board_id = ? AND v.board_revision <= ? AND v.task_id > ?
-         AND v.is_deleted = 0
-         AND NOT EXISTS (
-           SELECT 1
-           FROM direct_task_versions newer
-           WHERE newer.board_id = v.board_id
-             AND newer.task_id = v.task_id
-             AND newer.board_revision <= ?
-             AND newer.board_revision > v.board_revision
-         )
-       ORDER BY v.task_id
+      `SELECT v.id, v.status, v.title
+       FROM fs_tasks v
+       WHERE v.board_id = ? AND v.id > ? AND v.status = 'ready'
+       ORDER BY v.id
        LIMIT 100`
     );
     const elapsed: number[] = [];
@@ -129,8 +92,8 @@ describe("historical task query performance contract", () => {
 
     for (let page = 0; page < 30; page += 1) {
       const started = performance.now();
-      const rows = pageQuery.all("benchmark-board", 20_000, lastTaskId, 20_000) as Array<{ task_id: string }>;
-      lastTaskId = rows.at(-1)?.task_id ?? lastTaskId;
+      const rows = pageQuery.all("benchmark-board", lastTaskId) as Array<{ id: string }>;
+      lastTaskId = rows.at(-1)?.id ?? lastTaskId;
       elapsed.push(performance.now() - started);
     }
 

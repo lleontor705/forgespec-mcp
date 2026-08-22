@@ -10,8 +10,8 @@ async function main(argv: string[]): Promise<void> {
   try {
     const options = parseArguments(argv);
     const evidence = await collectRuntimeEvidence(options);
-    if (!evidence.better_sqlite3_loaded || !evidence.migration_ok || !Object.values(evidence.sqlite_features).every(Boolean)) {
-      throw new SmokeError(EXIT_RUNTIME, "Runtime, SQLite, or migration qualification failed");
+    if (!evidence.better_sqlite3_loaded || !evidence.storage_ok || !Object.values(evidence.sqlite_features).every(Boolean)) {
+      throw new SmokeError(EXIT_RUNTIME, "Runtime, SQLite, or storage qualification failed");
     }
     if (!evidence.handshake.initialize || !evidence.handshake.tools_list) {
       throw new SmokeError(EXIT_PROTOCOL, "MCP initialize/tools-list handshake failed");

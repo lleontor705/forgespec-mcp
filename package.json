@@ -10,15 +10,27 @@
     ".": {
       "import": "./build/index.js",
       "types": "./build/index.d.ts"
+    },
+    "./plugin": {
+      "import": "./plugins/opencode-forgespec/index.js"
+    },
+    "./mcp": {
+      "import": "./build/index.js"
+    },
+    "./broker": {
+      "import": "./build/identity/broker-cli.js"
     }
   },
   "bin": {
-    "forgespec-mcp": "build/index.js"
+    "forgespec-mcp": "build/index.js",
+    "forgespec-identity-broker": "build/identity/broker-cli.js"
   },
   "files": [
-    "build"
+    "build",
+    "plugins/opencode-forgespec"
   ],
   "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('build', { recursive: true, force: true })\"",
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "runtime:smoke": "node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts",
@@ -75,5 +87,13 @@
     "tsx": "^4.0.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
-  }
+  },
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "bugs": {
+    "url": "https://github.com/lleontor705/forgespec-mcp/issues"
+  },
+  "homepage": "https://github.com/lleontor705/forgespec-mcp#readme"
 }

@@ -1,124 +1,101 @@
-/**
- * OpenCode Plugin for ForgeSpec MCP v2.0
- *
- * Provides:
- * 1. Automatic Board discovery & creation via task_board_create
- * 2. Pre-hook: Advisory file reservation via file_reserve
- * 3. Post-hook: Automatic task completion & file lock release via task_complete & file_release
- * 4. System prompt injection with SDD workflow instructions
- */
+/** Official OpenCode plugin boundary for the local ForgeSpec identity broker. */
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 
-export function createForgeSpecPlugin(context = {}) {
-  const client = context.client;
-  const logger = context.logger || console;
-  const projectName = context.projectName || "default-project";
-  const agentName = context.agentName || "opencode-agent";
+const TOOL_NAMES = new Set(["attempt_claim", "attempt_recover", "attempt_renew", "authority_manage", "approval_record", "board_create", "contract_commit", "contract_query", "contract_validate", "event_query", "forge_health", "forge_negotiate", "lease_release", "lease_renew", "lease_reserve", "task_define", "task_query", "task_transition"]);
+const TOOL = /^forgespec_([A-Za-z0-9_]+)$/;
+const ALIAS = /^(?:caller|caller_id|callerId|actor|actor_id|actorId|identity|_identity)$/i;
+const READY_MS = 2_000;
+const MAX_DEPTH = 64;
 
-  let activeBoardId = null;
-  let activeTaskId = null;
+const strip = (value) => {
+  if (Array.isArray(value)) return value.map(strip);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !ALIAS.test(key)).map(([key, item]) => [key, strip(item)]));
+};
 
-  return {
-    name: "opencode-forgespec",
+const frame = (id, payload) => `${JSON.stringify({ id, payload })}\n`;
+const logOf = (client) => (level, message, extra = {}) => client?.app?.log?.({ body: { service: "opencode-forgespec", level, message, extra } });
 
-    /**
-     * Called when the OpenCode session starts.
-     * Creates or initializes a board for the project.
-     */
-    async onSessionStart() {
-      if (!client) return;
-      try {
-        const createRes = await client.callTool("task_board_create", {
-          project: projectName,
-          name: `${projectName}-main`,
-          owner_actor: agentName,
-        });
-        const created = typeof createRes?.content?.[0]?.text === "string"
-          ? JSON.parse(createRes.content[0].text)
-          : createRes?.structuredContent || {};
-        activeBoardId = created.board_id;
-        logger.info?.(`[ForgeSpec v2] Initialized board: ${activeBoardId} for project ${projectName}`);
-      } catch (err) {
-        logger.error?.(`[ForgeSpec v2] Session initialization error: ${err.message}`);
-      }
-    },
-
-    /**
-     * Pre-execution hook: Intercepts file modification tools to acquire advisory file locks.
-     */
-    async beforeToolExecute({ toolName, params }) {
-      if (!client) return;
-      const fileMutationTools = ["write_file", "edit_file", "replace_content", "apply_patch", "write_to_file"];
-      const targetPath = params?.path || params?.TargetFile || params?.filePath;
-
-      if (fileMutationTools.includes(toolName) && targetPath) {
-        const normalized = targetPath.replace(/\\/g, "/");
-        logger.info?.(`[ForgeSpec v2] Requesting advisory file reservation for: ${normalized}`);
-
-        const reserveRes = await client.callTool("file_reserve", {
-          project: projectName,
-          paths: [normalized],
-          holder: agentName,
-          lease_seconds: 300,
-        });
-
-        const result = typeof reserveRes?.content?.[0]?.text === "string"
-          ? JSON.parse(reserveRes.content[0].text)
-          : reserveRes?.structuredContent || {};
-
-        if (result.ok === false || reserveRes.isError) {
-          throw new Error(
-            `[ForgeSpec Conflict] File '${normalized}' cannot be locked: ${result.error || "Conflict detected"}`
-          );
-        }
-      }
-    },
-
-    /**
-     * Post-execution hook: When tasks are completed, release held locks.
-     */
-    async afterToolExecute({ toolName, params, result }) {
-      if (!client) return;
-      if (toolName === "complete_task" || toolName === "task_complete") {
-        try {
-          const targetPath = params?.path || params?.TargetFile || params?.filePath;
-          if (targetPath) {
-            await client.callTool("file_release", {
-              project: projectName,
-              paths: [targetPath.replace(/\\/g, "/")],
-              holder: agentName,
-            });
-            logger.info?.(`[ForgeSpec v2] Released file reservation: ${targetPath}`);
-          }
-        } catch (err) {
-          logger.warn?.(`[ForgeSpec v2] Error releasing file reservations: ${err.message}`);
-        }
-      }
-    },
-
-    /**
-     * Injects context and guidelines into OpenCode system instructions.
-     */
-    getSystemPromptAdditions() {
-      return `
-[FORGESPEC V2 COORDINATION ACTIVE]
-Connected to ForgeSpec MCP Server v2.0 (14 Semantic Tools).
-- Active Board ID: ${activeBoardId || "Auto-detected on startup"}
-- Agent Identity: ${agentName}
-- Rules:
-  1. Use 'task_board_get' to view ready and backlog tasks.
-  2. Use 'task_claim' before editing to claim task and reserve working file locks at once.
-  3. Use 'task_complete' once work is complete to auto-unblock dependents and free locks.
-  4. Follow SDD phase sequence (spec -> tasks -> apply -> verify) via 'spec_save'.
-`;
-    },
-
-    /**
-     * Getter for current state (useful for tests and diagnostics).
-     */
-    getState() {
-      return { activeBoardId, activeTaskId, agentName, projectName };
-    },
+function lineage(client, sessionId, cache) {
+  const walk = async (id, seen = new Set(), chain = []) => {
+    if (typeof id !== "string" || !id || seen.has(id) || chain.length > MAX_DEPTH) throw new Error("SESSION_LINEAGE_INVALID");
+    // A cache entry is an exact root-to-that-session prefix. Never append a
+    // sibling's suffix to it; only append the current child after its parent.
+    if (cache.has(id)) return cache.get(id);
+    seen.add(id);
+    const response = await client.session.get({ path: { id } });
+    const session = response?.data;
+    if (!session) throw new Error("SESSION_NOT_FOUND");
+    const parent = session?.parentID ?? session?.parentId ?? session?.parent_id;
+    const next = parent ? [...await walk(parent, seen, chain), id] : [id];
+    if (next.length > MAX_DEPTH + 1) throw new Error("SESSION_LINEAGE_INVALID");
+    cache.set(id, next);
+    return next;
   };
+  return walk(sessionId).then((ids) => ({ root: ids[0], ...(ids.length > 1 ? { parent: ids[ids.length - 2] } : {}), worker: ids.at(-1), lineage: ids }));
 }
 
-export default createForgeSpecPlugin;
+function resolveNodeCommand(context = {}) {
+  const explicit = context.nodePath ?? context.options?.nodePath ?? process.env.FORGESPEC_NODE_PATH;
+  if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
+  const base = String(process.execPath).split(/[\\/]/).pop()?.toLowerCase();
+  return base === "node" || base === "node.exe" ? process.execPath : "node";
+}
+
+function resolvePackagePath(specifier) {
+  // OpenCode runs this as native ESM. createRequire is only a test-runner
+  // compatibility fallback (some ESM transforms omit import.meta.resolve).
+  const resolved = typeof import.meta.resolve === "function"
+    ? import.meta.resolve(specifier)
+    : createRequire(import.meta.url).resolve(specifier);
+  return fileURLToPath(resolved);
+}
+
+function localBroker({ client, broker: supplied, nodeCommand, brokerPath } = {}) {
+  if (supplied) return { request: (input) => supplied.request ? supplied.request(input) : supplied.before(input), close: () => supplied.close?.() };
+  const entry = brokerPath ?? resolvePackagePath("forgespec-mcp/broker");
+  const child = spawn(nodeCommand ?? resolveNodeCommand(), [entry], { shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, FORGESPEC_IDENTITY_SIDECAR_PATH: process.env.FORGESPEC_IDENTITY_SIDECAR_PATH ?? "" } });
+  const pending = new Map(); let buffer = ""; let closed = false; let readyResolve; let readyReject;
+  const ready = new Promise((resolveReady, rejectReady) => { readyResolve = resolveReady; readyReject = rejectReady; });
+  const consume = (chunk) => {
+    buffer += String(chunk);
+    if (buffer.length > 64 * 1024) return fail(new Error("BROKER_OUTPUT_TOO_LARGE"));
+    const rows = buffer.split("\n"); buffer = rows.pop() ?? "";
+    for (const row of rows) if (row) {
+      try {
+        const value = JSON.parse(row);
+        if (value.type === "ready") { readyResolve(value); continue; }
+        const item = pending.get(value.id); if (!item) continue;
+        pending.delete(value.id); value.payload?.error ? item.reject(new Error(value.payload.error.code || "BROKER_ERROR")) : item.resolve(value.payload);
+      } catch { fail(new Error("BROKER_PROTOCOL_ERROR")); return; }
+    }
+  };
+   const fail = (error) => { closed = true; for (const item of pending.values()) item.reject(error); pending.clear(); };
+  const timer = setTimeout(() => { readyReject(new Error("BROKER_READY_TIMEOUT")); fail(new Error("BROKER_READY_TIMEOUT")); }, READY_MS);
+  ready.finally(() => clearTimeout(timer)).catch(() => undefined);
+  child.stdout.on("data", consume); child.stderr.on("data", (chunk) => { if (String(chunk).length > 64 * 1024) fail(new Error("BROKER_STDERR_TOO_LARGE")); });
+  child.once("error", (error) => { readyReject(error); fail(error); }); child.once("exit", () => { const error = new Error("BROKER_UNAVAILABLE"); readyReject(error); fail(error); });
+  return { ready, request(input) { return ready.then(() => new Promise((resolveReply, reject) => { if (closed) return reject(new Error("BROKER_UNAVAILABLE")); const id = randomUUID(); pending.set(id, { resolve: resolveReply, reject }); child.stdin.write(frame(id, input)); })); }, close() { if (!closed) { fail(new Error("BROKER_DISPOSED")); child.stdin.end(); child.kill(); } } };
+}
+
+export default async function forgeSpecPlugin(context = {}) {
+  const client = context.client; const log = logOf(client); const cache = new Map(); const nodeCommand = resolveNodeCommand(context); const broker = localBroker({ ...context, broker: context.broker ?? context.options?.broker, brokerPath: context.brokerPath ?? context.options?.brokerPath, nodeCommand });
+  let bootstrap;
+  const ensure = async () => { bootstrap ??= broker.ready ? await broker.ready : undefined; return bootstrap; };
+  const hooks = {
+      config: async (config = {}) => { const ready = await ensure().catch((error) => { log("warn", "ForgeSpec broker readiness unavailable", { code: error?.message }); return undefined; }); const mcpIndexPath = context.mcpPath ?? context.options?.mcpPath ?? resolvePackagePath("forgespec-mcp/mcp"); const environment = { FORGESPEC_IDENTITY_ROOT_PUBLIC_KEY: ready?.root_public_key ?? "", FORGESPEC_IDENTITY_ISSUER: ready?.issuer ?? "", FORGESPEC_IDENTITY_AUDIENCE: ready?.audience ?? "broker", FORGESPEC_IDENTITY_SIDECAR_PATH: process.env.FORGESPEC_IDENTITY_SIDECAR_PATH ?? "" }; config.mcp ??= {}; config.mcp.forgespec = { type: "local", command: [nodeCommand, mcpIndexPath], enabled: true, environment }; },
+    "tool.execute.before": async (input, output) => {
+       if (!TOOL.test(input?.tool ?? "")) return;
+        const match = TOOL.exec(input.tool ?? ""); const requested = match?.[1]; const toolName = requested?.startsWith("forgespec_") ? `forge_${requested.slice("forgespec_".length)}` : requested; if (!toolName || !TOOL_NAMES.has(toolName)) return;
+         try { const ready = await ensure(); const full = await lineage(client, input.sessionID ?? input.sessionId, cache); const { lineage: ordered, ...session } = full; const args = strip(output?.args ?? {}); const envelope = await broker.request({ session, lineage: ordered, tool: toolName, args, call: input.callID, audience: ready?.audience }); const target = output.args; for (const key of Object.keys(target)) delete target[key]; Object.assign(target, args, { _identity: envelope }); }
+      catch (error) { log("warn", "ForgeSpec identity injection failed closed", { tool: input.tool, code: error?.message }); throw new Error("FORGESPEC_IDENTITY_UNAVAILABLE"); }
+    },
+    "tool.execute.after": async () => undefined,
+      event: async ({ event } = {}) => { if (event?.type === "session.deleted") { const id = event.properties?.info?.id ?? event.properties?.sessionID ?? event.sessionID ?? event.sessionId; if (id) for (const [key, chain] of cache) if (key === id || chain.includes(id)) cache.delete(key); } },
+    dispose: async () => broker.close(),
+  };
+  return hooks;
+}

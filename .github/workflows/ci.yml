@@ -42,9 +42,6 @@ jobs:
           node -e "if (process.version !== 'v24.18.1' || process.versions.modules !== '137') process.exit(1)"
       - run: npm run lint
       - run: npm test
-      - name: Migration and temporary MCP handshake
-        shell: bash
-        run: npm test -- --run tests/migrations.test.ts tests/runtime-compatibility.test.ts
 
   runtime-quality:
     name: Runtime ${{ matrix.node-line }} / ${{ matrix.os }}
@@ -112,7 +109,16 @@ jobs:
         run: npm run lint
       - name: Full test suite
         run: npm test
-      - name: Migration and native smoke
-        run: npm test -- --run tests/migrations.test.ts
       - name: Temporary MCP initialize and tools/list handshake
         run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi ${{ matrix.expected-abi }}
+
+  yaml-parse:
+    name: Validate workflow YAML without network access
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.18.1"
+      - name: Parse workflow YAML with the runner-provided offline parser
+        run: npx --yes prettier@3.6.2 --check --parser yaml .github/workflows/ci.yml .github/workflows/release.yml

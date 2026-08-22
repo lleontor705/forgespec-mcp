@@ -10,6 +10,7 @@ import {
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const release = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", "release.yml"), "utf8");
+const hostVerifier = fs.readFileSync(path.join(PROJECT_ROOT, "scripts", "verify-opencode-host.mjs"), "utf8");
 
 function job(name: string, next?: string): string {
   const start = release.indexOf(`  ${name}:`);
@@ -20,8 +21,36 @@ function job(name: string, next?: string): string {
 }
 
 describe("release workflow policy", () => {
+  it("uses the real OpenCode host with a streaming two-turn mock tool call", () => {
+    expect(hostVerifier).toMatch(/file:\/\/.*plugins\/opencode-forgespec\/index\.js/);
+    expect(hostVerifier).toMatch(/request\.stream/);
+    expect(hostVerifier).toMatch(/text\/event-stream/);
+    expect(hostVerifier).toMatch(/modelTurns < 2/);
+    expect(hostVerifier).toMatch(/provider-requests\.log/);
+    expect(hostVerifier).toMatch(/table_count[^\n]*16/);
+    expect(hostVerifier).not.toMatch(/Client.*callTool|StdioClientTransport/);
+    expect(hostVerifier).toMatch(/OpenCode unavailable; required host gate failed/);
+    expect(hostVerifier).toMatch(/process\.exit\(1\)/);
+  });
+
+  it("installs the pinned official host before the packed verifier", () => {
+    const verification = job("release-node24", "approve-release");
+    const install = verification.indexOf("opencode-ai@1.18.3");
+    const verify = verification.indexOf("verify-opencode-host.mjs --mode=packed");
+    expect(install).toBeGreaterThanOrEqual(0);
+    expect(verify).toBeGreaterThan(install);
+    expect(verification).toMatch(/npm install --prefix "\$RUNNER_TEMP\/opencode-host"[^\n]*opencode-ai@1\.18\.3/);
+  });
+  it("publishes both executable bins and the plugin subtree", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8"));
+    expect(manifest.bin).toEqual({ "forgespec-mcp": "build/index.js", "forgespec-identity-broker": "build/identity/broker-cli.js" });
+    expect(manifest.files).toContain("plugins/opencode-forgespec");
+    const plugin = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "plugins", "opencode-forgespec", "package.json"), "utf8"));
+    expect(plugin.version).toBe(manifest.version);
+    expect(plugin.dependencies["forgespec-mcp"]).toBe(manifest.version);
+  });
   it("accepts only one leading v followed by strict stable SemVer", () => {
-    const prepare = job("prepare-release", "node22-compatibility-gate");
+    const prepare = job("prepare-release", "release-node24");
     expect(prepare).toMatch(/TAG: \$\{\{ inputs\.tag \}\}/);
     expect(prepare).toMatch(/VERSION="\$\{TAG#v\}"/);
     expect(prepare).toMatch(/semver\.valid\(version\)/);
@@ -50,8 +79,7 @@ describe("release workflow policy", () => {
 
   it("checks out the immutable source in every job that reads repository content", () => {
     const sections = [
-      job("prepare-release", "node22-compatibility-gate"),
-      job("node22-compatibility-gate", "release-node24"),
+      job("prepare-release", "release-node24"),
       job("release-node24", "approve-release"),
       job("publish"),
     ];
@@ -94,6 +122,8 @@ describe("release workflow policy", () => {
     expect(publish).toMatch(/npm version[^\n]*--ignore-scripts/);
     expect(publish).toMatch(/npm pack[^\n]*--ignore-scripts/);
     expect(publish).toMatch(/npm publish[^\n]*--provenance[^\n]*--access public[^\n]*--ignore-scripts/);
+    expect(publish).toMatch(/npm version[^\n]*--prefix plugins\/opencode-forgespec/);
+    expect(publish).toMatch(/npm publish \.\/plugins\/opencode-forgespec[^\n]*--provenance/);
   });
 
   it("creates and verifies the tag before npm and GitHub release mutations", () => {
@@ -127,8 +157,8 @@ describe("release workflow policy", () => {
   });
 
   it("keeps approval, runtime, permissions, and partial-state safeguards", () => {
-    expect(release).toMatch(/matrix:[\s\S]*ubuntu-latest, windows-latest, macos-latest/);
-    expect(release).toMatch(/node-version: "22\.x"/);
+    expect(release).not.toMatch(/node-version: "22\.x"/);
+    expect(release).not.toMatch(/migrations|compatibility/i);
     expect(release.match(/node-version: "24\.18\.1"/g)).toHaveLength(2);
     expect(job("approve-release", "publish")).toMatch(/environment: production/);
     expect(release).toMatch(/permissions:\s*\n\s+contents: read/);

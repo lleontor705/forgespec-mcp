@@ -2,8 +2,11 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { createV2Database } from "./helpers/database.js";
+import { createFreshStore } from "../src/storage/bootstrap.js";
+import { IdentityBroker } from "../src/identity/broker.js";
+import { sha256 } from "../src/identity/canonical.js";
 
 const projectRoot = path.resolve(".");
 const temporaryDirectories: string[] = [];
@@ -16,11 +19,13 @@ type ProcessResult = {
   stderr: string;
 };
 
-function runServer(databasePath: string, input: string, expectedLines = 0): Promise<ProcessResult> {
+function runServer(databasePath: string, input: string, expectedLines = 0, validBootstrap = true): Promise<ProcessResult> {
+  const sidecarPath = path.join(path.dirname(databasePath), "identity.sqlite");
+  const broker = new IdentityBroker();
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ["--import", "tsx/esm", path.join(projectRoot, "src/index.ts")], {
       cwd: projectRoot,
-      env: { ...process.env, FORGESPEC_DB: databasePath, NODE_NO_WARNINGS: "1" },
+      env: { ...process.env, FORGESPEC_DB: databasePath, NODE_NO_WARNINGS: "1", ...(validBootstrap ? { FORGESPEC_IDENTITY_ROOT_PUBLIC_KEY: broker.rootPublicKey, FORGESPEC_IDENTITY_ISSUER: `root:${sha256(JSON.stringify(broker.rootPublicKey))}`, FORGESPEC_IDENTITY_AUDIENCE: "broker", FORGESPEC_IDENTITY_SIDECAR_PATH: sidecarPath } : {}) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -64,11 +69,13 @@ afterEach(() => {
 });
 
 describe("startup process gates", () => {
-  it("aborts before initialize on a migration checksum mismatch with zero stdout", async () => {
-    const { path: databasePath, database } = createV2Database("forgespec-startup-checksum-");
-    database
-      .prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 2")
-      .run("sha256:tampered");
+  it("fails closed on an unsupported inventory without mutating the store", async () => {
+    const databasePath = createTemporaryDatabasePath("forgespec-startup-malformed-");
+    const database = new Database(databasePath);
+    database.exec("CREATE TABLE unsupported_inventory (id INTEGER NOT NULL)");
+    const before = database
+      .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+      .all();
     database.close();
 
     const result = await runServer(
@@ -87,31 +94,51 @@ describe("startup process gates", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toMatch(/version|migration/i);
-    expect(result.stderr).toMatch(/expected|observed|restore|repair|safe/i);
+    expect(result.stderr).toBe("ForgeSpec MCP startup failed. Check the database and runtime capabilities before retrying.\n");
+
+    const reopened = new Database(databasePath, { readonly: true });
+    const after = reopened
+      .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+      .all();
+    reopened.close();
+    expect(after).toEqual(before);
   }, STARTUP_TIMEOUT_MS);
 
-  it("reports STRICT, JSON1, and effective WAL qualification on stderr only", async () => {
+  it("rejects a malformed final store with DATABASE_INCOMPATIBLE and no mutation", async () => {
     const databasePath = createTemporaryDatabasePath("forgespec-startup-capabilities-");
+    const database = new Database(databasePath);
+    database.pragma("journal_mode = WAL");
+    database.pragma("foreign_keys = ON");
+    createFreshStore(database);
+    database.prepare("DELETE FROM fs_schema_meta WHERE key = 'core'").run();
+    const before = database
+      .prepare("SELECT key, schema_version, bootstrap_metadata_json, recovery_mode FROM fs_schema_meta")
+      .all();
+    database.close();
     const result = await runServer(
       databasePath,
-      `${JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-06-18",
-          capabilities: {},
-          clientInfo: { name: "startup-test", version: "1.0.0" },
-        },
-      })}\n${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`,
-      2
+      "",
     );
 
-    expect(result.stdout).not.toMatch(/SQLite|STRICT|JSON1|journal_mode/i);
-    expect(result.stderr).toMatch(/STRICT/i);
-    expect(result.stderr).toMatch(/JSON1|json_valid/i);
-    expect(result.stderr).toMatch(/WAL.*wal|journal_mode.*wal/i);
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("ForgeSpec MCP startup failed. Check the database and runtime capabilities before retrying.\n");
+
+    const reopened = new Database(databasePath, { readonly: true });
+    const after = reopened
+      .prepare("SELECT key, schema_version, bootstrap_metadata_json, recovery_mode FROM fs_schema_meta")
+      .all();
+    reopened.close();
+    expect(after).toEqual(before);
+  }, STARTUP_TIMEOUT_MS);
+
+  it("rejects missing trust bootstrap before opening the domain store", async () => {
+    const databasePath = createTemporaryDatabasePath("forgespec-startup-trust-");
+    const result = await runServer(databasePath, "", 0, false);
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("TRUST_BOOTSTRAP_INVALID\n");
+    expect(fs.existsSync(databasePath)).toBe(false);
   }, STARTUP_TIMEOUT_MS);
 
   it("closes cleanly on EOF before initialize without a startup banner", async () => {

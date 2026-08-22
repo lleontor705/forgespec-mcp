@@ -28,7 +28,6 @@ describe("runtime smoke CLI process contract", () => {
     expect(fs.existsSync(CLI)).toBe(true);
     const source = fs.readFileSync(CLI, "utf8");
     expect(source).not.toMatch(/from ["']vitest["']/);
-    expect(source).not.toMatch(/tests[\\/]runtime-compatibility\.test/);
     expect(source).toMatch(/process\.stdout/);
     expect(source).toMatch(/process\.stderr/);
   });
