@@ -32,5 +32,13 @@
     "coordination"
   ],
   "author": "lleontor705",
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lleontor705/forgespec-mcp.git",
+    "directory": "plugins/opencode-forgespec"
+  }
 }
