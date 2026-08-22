@@ -36,7 +36,7 @@ body:
         - Coordination
         - SDD contracts
         - Task boards
-        - Database and migrations
+         - Database and storage
         - MCP tools
         - Documentation
         - CI and workflows

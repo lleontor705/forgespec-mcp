@@ -1,97 +1,29 @@
-# ForgeSpec MCP
+# ForgeSpec MCP Protocol 2.0
 
-> The coordination backbone for multi-agent AI development. MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management with authority control, and advisory file locking to coordinate work across multiple AI agents. Works with any MCP-compatible client: Claude Code, Codex CLI, Gemini CLI, OpenClaw, and more.
+ForgeSpec MCP is an MCP server for auditable, multi-agent Spec-Driven Development over stdio. It provides typed contracts, task coordination, authority, approvals, leases, event queries, and fail-closed SQLite storage.
 
-## Why ForgeSpec?
+## Current runtime
 
-Multi-agent AI development creates coordination challenges: conflicting file edits, lost context between agents, unstructured workflows, no quality gates, and no way to resume failed tasks. ForgeSpec solves all of these with:
+- Protocol: `2.0`
+- Canonical tools: **18**
+- Storage: **16 strict `fs_*` tables**
+- Transport: MCP JSON-RPC over stdio
+- Integration: `forgespec-mcp/plugin`, shell-free broker, root/worker handles,
+  exact identity bootstrap names, and manual OpenCode restart after changes.
+- Runtime: Node.js 22, 24, or 26
 
-- **Zero infrastructure** — Embedded SQLite database, no external services required
-- **Universal compatibility** — Any MCP client (Claude Code, Codex, Gemini, OpenClaw)
-- **Instant setup** — `npx -y forgespec-mcp@1.6.0`
-- **9-phase SDD pipeline** — Enforced confidence thresholds prevent premature transitions
-- **Full audit trail & authority** — Every contract, task, grant, revocation, and reservation is logged with immutable history
-- **Cross-platform** — Tested on Ubuntu, Windows, macOS with Node 22, 24, 26 (primary Node 24.18.1)
-- **Cortex-ready** — Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph
+## Tools
 
-## Recommended: Pair with Cortex
+`attempt_claim`, `attempt_recover`, `attempt_renew`, `authority_manage`, `approval_record`, `board_create`, `contract_commit`, `contract_query`, `contract_validate`, `event_query`, `forge_health`, `forge_negotiate`, `lease_release`, `lease_renew`, `lease_reserve`, `task_define`, `task_query`, `task_transition`.
 
-ForgeSpec manages the **workflow** (contracts, tasks, file locks, authority). [Cortex](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Artifacts saved with `type: "cortex"` are persisted to Cortex and linked via knowledge graph. ForgeSpec also works standalone with `type: "openspec"` (filesystem) or `type: "inline"`.
+Profiles are `planner`, `worker`, `orchestrator`, and `reviewer`. Each profile receives a deterministic subset of the catalog.
 
-## Quick Start
+## SDD phases
 
-- [npm package](https://www.npmjs.com/package/forgespec-mcp): Install via `npx -y forgespec-mcp@1.6.0` or `npm install -g forgespec-mcp@1.6.0`
-- [GitHub Repository](https://github.com/lleontor705/forgespec-mcp): Source code, issues, and contributions
-- [Full documentation](https://github.com/lleontor705/forgespec-mcp/blob/master/llms-full.txt): Complete tool reference with parameters and schemas
+`init` → `explore` → `proposal` → `spec` → `design` → `tasks` → `apply` → `verify`
 
-## SDD Pipeline
+## Storage
 
-9-phase lifecycle with confidence thresholds:
+The schema uses `fs_schema_meta`, `fs_boards`, `fs_tasks`, `fs_task_dependencies`, `fs_gates`, `fs_gate_decisions`, `fs_attempts`, `fs_contracts`, `fs_leases`, `fs_lease_scopes`, `fs_authority`, `fs_authority_revocations`, `fs_approvals`, `fs_audit_events`, `fs_evidence`, and `fs_idempotency`.
 
-```
-init(0.5) → explore(0.5) → propose(0.7) → spec(0.8) → design(0.7) → tasks(0.8) → apply(0.6) → verify(0.9) → archive(0.9)
-```
-
-## Tools (30 total)
-
-### Capability & Diagnostic Tools (3)
-- `forgespec_capabilities`: Negotiate API/schema versions, capabilities, limits, and mode
-- `forgespec_health`: Server health diagnostics, database integrity, system time, active lease counts, and version telemetry
-- `tb_audit_log`: Query historical audit trail of authority grants, revocations, and approval decisions
-
-### SDD Contract Tools (5)
-- `sdd_validate`: Validate contract against phase schema with confidence check
-- `sdd_save`: Validate and persist contract to SQLite
-- `sdd_get`: Retrieve contract by ID
-- `sdd_list`: List contracts (filter by project/phase)
-- `sdd_history`: Phase transition history for a project
-
-### Task Board Tools (19)
-- `tb_create_board`: Create task board with optional inline tasks (atomic)
-- `tb_add_task`: Add task with priority, spec ref, acceptance criteria, dependencies
-- `tb_status`: Board status with tasks grouped by status
-- `tb_claim`: Claim task (validates dependencies before assignment)
-- `tb_update`: Update status (auto-unblocks dependents on completion)
-- `tb_unblocked`: List tasks ready to work on (all dependencies resolved)
-- `tb_get`: Full task details by ID
-- `tb_list_boards`: List task boards (includes direct-v1 owned/granted boards with actor context)
-- `tb_set_dependencies`: Set normalized dependency edges
-- `tb_heartbeat`: Renew active attempt lease
-- `tb_recover_claims`: Recover expired claims
-- `tb_requeue`: Requeue a recovered task
-- `tb_approve`: Record immutable approval decision with asserted provenance
-- `tb_grant`: Create attenuated, expiring task-authority grant
-- `tb_handoff`: Create reference-only attenuated handoff
-- `tb_revoke`: Append authority revocation (destructive operation)
-- `tb_query`: Query snapshot task pages with signed compound cursors
-- `tb_batch_status`: Read bounded board/work-unit status
-- `tb_events`: Read authority-event deltas
-
-### File Reservation Tools (3)
-- `file_reserve`: Reserve files/globs with TTL (default 15 min; `check_only: true` for dry-run)
-- `file_release`: Release file reservations
-- `file_renew`: Renew an active direct-v1 file lease
-
-## Configuration
-
-- **Claude Code**: `claude mcp add forgespec --transport stdio -- npx -y forgespec-mcp`
-- **Codex CLI**: Add to `~/.codex/config.toml` under `[mcp_servers.forgespec]`
-- **Gemini CLI**: Add to `settings.json` under `mcpServers.forgespec`
-- **OpenClaw**: Add to `openclaw.json` under `mcp.servers.forgespec`
-
-## Environment Variables
-
-- `FORGESPEC_DIR` (default `~/.forgespec`): Database directory
-- `FORGESPEC_DB` (default `~/.forgespec/forgespec.db`): Full database path
-
-## Versioning
-
-Uses conventional commits with automatic semver bumping:
-- `fix:` → patch | `feat:` → minor | `feat!:` → major
-- Release: `npm run release && git push --follow-tags origin master`
-
-## Links
-
-- [Development guide](https://github.com/lleontor705/forgespec-mcp#development): Clone, install, dev/test/build commands
-- [Contributing](https://github.com/lleontor705/forgespec-mcp#contributing): Conventional commits workflow
-- [License](https://github.com/lleontor705/forgespec-mcp/blob/master/LICENSE): MIT
+See [llms-full.txt](llms-full.txt), [spec.md](spec.md), and [docs/architecture.md](docs/architecture.md).

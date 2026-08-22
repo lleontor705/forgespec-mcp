@@ -3,7 +3,17 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { LATEST_SCHEMA_VERSION, migrateDatabase, qualifyDatabase } from "../database/migrations.js";
+import { createFreshStore } from "../storage/bootstrap.js";
+import { qualifySQLite } from "../storage/qualify.js";
+import { SDD_TOOL_CATALOG } from "../protocol/capabilities.js";
+import { IdentityBroker } from "../identity/broker.js";
+import { sha256 } from "../identity/canonical.js";
+
+const EXPECTED_STORAGE_TABLES = [
+  "fs_approvals", "fs_attempts", "fs_audit_events", "fs_authority", "fs_authority_revocations",
+  "fs_boards", "fs_contracts", "fs_evidence", "fs_gate_decisions", "fs_gates", "fs_idempotency",
+  "fs_lease_scopes", "fs_leases", "fs_schema_meta", "fs_task_dependencies", "fs_tasks",
+].sort();
 
 export interface RuntimeEvidence {
   schema_version: 1;
@@ -14,7 +24,8 @@ export interface RuntimeEvidence {
   better_sqlite3_loaded: boolean;
   sqlite_version: string;
   sqlite_features: { strict: boolean; json1: boolean; wal: boolean };
-  migration_ok: boolean;
+  storage_ok: boolean;
+  storage_inventory: string[];
   handshake: { initialize: boolean; tools_list: boolean; tool_count: number };
 }
 
@@ -38,24 +49,25 @@ export async function collectRuntimeEvidence(options: RuntimeSmokeOptions): Prom
     better_sqlite3_loaded: false,
     sqlite_version: "",
     sqlite_features: { strict: false, json1: false, wal: false },
-    migration_ok: false,
+    storage_ok: false,
+    storage_inventory: [],
     handshake: { initialize: false, tools_list: false, tool_count: 0 },
   };
 
   try {
     assertSupportedRuntime(evidence, options.expectedAbi);
     evidence.better_sqlite3_loaded = true;
-    migrateDatabase(databasePath);
     const database = new Database(databasePath);
     try {
-      const qualification = qualifyDatabase(database, { requireWal: true });
-      evidence.sqlite_version = qualification.sqliteVersion;
-      evidence.sqlite_features = {
-        strict: qualification.strictTables,
-        json1: qualification.json1,
-        wal: qualification.wal,
-      };
-      evidence.migration_ok = database.pragma("user_version", { simple: true }) === LATEST_SCHEMA_VERSION;
+      database.pragma("busy_timeout = 10000");
+      database.pragma("foreign_keys = ON");
+      database.pragma("journal_mode = WAL");
+      createFreshStore(database);
+      qualifySQLite(database);
+      evidence.sqlite_version = (database.prepare("SELECT sqlite_version() AS version").get() as { version: string }).version;
+      evidence.sqlite_features = { strict: true, json1: true, wal: String(database.pragma("journal_mode", { simple: true })).toLowerCase() === "wal" };
+      evidence.storage_inventory = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'fs_%' ORDER BY name").all() as Array<{ name: string }>).map((row) => row.name);
+      evidence.storage_ok = JSON.stringify(evidence.storage_inventory) === JSON.stringify(EXPECTED_STORAGE_TABLES) && SDD_TOOL_CATALOG.length === 18;
     } finally {
       database.close();
     }
@@ -99,12 +111,14 @@ export function assertSupportedRuntime(
 
 export function runMcpHandshake(options: RuntimeSmokeOptions): Promise<RuntimeEvidence["handshake"]> {
   const databasePath = path.join(options.tempRoot ?? os.tmpdir(), "handshake.db");
+  const sidecarPath = path.join(options.tempRoot ?? os.tmpdir(), "handshake-identity.sqlite");
+  const broker = new IdentityBroker();
   const args = options.mode === "source" ? ["--import", "tsx/esm", options.entrypoint] : [options.entrypoint];
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: process.cwd(),
       shell: false,
-      env: { ...process.env, FORGESPEC_DB: databasePath, NODE_NO_WARNINGS: "1" },
+      env: { ...process.env, FORGESPEC_DB: databasePath, NODE_NO_WARNINGS: "1", FORGESPEC_IDENTITY_ROOT_PUBLIC_KEY: broker.rootPublicKey, FORGESPEC_IDENTITY_ISSUER: `root:${sha256(JSON.stringify(broker.rootPublicKey))}`, FORGESPEC_IDENTITY_AUDIENCE: "broker", FORGESPEC_IDENTITY_SIDECAR_PATH: sidecarPath },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

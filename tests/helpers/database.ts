@@ -2,14 +2,13 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { migrateDatabase } from "../../src/database/migrations.js";
 
 const directories: string[] = [];
 const openDatabases: Database.Database[] = [];
 
 /**
  * Allocates a database path without opening a native SQLite binding. Runtime
- * compatibility tests use this before attempting a conditional native load,
+ * runtime checks use this before attempting a conditional native load,
  * so unavailable runtimes can be skipped without leaving artifacts behind.
  */
 export function createTemporaryDatabasePath(prefix = "forgespec-runtime-"): string {
@@ -27,39 +26,14 @@ export function openTestDatabase(databasePath: string): Database.Database {
   return database;
 }
 
-export function createTestDatabase(prefix = "forgespec-direct-"): {
+export function createTestDatabase(prefix = "forgespec-final-"): {
   path: string;
   database: Database.Database;
 } {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   directories.push(directory);
   const databasePath = path.join(directory, "forgespec.db");
-  migrateDatabase(databasePath);
   return { path: databasePath, database: openTestDatabase(databasePath) };
-}
-
-/**
- * Creates a temporary database at the last released schema boundary.
- * Migration RED tests use this fixture so they exercise v2 -> v3 rather
- * than accidentally starting from a newly-created database.
- */
-export function createV2Database(prefix = "forgespec-v2-"): {
-  path: string;
-  database: Database.Database;
-} {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  directories.push(directory);
-  const databasePath = path.join(directory, "forgespec.db");
-  migrateDatabase(databasePath);
-  const database = openTestDatabase(databasePath);
-  database.transaction(() => {
-    database.exec("DROP INDEX IF EXISTS idx_task_versions_board_snapshot");
-    database.exec("DROP INDEX IF EXISTS idx_task_versions_task_history");
-    database.exec("DROP TABLE IF EXISTS direct_task_versions");
-    database.prepare("DELETE FROM schema_migrations WHERE version = 3").run();
-    database.pragma("user_version = 2");
-  })();
-  return { path: databasePath, database };
 }
 
 export function seedDirectBoard(
@@ -73,7 +47,7 @@ export function seedDirectBoard(
       `INSERT INTO boards (id, project, name) VALUES (?, ?, ?)
        ON CONFLICT(id) DO NOTHING`
     )
-    .run(boardId, "migration-test", boardId);
+    .run(boardId, "storage-test", boardId);
   database
     .prepare(
       `INSERT INTO direct_boards
@@ -121,7 +95,7 @@ export function seedTaskCreatedEvent(
          (event_id, resource_type, resource_id, board_id, board_revision,
           resource_revision, event_ordinal, event_type, actor, outcome,
           details_json, created_at_ms)
-       VALUES (?, 'task', ?, ?, ?, 1, ?, 'task_created', 'migration-test', 'success', '{}', 1000)`
+        VALUES (?, 'task', ?, ?, ?, 1, ?, 'task_created', 'storage-test', 'success', '{}', 1000)`
     )
     .run(eventId, taskId, boardId, boardRevision, eventOrdinal);
 }

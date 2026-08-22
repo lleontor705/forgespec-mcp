@@ -24,6 +24,10 @@ function readLockfile(): Record<string, any> {
 describe("package-lock runtime policy", () => {
   it("contains only the supported root engines metadata", () => {
     const lock = readLockfile();
+    expect(lock.name).toBe("forgespec-mcp");
+    expect(lock.version).toBe("2.0.0");
+    expect(lock.packages?.["" ]?.version).toBe("2.0.0");
+    expect(lock.packages?.["" ]?.bin).toEqual({ "forgespec-identity-broker": "build/identity/broker-cli.js", "forgespec-mcp": "build/index.js" });
     expect(lock.packages?.[""]?.engines?.node).toBe(">=22 <23 || >=24 <25 || >=26 <27");
   });
 
@@ -57,6 +61,7 @@ describe("package-lock runtime policy", () => {
       delete tree.packages?.["node_modules/better-sqlite3"];
       delete tree.packages?.["node_modules/fast-uri"];
       delete tree.packages?.["node_modules/ip-address"];
+      delete tree.packages?.[""]?.bin;
     }
 
     expect(currentStripped).toEqual(baselineStripped);
@@ -86,7 +91,18 @@ describe("package-lock runtime policy", () => {
   });
 
   it("forbids dependency resolver commands and cross-job native artifacts", () => {
-    expect(workflows).not.toMatch(/npm (?:install|update|audit\s+fix)/);
+    expect(workflows).not.toMatch(/npm (?:update|audit\s+fix)/);
+    const installs = workflows.match(/npm install[^\n]*/g) ?? [];
+    expect(installs).toEqual([
+      'npm install --prefix "$RUNNER_TEMP/opencode-host" --ignore-scripts --omit=peer --package-lock=false opencode-ai@1.18.3',
+      'npm install --prefix "$TMP" --ignore-scripts --omit=peer --package-lock=false "$(pwd)/$TARBALL" "$(pwd)/$PLUGIN_TARBALL"',
+      'npm install --prefix "$POST_TMP" --ignore-scripts --omit=peer --package-lock=false "opencode-forgespec@$VERSION" "forgespec-mcp@$VERSION"',
+    ]);
     expect(workflows).not.toMatch(/upload-artifact|download-artifact/);
+  });
+
+  it("documents the only permitted isolated tarball install", () => {
+    expect(workflows).toMatch(/npm install --prefix "\$TMP" --ignore-scripts --omit=peer --package-lock=false "\$\(pwd\)\/\$TARBALL"/);
+    expect(workflows).toMatch(/npm install --prefix "\$POST_TMP" --ignore-scripts --omit=peer --package-lock=false "opencode-forgespec@\$VERSION" "forgespec-mcp@\$VERSION"/);
   });
 });

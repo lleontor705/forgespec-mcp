@@ -1,114 +1,52 @@
-# ForgeSpec MCP (Complete Technical Reference)
+# ForgeSpec MCP Protocol 2.0 — Technical Reference
 
-> The coordination backbone for multi-agent AI development. MCP Server for Spec-Driven Development (SDD) — provides typed contract validation, SQLite-backed task board management, granular authority control (`task-authority@1.0.0`), and advisory file locking to coordinate work across multiple AI agents. Built on the Model Context Protocol SDK with better-sqlite3 and Zod schema validation.
+ForgeSpec MCP is a typed MCP server for auditable multi-agent Spec-Driven Development. It uses JSON-RPC over stdio, SQLite with strict tables, JSON1, foreign keys, and WAL, plus Zod validation.
 
-## Why ForgeSpec?
+The published package exports `forgespec-mcp/plugin` and both executable bins.
+Its shell-free broker lifecycle is start/ready/request/dispose. Root and
+enrolled worker handles define the identity threat boundary; no actor fields are
+accepted. The identity sidecar has 5 tables, the domain has 16, reset is only
+for fresh stores, and OpenCode must be manually restarted after changes.
 
-Building software with multiple AI agents introduces coordination challenges that don't exist in single-agent workflows:
+## Runtime contract
 
-| Problem | Without ForgeSpec | With ForgeSpec |
-|---------|-------------------|----------------|
-| Conflicting edits | Two agents modify the same file, causing merge conflicts | File reservation leases with TTL prevent edit conflicts |
-| No shared context | Each agent works in isolation | Contract validation creates shared audit trail |
-| Unstructured work | Agents jump to code without specs | 9-phase pipeline enforces structured flow |
-| Lost progress | No way to resume after failure | SQLite task board persists state across sessions |
-| No quality gates | Code ships without validation | Confidence thresholds block premature transitions |
-| Unauthorized mutations | Any agent can mutate any task/board | Authority grants/handoffs (`task-authority@1.0.0`) enforce zero-trust bounds |
+The server qualifies storage before accepting MCP traffic. Startup is fail-closed when storage or capability checks fail. Protocol messages use stdout; diagnostics use stderr. The SDD phases are `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, and `verify`.
 
-**Key advantages:**
-- Zero infrastructure — Embedded SQLite database, no external services required
-- Universal compatibility — Any MCP client (Claude Code, Codex CLI, Gemini CLI, OpenClaw)
-- Instant setup — One command: `npx -y forgespec-mcp@1.6.0`
-- Battle-tested pipeline — 9 phases with confidence thresholds
-- Full audit trail — Every contract, task, grant, revocation, and reservation is logged with timestamps
-- Cross-platform — Tested on Ubuntu, Windows, macOS with Node 22, 24, 26 (primary Node 24.18.1)
-- Cortex-ready — Native integration with [Cortex](https://github.com/lleontor705/cortex) for persistent memory and knowledge graph
+## Canonical tools (18)
 
-## Recommended: Pair with Cortex
+| Family | Tools |
+|---|---|
+| Attempts | `attempt_claim`, `attempt_recover`, `attempt_renew` |
+| Authority | `authority_manage`, `approval_record` |
+| Boards and contracts | `board_create`, `contract_commit`, `contract_query`, `contract_validate` |
+| Events and health | `event_query`, `forge_health`, `forge_negotiate` |
+| Leases | `lease_release`, `lease_renew`, `lease_reserve` |
+| Tasks | `task_define`, `task_query`, `task_transition` |
 
-ForgeSpec manages the **workflow** (contracts, tasks, file locks, authority). [Cortex](https://github.com/lleontor705/cortex) manages the **memory** (observations, knowledge graph, session continuity). Together they form a complete multi-agent coordination stack:
+Profiles are `planner`, `worker`, `orchestrator`, and `reviewer`; negotiation returns the deterministic profile subset.
 
-- **ForgeSpec** validates SDD contracts, manages task dependencies, enforces authority grants, prevents file conflicts
-- **Cortex** stores artifacts as observations, connects them via knowledge graph, enables session recovery
-- Artifacts saved with `type: "cortex"` are persisted to Cortex via `mem_save` and linked with `mem_relate`
-- ForgeSpec works standalone without Cortex — artifacts can also use `type: "openspec"` (filesystem) or `type: "inline"` (returned in response)
+## Storage tables (16)
 
-## Overview
+`fs_schema_meta`, `fs_boards`, `fs_tasks`, `fs_task_dependencies`, `fs_gates`, `fs_gate_decisions`, `fs_attempts`, `fs_contracts`, `fs_leases`, `fs_lease_scopes`, `fs_authority`, `fs_authority_revocations`, `fs_approvals`, `fs_audit_events`, `fs_evidence`, `fs_idempotency`.
 
-forgespec-mcp is an MCP (Model Context Protocol) server designed for multi-agent AI development workflows. It enforces a structured 9-phase development pipeline through typed contracts, manages tasks with intelligent dependency resolution, and provides advisory file locking and authority delegation for agent coordination.
+## Security and operations
 
-**Key characteristics:**
-- TypeScript, compiled to ES2022 with Node16 module resolution
-- SQLite database with WAL mode for concurrent access and PRAGMA qualification
-- Zod runtime schema validation for all inputs and outputs
-- Official MCP Tool Annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) on all 30 tools
-- In-memory/SQLite rate limiting per actor identity to prevent runaway mutation loops
-- Runs as a stdio MCP transport (launched by client applications)
-- Node.js >= 22 required (22.x, 24.x, 26.x supported; primary Node 24.18.1)
+Revisions and scoped idempotency protect mutations. Attempt, authority, and lease tokens are returned once and stored as hashes. Event cursors are opaque HMAC-authenticated values bound to actor and query parameters. `FORGESPEC_CURSOR_SECRET` must contain at least 32 bytes; embedded callers pass `cursorSecret`.
 
-## Installation and Usage
-
-### Using npx (no installation required)
+## Usage
 
 ```bash
-npx -y forgespec-mcp@1.6.0
+npm ci
+npm run build
+FORGESPEC_CURSOR_SECRET="at-least-32-bytes-of-secret-material" npx forgespec-mcp
 ```
 
-### Install globally
+`FORGESPEC_DB` selects the SQLite file and `FORGESPEC_DIR` its default directory. The package entrypoint is `build/index.js`.
+
+## Verification
 
 ```bash
-npm install -g forgespec-mcp@1.6.0
+npm test
+npm run lint
+npm run build
 ```
-
-## Inventory of 30 MCP Tools
-
-### 1. Capability & Diagnostic Tools (3)
-- `forgespec_capabilities`: Negotiate API/schema versions, capabilities, limits, and coordination mode (`readOnlyHint: true, idempotentHint: true`).
-- `forgespec_health`: Get server health diagnostics, SQLite integrity status (`PRAGMA quick_check`), system time, active file lease count, board/task counts, and version telemetry (`readOnlyHint: true, idempotentHint: true`).
-- `tb_audit_log`: Query historical audit trail of authority grants, revocations, and approval decisions (`readOnlyHint: true, idempotentHint: true`).
-
-### 2. SDD Contract Tools (5)
-- `sdd_validate`: Validate an SDD contract against phase schema with confidence check (`readOnlyHint: true, idempotentHint: true`).
-- `sdd_save`: Validate and persist an SDD contract to SQLite (`readOnlyHint: false, idempotentHint: true`).
-- `sdd_get`: Retrieve a single contract by ID (`readOnlyHint: true, idempotentHint: true`).
-- `sdd_list`: List contracts with optional project/phase filters (`readOnlyHint: true, idempotentHint: true`).
-- `sdd_history`: Get phase transition history for a project (`readOnlyHint: true, idempotentHint: true`).
-
-### 3. Task Board Tools (19)
-- `tb_create_board`: Create a new task board with optional inline tasks (`readOnlyHint: false, idempotentHint: true`).
-- `tb_add_task`: Add a task with priority, spec reference, acceptance criteria, and dependencies (`readOnlyHint: false, idempotentHint: false`).
-- `tb_status`: Get board status with tasks grouped by status (`readOnlyHint: true, idempotentHint: true`).
-- `tb_claim`: Claim a task for execution (`readOnlyHint: false, idempotentHint: false`).
-- `tb_update`: Update task status and append timestamped notes (`readOnlyHint: false, idempotentHint: true`).
-- `tb_unblocked`: List tasks ready to work on with resolved dependencies (`readOnlyHint: true, idempotentHint: true`).
-- `tb_get`: Get full task details by ID (`readOnlyHint: true, idempotentHint: true`).
-- `tb_list_boards`: List task boards; with direct-v1 actor context, includes owned or actively granted direct-v1 boards (`readOnlyHint: true, idempotentHint: true`).
-- `tb_set_dependencies`: Set normalized dependency edges (`readOnlyHint: false, idempotentHint: true`).
-- `tb_heartbeat`: Renew an active attempt lease (`readOnlyHint: false, idempotentHint: true`).
-- `tb_recover_claims`: Recover expired claims (`readOnlyHint: false, idempotentHint: true`).
-- `tb_requeue`: Requeue a recovered task (`readOnlyHint: false, idempotentHint: true`).
-- `tb_approve`: Record an immutable approval decision with asserted provenance (`readOnlyHint: false, idempotentHint: true`).
-- `tb_grant`: Create an attenuated, expiring task-authority grant (`readOnlyHint: false, idempotentHint: true`).
-- `tb_handoff`: Create a reference-only attenuated handoff (`readOnlyHint: false, idempotentHint: true`).
-- `tb_revoke`: Append an authority revocation without changing board ownership (`readOnlyHint: false, destructiveHint: true, idempotentHint: true`).
-- `tb_query`: Query snapshot task pages with signed compound cursors (`readOnlyHint: true, idempotentHint: true`).
-- `tb_batch_status`: Read bounded board/work-unit status (`readOnlyHint: true, idempotentHint: true`).
-- `tb_events`: Read authority-event deltas (`readOnlyHint: true, idempotentHint: true`).
-
-### 4. File Reservation Tools (3)
-- `file_reserve`: Reserve files or glob patterns with TTL (`readOnlyHint: false, idempotentHint: true`).
-- `file_release`: Release file reservations (`readOnlyHint: false, idempotentHint: true`).
-- `file_renew`: Renew an active direct-v1 file lease (`readOnlyHint: false, idempotentHint: true`).
-
----
-
-## Environment Variables
-
-- `FORGESPEC_DIR` (default `~/.forgespec`): Directory for database storage.
-- `FORGESPEC_DB` (default `~/.forgespec/forgespec.db`): Full path to SQLite database.
-
----
-
-## License
-
-MIT © [lleontor705](https://github.com/lleontor705)

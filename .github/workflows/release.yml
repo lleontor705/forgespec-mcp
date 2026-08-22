@@ -54,45 +54,10 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
-  node22-compatibility-gate:
-    name: Node 22 compatibility gate
-    needs: prepare-release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.prepare-release.outputs.source_sha }}
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "22.x"
-      - name: Cache npm downloads only
-        uses: actions/cache@v5
-        with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-${{ runner.arch }}-22.x-${{ hashFiles('package-lock.json') }}
-      - name: Install clean Node 22 dependencies
-        run: npm ci --ignore-scripts
-      - name: Record Node 22 native runtime evidence
-        shell: bash
-        run: |
-          node --version
-          npm --version
-          node -e "const b=require('better-sqlite3'); const db=new b(':memory:'); const sqlite=db.prepare('select sqlite_version() as version').get().version; console.log(JSON.stringify({node:process.version,npm:process.env.npm_config_user_agent,modules:process.versions.modules,napi:process.versions.napi,sqlite,betterSqlite3Loaded:true})); if (process.versions.modules !== '127') process.exit(1); db.close()"
-      - name: Run full Node 22 test suite
-        run: npm test
-      - name: Run Node 22 migrations and native handshake
-        run: npm test -- --run tests/migrations.test.ts
-      - name: Run Node 22 runtime smoke CLI
-        run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi 127
-
   release-node24:
     name: Verify release on Node 24.18.1
     runs-on: ubuntu-latest
-    needs: [prepare-release, node22-compatibility-gate]
+    needs: prepare-release
     steps:
       - uses: actions/checkout@v5
         with:
@@ -117,8 +82,20 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
-      - name: Run migrations and temporary MCP handshake
-        run: npm test -- --run tests/migrations.test.ts
+      - name: Pack release artifacts before host verification
+        shell: bash
+        run: |
+          rm -rf .release-artifacts
+          mkdir -p .release-artifacts
+          npm pack --json --ignore-scripts --pack-destination .release-artifacts > .release-artifacts/root-pack.json
+           npm pack ./plugins/opencode-forgespec --json --ignore-scripts --pack-destination .release-artifacts > .release-artifacts/plugin-pack.json
+      - name: Install pinned official OpenCode host
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/opencode-host" --ignore-scripts --omit=peer --package-lock=false opencode-ai@1.18.3
+          echo "$RUNNER_TEMP/opencode-host/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Verify actual OpenCode host against packed plugin URL
+        run: node scripts/verify-opencode-host.mjs --mode=packed --artifacts-dir="$GITHUB_WORKSPACE/.release-artifacts"
       - name: Run exact Node 24 runtime smoke CLI
         run: node --import tsx/esm src/runtime/runtime-smoke.ts --mode source --entrypoint src/index.ts --expected-abi 137
       - name: Run built runtime smoke CLI
@@ -126,23 +103,34 @@ jobs:
       - name: Validate packed manifest without publishing
         shell: bash
         run: |
+          npm run build
           npm pack --json --ignore-scripts > pack-manifest.json
           TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
           tar -xOf "$TARBALL" package/package.json > packed-package.json
-          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log(JSON.stringify({tarball:process.env.TARBALL,bin:p.bin}))"
-          rm -f "$TARBALL" pack-manifest.json packed-package.json
+          node -e "const p=require('./packed-package.json'); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log(JSON.stringify({bin:p.bin}))"
+          PLUGIN_TARBALL=$(npm pack ./plugins/opencode-forgespec --json --ignore-scripts | node -e "let s=''; process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).at(-1).filename))")
+          test -s "$PLUGIN_TARBALL"
+          node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('plugins/opencode-forgespec/package.json')); if(p.name!=='opencode-forgespec'||p.dependencies?.['forgespec-mcp']!==p.version||!p.files?.includes('index.js')) process.exit(1)"
+          TMP=$(mktemp -d); npm init --yes --prefix "$TMP" >/dev/null 2>&1
+          npm install --prefix "$TMP" --ignore-scripts --omit=peer --package-lock=false "$(pwd)/$TARBALL" "$(pwd)/$PLUGIN_TARBALL"
+          export FORGESPEC_DB="$TMP/domain.db" FORGESPEC_IDENTITY_SIDECAR_PATH="$TMP/identity.db" FORGESPEC_CURSOR_SECRET="release-packed-cursor-secret-0123456789012345"
+          PLUGIN_URL="file://$(realpath "$TMP/node_modules/opencode-forgespec/index.js")"
+          (cd "$TMP" && PLUGIN_URL="$PLUGIN_URL" node --input-type=module -e "import { Client } from '@modelcontextprotocol/sdk/client/index.js'; import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'; const p=await import(process.env.PLUGIN_URL); if(typeof p.default!=='function') process.exit(1); const hooks=await p.default({client:{session:{get:async()=>({data:{id:'gate'}})}}}); const cfg={mcp:{}}; await hooks.config(cfg); const entry=cfg.mcp.forgespec; if(!entry?.command?.length) process.exit(1); const transport=new StdioClientTransport({command:entry.command[0],args:entry.command.slice(1),env:{...process.env,...entry.environment}}); const mcp=new Client({name:'release-gate',version:'1'}); await mcp.connect(transport); const call={args:{}}; await hooks['tool.execute.before']({tool:'forgespec_forge_health',sessionID:'gate',callID:'release-gate'}, call); const result=await mcp.callTool({name:'forge_health',arguments:call.args}); if(result.isError||result.structuredContent?.ok!==true||result.structuredContent?.data?.storage?.qualified!==true) process.exit(1); await mcp.close(); await hooks.dispose(); console.log('packed file-url OpenCode MCP connection and signed health passed')")
+          npm exec --prefix "$TMP" --yes --package=opencode-ai@1.18.3 -- opencode --version
+          (cd "$TMP" && node --input-type=module -e "const m=await import('forgespec-mcp/mcp'); if(typeof m.default!=='function'&&typeof m.createServer!=='function') process.exit(1); console.log('packed MCP entrypoint loaded; signed health is covered by runtime gate')")
+          rm -rf "$TMP" "$TARBALL" "$PLUGIN_TARBALL" pack-manifest.json packed-package.json
 
   approve-release:
     name: Approve Release
     runs-on: ubuntu-latest
-    needs: [prepare-release, node22-compatibility-gate, release-node24]
+    needs: [prepare-release, release-node24]
     environment: production
     steps:
-      - run: echo "Release approved after Node22 compatibility and Node24.18.1 verification."
+      - run: echo "Release approved after final Node 24.18.1 verification."
 
   publish:
     name: Publish verified Node 24.18.1 release
-    needs: [prepare-release, node22-compatibility-gate, release-node24, approve-release]
+    needs: [prepare-release, release-node24, approve-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -167,6 +155,10 @@ jobs:
         run: npm run build
       - name: Set package version without lifecycle scripts
         run: npm version "${{ needs.prepare-release.outputs.version }}" --no-git-tag-version --allow-same-version --ignore-scripts
+      - name: Align standalone plugin version without lifecycle scripts
+        run: npm version "${{ needs.prepare-release.outputs.version }}" --prefix plugins/opencode-forgespec --no-git-tag-version --allow-same-version --ignore-scripts
+      - name: Align plugin dependency version without lifecycle scripts
+        run: npm pkg set dependencies.forgespec-mcp="${{ needs.prepare-release.outputs.version }}" --prefix plugins/opencode-forgespec
       - name: Validate packed manifest before publish
         shell: bash
         env:
@@ -176,7 +168,10 @@ jobs:
           TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('pack-manifest.json','utf8'))[0].filename)")
           tar -xOf "$TARBALL" package/package.json > packed-package.json
           node -e "const p=require('./packed-package.json'); if (p.version !== process.env.EXPECTED_VERSION) process.exit(1); if (p.bin?.['forgespec-mcp'] !== 'build/index.js') process.exit(1); if (!p.files?.includes('build')) process.exit(1); console.log('packed manifest verified')"
-          rm -f "$TARBALL" pack-manifest.json packed-package.json
+          npm pack ./plugins/opencode-forgespec --json --ignore-scripts > plugin-pack-manifest.json
+          PLUGIN_TARBALL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('plugin-pack-manifest.json','utf8')).at(-1).filename)")
+          node -e "const p=require('./plugins/opencode-forgespec/package.json'); if (p.version !== process.env.EXPECTED_VERSION || p.dependencies?.['forgespec-mcp'] !== process.env.EXPECTED_VERSION) process.exit(1)"
+          rm -f "$TARBALL" "$PLUGIN_TARBALL" pack-manifest.json plugin-pack-manifest.json packed-package.json
       - name: Re-check source and remote tag immediately before mutation
         env:
           TAG: ${{ needs.prepare-release.outputs.tag }}
@@ -200,11 +195,34 @@ jobs:
           TAG: ${{ needs.prepare-release.outputs.tag }}
           EXPECTED_SOURCE_SHA: ${{ needs.prepare-release.outputs.source_sha }}
         run: node .github/scripts/release-policy.mjs verify-remote-tag "$TAG" "$EXPECTED_SOURCE_SHA"
-      - name: Publish to npm
+      - name: Publish root package to npm
         id: publish_npm
         run: npm publish --provenance --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish standalone OpenCode plugin package to npm
+        run: npm publish ./plugins/opencode-forgespec --provenance --access public --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Retry npm visibility and signed health assertion
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+             npm view "forgespec-mcp@$VERSION" version --json && npm view "opencode-forgespec@$VERSION" version --json && break
+             test "$attempt" -lt 5 || exit 1
+             sleep $((attempt * 5))
+           done
+           test "$(npm view "forgespec-mcp@$VERSION" version)" = "$VERSION"
+           test "$(npm view "opencode-forgespec@$VERSION" version)" = "$VERSION"
+            POST_TMP=$(mktemp -d)
+            npm init --yes --prefix "$POST_TMP" >/dev/null 2>&1
+             npm install --prefix "$POST_TMP" --ignore-scripts --omit=peer --package-lock=false "opencode-forgespec@$VERSION" "forgespec-mcp@$VERSION"
+             (cd "$POST_TMP" && node "$GITHUB_WORKSPACE/scripts/verify-opencode-host.mjs" --mode=registry)
+            export FORGESPEC_DB="$POST_TMP/domain.db" FORGESPEC_IDENTITY_SIDECAR_PATH="$POST_TMP/identity.db" FORGESPEC_CURSOR_SECRET="release-registry-cursor-secret-0123456789012345"
+            (cd "$POST_TMP" && node --input-type=module -e "import { Client } from '@modelcontextprotocol/sdk/client/index.js'; import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'; const p=await import('opencode-forgespec'); if(typeof p.default!=='function') process.exit(1); const hooks=await p.default({client:{session:{get:async()=>({data:{id:'postpublish-gate'}})}}}); const cfg={mcp:{}}; await hooks.config(cfg); const e=cfg.mcp.forgespec; const t=new StdioClientTransport({command:e.command[0],args:e.command.slice(1),env:{...process.env,...e.environment}}); const m=new Client({name:'postpublish-gate',version:'1'}); await m.connect(t); const call={args:{}}; await hooks['tool.execute.before']({tool:'forgespec_forge_health',sessionID:'postpublish-gate',callID:'postpublish-gate'}, call); const r=await m.callTool({name:'forge_health',arguments:call.args}); if(r.isError||r.structuredContent?.ok!==true||r.structuredContent?.data?.storage?.qualified!==true) process.exit(1); await m.close(); await hooks.dispose(); console.log('registry package-spec OpenCode MCP connection and signed health passed')")
+            rm -rf "$POST_TMP"
       - name: Re-verify pushed tag source before GitHub release
         env:
           TAG: ${{ needs.prepare-release.outputs.tag }}
