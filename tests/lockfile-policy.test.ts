@@ -5,8 +5,8 @@ import { describe, expect, it } from "vitest";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const lockfilePath = path.join(PROJECT_ROOT, "package-lock.json");
-const ci = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", "ci.yml"), "utf8");
-const release = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", "release.yml"), "utf8");
+const ci = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", "ci.yml"), "utf8").replace(/\r\n/g, "\n");
+const release = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", "release.yml"), "utf8").replace(/\r\n/g, "\n");
 const workflows = `${ci}\n${release}`;
 
 const RUNTIME_KEY = /npm-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-(?:\$\{\{ matrix\.node-line \}\}|22\.x|24\.18\.1)/;

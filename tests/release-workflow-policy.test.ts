@@ -9,8 +9,8 @@ import {
 } from "../.github/scripts/release-policy.mjs";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
-const release = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", "release.yml"), "utf8");
-const hostVerifier = fs.readFileSync(path.join(PROJECT_ROOT, "scripts", "verify-opencode-host.mjs"), "utf8");
+const release = fs.readFileSync(path.join(PROJECT_ROOT, ".github", "workflows", "release.yml"), "utf8").replace(/\r\n/g, "\n");
+const hostVerifier = fs.readFileSync(path.join(PROJECT_ROOT, "scripts", "verify-opencode-host.mjs"), "utf8").replace(/\r\n/g, "\n");
 
 function job(name: string, next?: string): string {
   const start = release.indexOf(`  ${name}:`);
