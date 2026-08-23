@@ -2,6 +2,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export interface PluginClient {
@@ -128,6 +130,13 @@ function resolvePackagePath(specifier: string): string {
   return fileURLToPath(resolved);
 }
 
+function resolveSidecarPath(): string {
+  const configured = process.env.FORGESPEC_IDENTITY_SIDECAR_PATH?.trim();
+  if (configured) return configured;
+  const dir = process.env.FORGESPEC_DIR?.trim() || path.join(os.homedir(), ".forgespec");
+  return path.join(dir, "identity.db");
+}
+
 function localBroker({ client, broker: supplied, nodeCommand, brokerPath }: {
   client?: PluginClient;
   broker?: PluginContext["broker"];
@@ -136,10 +145,11 @@ function localBroker({ client, broker: supplied, nodeCommand, brokerPath }: {
 } = {}) {
   if (supplied) return { request: (input: unknown) => (supplied.request ? supplied.request(input) : supplied.before!(input)), close: () => supplied.close?.() };
   const entry = brokerPath ?? resolvePackagePath("forgespec-mcp/broker");
+  const sidecarPath = resolveSidecarPath();
   const child: ChildProcess = spawn(nodeCommand ?? resolveNodeCommand(), [entry], {
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, FORGESPEC_IDENTITY_SIDECAR_PATH: process.env.FORGESPEC_IDENTITY_SIDECAR_PATH ?? "" }
+    env: { ...process.env, FORGESPEC_IDENTITY_SIDECAR_PATH: sidecarPath }
   });
   const pending = new Map<string, { resolve: (value: any) => void; reject: (reason: any) => void }>();
   let buffer = "";
@@ -227,7 +237,7 @@ export default async function forgeSpecPlugin(context: PluginContext = {}): Prom
         FORGESPEC_IDENTITY_ROOT_PUBLIC_KEY: ready?.root_public_key ?? "",
         FORGESPEC_IDENTITY_ISSUER: ready?.issuer ?? "",
         FORGESPEC_IDENTITY_AUDIENCE: ready?.audience ?? "broker",
-        FORGESPEC_IDENTITY_SIDECAR_PATH: process.env.FORGESPEC_IDENTITY_SIDECAR_PATH ?? ""
+        FORGESPEC_IDENTITY_SIDECAR_PATH: resolveSidecarPath()
       };
       config.mcp ??= {};
       config.mcp.forgespec = { type: "local", command: [nodeCommand, mcpIndexPath], enabled: true, environment };

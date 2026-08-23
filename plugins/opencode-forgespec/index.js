@@ -2,6 +2,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TOOL_NAMES = new Set(["attempt_claim", "attempt_recover", "attempt_renew", "authority_manage", "approval_record", "board_create", "contract_commit", "contract_query", "contract_validate", "event_query", "forge_health", "forge_negotiate", "lease_release", "lease_renew", "lease_reserve", "task_define", "task_query", "task_transition"]);
@@ -54,10 +56,18 @@ function resolvePackagePath(specifier) {
   return fileURLToPath(resolved);
 }
 
+function resolveSidecarPath() {
+  const configured = process.env.FORGESPEC_IDENTITY_SIDECAR_PATH?.trim();
+  if (configured) return configured;
+  const dir = process.env.FORGESPEC_DIR?.trim() || path.join(os.homedir(), ".forgespec");
+  return path.join(dir, "identity.db");
+}
+
 function localBroker({ client, broker: supplied, nodeCommand, brokerPath } = {}) {
   if (supplied) return { request: (input) => supplied.request ? supplied.request(input) : supplied.before(input), close: () => supplied.close?.() };
   const entry = brokerPath ?? resolvePackagePath("forgespec-mcp/broker");
-  const child = spawn(nodeCommand ?? resolveNodeCommand(), [entry], { shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, FORGESPEC_IDENTITY_SIDECAR_PATH: process.env.FORGESPEC_IDENTITY_SIDECAR_PATH ?? "" } });
+  const sidecarPath = resolveSidecarPath();
+  const child = spawn(nodeCommand ?? resolveNodeCommand(), [entry], { shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, FORGESPEC_IDENTITY_SIDECAR_PATH: sidecarPath } });
   const pending = new Map(); let buffer = ""; let closed = false; let readyResolve; let readyReject;
   const ready = new Promise((resolveReady, rejectReady) => { readyResolve = resolveReady; readyReject = rejectReady; });
   const consume = (chunk) => {
@@ -86,7 +96,7 @@ export default async function forgeSpecPlugin(context = {}) {
   let bootstrap;
   const ensure = async () => { bootstrap ??= broker.ready ? await broker.ready : undefined; return bootstrap; };
   const hooks = {
-      config: async (config = {}) => { const ready = await ensure().catch((error) => { log("warn", "ForgeSpec broker readiness unavailable", { code: error?.message }); return undefined; }); const mcpIndexPath = context.mcpPath ?? context.options?.mcpPath ?? resolvePackagePath("forgespec-mcp/mcp"); const environment = { FORGESPEC_IDENTITY_ROOT_PUBLIC_KEY: ready?.root_public_key ?? "", FORGESPEC_IDENTITY_ISSUER: ready?.issuer ?? "", FORGESPEC_IDENTITY_AUDIENCE: ready?.audience ?? "broker", FORGESPEC_IDENTITY_SIDECAR_PATH: process.env.FORGESPEC_IDENTITY_SIDECAR_PATH ?? "" }; config.mcp ??= {}; config.mcp.forgespec = { type: "local", command: [nodeCommand, mcpIndexPath], enabled: true, environment }; },
+      config: async (config = {}) => { const ready = await ensure().catch((error) => { log("warn", "ForgeSpec broker readiness unavailable", { code: error?.message }); return undefined; }); const mcpIndexPath = context.mcpPath ?? context.options?.mcpPath ?? resolvePackagePath("forgespec-mcp/mcp"); const environment = { FORGESPEC_IDENTITY_ROOT_PUBLIC_KEY: ready?.root_public_key ?? "", FORGESPEC_IDENTITY_ISSUER: ready?.issuer ?? "", FORGESPEC_IDENTITY_AUDIENCE: ready?.audience ?? "broker", FORGESPEC_IDENTITY_SIDECAR_PATH: resolveSidecarPath() }; config.mcp ??= {}; config.mcp.forgespec = { type: "local", command: [nodeCommand, mcpIndexPath], enabled: true, environment }; },
     "tool.execute.before": async (input, output) => {
        if (!TOOL.test(input?.tool ?? "")) return;
         const match = TOOL.exec(input.tool ?? ""); const requested = match?.[1]; const toolName = requested?.startsWith("forgespec_") ? `forge_${requested.slice("forgespec_".length)}` : requested; if (!toolName || !TOOL_NAMES.has(toolName)) return;

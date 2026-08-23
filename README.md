@@ -112,18 +112,54 @@ OpenCode Plugin ──private stdio──> Identity Broker ──> Sidecar Store
 
 The official OpenCode integration is exported via `forgespec-mcp/plugin` and packaged as `opencode-forgespec`.
 
-### Configuration in `opencode.json`
+### Why Use `opencode-forgespec` Instead of Raw MCP?
+
+In ForgeSpec Protocol 2.0, the MCP server operates under a **fail-closed cryptographic identity model**:
+* AI models are prevented from self-assigning caller identities or forging permissions.
+* Direct invocation (`npx -y forgespec-mcp` in `mcp`) without the identity broker environment throws `TRUST_BOOTSTRAP_INVALID` by design.
+* The `opencode-forgespec` plugin automatically spins up the private **Identity Broker** sidecar, initializes trusted key pairs, securely injects bootstrap credentials into `forgespec-mcp`, and signs every tool call with session-bound `_identity` cryptographic envelopes.
+
+### Installation
+
+Install the plugin in your project (or in your OpenCode configuration directory):
+
+```bash
+# In your local project repository
+npm install --save-dev opencode-forgespec
+
+# Or globally for your user profile
+npm install -g opencode-forgespec
+# (On Windows, you can also install directly in %USERPROFILE%\.config\opencode)
+```
+
+### Configuration in `opencode.json` / `opencode.jsonc`
+
+Add `"opencode-forgespec"` to the `"plugin"` array in your project or global `opencode.json`:
 
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "plugin": [
     "opencode-forgespec"
   ]
 }
 ```
 
+> [!WARNING]
+> Do **not** define a manual `"forgespec"` entry under `"mcp"`. The plugin registers and connects the authenticated MCP server automatically.
+
 > [!IMPORTANT]
 > After installing or configuring `opencode-forgespec`, **restart OpenCode** to initialize the private identity broker. Ensure Node 22+ is available on your system path.
+
+### Available Tools in OpenCode
+
+All 18 canonical ForgeSpec tools are automatically exposed to OpenCode agents with the `forgespec_` prefix:
+* `forgespec_board_create`, `forgespec_contract_commit`, `forgespec_contract_query`, `forgespec_contract_validate`
+* `forgespec_task_define`, `forgespec_task_query`, `forgespec_task_transition`
+* `forgespec_attempt_claim`, `forgespec_attempt_recover`, `forgespec_attempt_renew`
+* `forgespec_lease_reserve`, `forgespec_lease_renew`, `forgespec_lease_release`
+* `forgespec_authority_manage`, `forgespec_approval_record`, `forgespec_event_query`
+* `forgespec_forge_health`, `forgespec_forge_negotiate`
 
 ---
 
