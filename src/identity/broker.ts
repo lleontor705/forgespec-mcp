@@ -13,8 +13,13 @@ const B64 = (k: KeyObject) => k.export({ format: "der", type: "spki" }).toString
 const digest = (v: unknown) => sha256(canonicalJson(v));
 
 export function derivePseudonymousHandles(session: SessionStrings, callId = ""): PseudonymousHandles {
-  if (!session || typeof session.root !== "string" || !session.root) throw new Error("invalid session strings");
-  const source = session.lineage?.length ? (session.lineage.length >= 3 ? session.lineage : [...session.lineage, `${session.root}:parent`, `${session.root}:worker`].slice(0, 3)) : [session.root, session.parent ?? `${session.root}:parent`, session.worker ?? `${session.root}:worker`];
+  const source = session.lineage?.length
+    ? (session.lineage.length >= 3
+        ? session.lineage
+        : (session.lineage.length === 2
+            ? [session.lineage[0], `${session.root}:parent`, session.lineage[1]]
+            : [session.lineage[0], `${session.root}:parent`, `${session.root}:worker`]))
+    : [session.root, session.parent ?? `${session.root}:parent`, session.worker ?? `${session.root}:worker`];
   if (source.length - 1 > MAX_LINEAGE_DEPTH) throw new Error("SESSION_LINEAGE_INVALID");
   if (source.length < 3 || source.some((item) => typeof item !== "string" || !item)) throw new Error("invalid session lineage");
   const lineage = source.map((item, index) => `lineage:${digest(`${session.root}\0${index}\0${item}`)}`);

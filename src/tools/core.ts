@@ -8,9 +8,9 @@ import { negotiateResult, healthResult } from "./schemas.js";
 
 const profiles = ["planner", "worker", "orchestrator", "reviewer"] as const;
 const negotiateInput = z.object({
-  profile: z.enum(profiles),
-  requiredCapabilities: z.array(z.string().min(1)).max(64).optional(),
-  optionalCapabilities: z.array(z.string().min(1)).max(64).optional(),
+  profile: z.enum(profiles).describe("Role profile to negotiate: 'planner', 'worker', 'orchestrator', or 'reviewer'"),
+  requiredCapabilities: z.array(z.string().min(1)).max(64).optional().describe("Optional capability family constraints (e.g. 'cas@2', 'leases@2'). OMIT unless requesting explicit protocol capability families."),
+  optionalCapabilities: z.array(z.string().min(1)).max(64).optional().describe("Optional capability family preferences. OMIT unless requesting explicit protocol capability families."),
 }).strict();
 const negotiateOutput = z.object({
   protocol_version: z.literal("2.0"), profile: z.enum(profiles), tools: z.array(z.string()),

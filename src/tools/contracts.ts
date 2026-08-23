@@ -39,7 +39,12 @@ export function registerContractTools(server: McpServer, databaseProvider: () =>
     const { revision: _revision, parent_contract_id: _parent, digest: _digest, ...value } = raw as z.infer<typeof contract>;
     const result = !jsonValue(value.data) || Buffer.byteLength(JSON.stringify(value.data), "utf8") > MAX_DATA_BYTES
       ? { valid: false, errors: ["data must be bounded JSON"] } : validateContract(value);
-    return { ok: true, ...result };
+    return {
+      ok: true,
+      valid: result.valid,
+      ...(result.digest ? { digest: result.digest } : {}),
+      ...(result.errors?.length ? { errors: result.errors } : {})
+    };
   }});
   const commitInput = z.object({ idempotency_key: text(256), expected_board_revision: z.number().int().min(1), parent_contract_id: text(256).optional(), contract: contractInput }).strict();
   registerIdentityTool<any, any>(server, { verifier, toolName: "contract_commit", description: "Append a final contract revision with board authority, CAS, and idempotency.", businessSchema: commitInput, outputSchema: contractCommitResult, annotations: mutationAnnotations, handler: async (input, principal) => ({ ok: true, ...commitContract(databaseProvider(), { idempotency_key: input.idempotency_key, expected_board_revision: input.expected_board_revision, ...(input.parent_contract_id === undefined ? {} : { parent_contract_id: input.parent_contract_id }), contract: input.contract, actor: principal.session.worker }) }) });

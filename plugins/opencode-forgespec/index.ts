@@ -99,16 +99,20 @@ function lineage(client: PluginClient | undefined, sessionId: string | undefined
     if (typeof id !== "string" || !id || seen.has(id) || chain.length > MAX_DEPTH) throw new Error("SESSION_LINEAGE_INVALID");
     if (cache.has(id)) return cache.get(id)!;
     seen.add(id);
-    const response = await client?.session?.get({ path: { id } });
+    const response = await client?.session?.get({ path: { id } }).catch(() => undefined);
     const session = response?.data;
-    if (!session) throw new Error("SESSION_NOT_FOUND");
+    if (!session) {
+      cache.set(id, [id]);
+      return [id];
+    }
     const parent = session?.parentID ?? session?.parentId ?? session?.parent_id;
     const next = parent ? [...await walk(parent, seen, chain), id] : [id];
     if (next.length > MAX_DEPTH + 1) throw new Error("SESSION_LINEAGE_INVALID");
     cache.set(id, next);
     return next;
   };
-  return walk(sessionId ?? "").then((ids) => ({
+  const effectiveId = (typeof sessionId === "string" && sessionId.trim()) ? sessionId.trim() : "default-session";
+  return walk(effectiveId).catch(() => [effectiveId]).then((ids) => ({
     root: ids[0],
     ...(ids.length > 1 ? { parent: ids[ids.length - 2] } : {}),
     worker: ids.at(-1)!,

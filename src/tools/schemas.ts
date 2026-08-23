@@ -40,7 +40,7 @@ export const recoveryResult = envelope(z.object({ taskRevision: revision }).stri
 export const leaseReserveResult = envelope(z.object({ leaseId: id, attemptId: id, holder: id, scopes: z.array(z.string().min(1).max(4096)).max(100), issuedAt: z.number().int().nonnegative(), expiresAt: z.number().int().positive(), leaseToken: z.string().max(512).nullable() }).strict());
 export const leaseMutationResult = envelope(z.object({ leaseId: id, revision, expiresAt: z.number().int().positive(), state: z.enum(["renewed", "released"]) }).strict());
 
-export const contractValidateResult = envelope(z.object({ ok: z.literal(true), valid: z.boolean(), errors: z.array(z.string().max(1024)).max(100).optional() }).strict());
+export const contractValidateResult = envelope(z.object({ ok: z.literal(true), valid: z.boolean(), digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(), errors: z.array(z.string().max(1024)).max(100).optional() }).strict());
 export const contractCommitResult = envelope(z.object({ ok: z.literal(true), contract_id: id, revision, board_revision: revision, digest: z.string().regex(/^sha256:[a-f0-9]{64}$/), replayed: replay }).strict());
 const contractItem = z.object({ contract_id: id, project: z.string().max(256), change_name: z.string().max(256), phase: z.string().max(64), status: z.string().max(64), confidence: z.number().min(0).max(1), executive_summary: z.string().max(4096), revision, digest: z.string().regex(/^sha256:[a-f0-9]{64}$/), parent_contract_id: id.nullable(), created_at: z.number().int().nonnegative(), updated_at: z.number().int().nonnegative() }).strict();
 export const contractQueryResult = envelope(z.object({ ok: z.literal(true), items: z.array(contractItem).max(100), total_count: z.number().int().nonnegative() }).strict());
