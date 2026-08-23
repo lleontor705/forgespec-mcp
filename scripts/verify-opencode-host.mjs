@@ -81,10 +81,13 @@ const server = createServer((req, res) => {
 await new Promise((resolveReady) => server.listen(0, "127.0.0.1", resolveReady));
 try {
   const port = server.address().port;
-   const plugin = mode === "registry" ? "opencode-forgespec" : pathToFileURL(resolve(install, "node_modules/opencode-forgespec/index.js")).href;
+  const plugin = mode === "registry"
+    ? pathToFileURL(resolve(process.cwd(), "node_modules/opencode-forgespec/index.js")).href
+    : pathToFileURL(resolve(install, "node_modules/opencode-forgespec/index.js")).href;
   const config = { plugin: [plugin], provider: { mock: { npm: "@ai-sdk/openai-compatible", options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "local-test-only" }, models: { mock: { name: "mock" } } } } };
   await writeFile(join(temp, "opencode.json"), JSON.stringify(config));
-  const env = { ...process.env, OPENAI_API_KEY: "local-test-only", OPENCODE_CONFIG: join(temp, "opencode.json"), FORGESPEC_DB: join(temp, "domain.db"), FORGESPEC_IDENTITY_SIDECAR_PATH: join(temp, "identity.db"), FORGESPEC_CURSOR_SECRET: "host-gate-cursor-secret-0123456789012345" };
+  const nodePaths = [resolve(process.cwd(), "node_modules"), resolve(install, "node_modules"), process.env.NODE_PATH].filter(Boolean);
+  const env = { ...process.env, NODE_PATH: nodePaths.join(process.platform === "win32" ? ";" : ":"), OPENAI_API_KEY: "local-test-only", OPENCODE_CONFIG: join(temp, "opencode.json"), FORGESPEC_DB: join(temp, "domain.db"), FORGESPEC_IDENTITY_SIDECAR_PATH: join(temp, "identity.db"), FORGESPEC_CURSOR_SECRET: "host-gate-cursor-secret-0123456789012345" };
   child = spawn(process.platform === "win32" ? "opencode" : which, ["run", "--print-logs", "--format", "json", "--model", "mock/mock", "Call forge_health and return the complete tool result", "--dir", temp], { cwd: temp, env, shell: process.platform === "win32", stdio: ["ignore", "pipe", "pipe"] });
   let output = ""; let diagnostics = ""; child.stdout.on("data", (chunk) => output += chunk); child.stderr.on("data", (chunk) => diagnostics += chunk);
    const code = await new Promise((done) => {
